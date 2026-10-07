@@ -1,6 +1,7 @@
 """Offline regression tests: no credentials or network requests needed."""
 import contextlib
 import copy
+import csv
 import io
 import json
 import subprocess
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 import requests
@@ -16,15 +18,27 @@ import price_reader as scanner
 
 
 class ScannerTests(unittest.TestCase):
+    tournament_id = "550e8400-e29b-41d4-a716-446655440000"
+
+    def race_markets(self):
+        return ({"Race": ({"id": "1", "status": "open"}, {"id": "2", "status": "open"})}, {"1", "2"})
+
     def setUp(self):
         # Every test gets a separate portfolio; never read or write the real one.
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
         self.portfolio_path = Path(temporary_directory.name) / "paper_portfolio.json"
+        self.trade_log_path = Path(temporary_directory.name) / "paper_trades.csv"
         for name, value in (("PORTFOLIO_PATH", self.portfolio_path),
+                            ("TRADE_LOG_PATH", self.trade_log_path),
                             ("open_positions", []),
                             ("paper_balance", trader.STARTING_BALANCE)):
             patcher = patch.object(trader, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        for name, value in (("_last_request_started", None), ("_read_cooldown_until", 0),
+                            ("get_tournament", Mock(return_value=self.tournament_id))):
+            patcher = patch.object(scanner, name, value)
             patcher.start()
             self.addCleanup(patcher.stop)
         self.output = io.StringIO()
@@ -35,6 +49,18 @@ class ScannerTests(unittest.TestCase):
     def opportunity(self, edge=0.1, quantity=100):
         return {"YES-PAIR": {"cost_per_pair": 1 - edge,
                              "profit_per_pair": edge, "quantity": quantity}}
+
+    def recorded_context(self):
+        """Public provenance for a verified two-party fixture, never credentials."""
+        return {"tournament_id": self.tournament_id, "market_ids": ["1", "2"],
+                "exchange_ids": ["11", "12"], "race_key": ["1", "2", "2026-11-03", "General", "Party Winner"],
+                "settlement_fingerprint": "a" * 64,
+                "relationships": [{"id": "22222222-2222-2222-2222-222222222222", "version": 1,
+                                   "isExhaustive": True, "members": [["11", "1"], ["12", "2"]]}],
+                "payout_condition": "ordinary_binary_settlement; refunds are separate",
+                "leg_prices": [.45, .45], "book_versions": [
+                    {"sequence": 1, "at": "2026-10-07T12:00:00.1234567+00:00"},
+                    {"sequence": 2, "at": "2026-10-07T12:00:01.1234567+00:00"}]}
 
     def test_transitions_and_duplicate_after_reappearance(self):
         previous = {}
@@ -71,42 +97,52 @@ class ScannerTests(unittest.TestCase):
 
     def test_calculations_and_thresholds(self):
         book = {"bid": .45, "ask": .49, "bid_quantity": 200, "ask_quantity": 200}
-        result = scanner.find_opportunities(book, book)
+        result = scanner.find_opportunities(book, book, ("YES-PAIR", "NO-PAIR"))
         self.assertEqual(result["YES-PAIR"]["quantity"], 100)
         book["ask_quantity"] = 49
-        self.assertEqual(scanner.find_opportunities(book, book), {})
+        self.assertEqual(scanner.find_opportunities(book, book, ("YES-PAIR", "NO-PAIR")), {})
         book.update(bid=.6, ask=.65, bid_quantity=70)
-        self.assertAlmostEqual(scanner.find_opportunities(book, book)["NO-PAIR"]["cost_per_pair"], .8)
+        self.assertAlmostEqual(scanner.find_opportunities(book, book, ("YES-PAIR", "NO-PAIR"))["NO-PAIR"]["cost_per_pair"], .8)
         self.assertEqual(scanner.find_opportunities(None, book), {})
 
     def test_failed_fetch_preserves_state(self):
         previous = {("Race", "YES-PAIR"): self.opportunity()["YES-PAIR"]}
         original = previous.copy()
         with patch.object(scanner, "get_races", side_effect=requests.Timeout):
-            scanner.scan_once(Mock(), previous)
-        with patch.object(scanner, "get_races", return_value={"Race": (1, 2)}), \
+            scanner.scan_once(Mock(), previous, self.tournament_id)
+        with patch.object(scanner, "get_races", return_value=self.race_markets()), \
+                patch.object(scanner, "fetch_pages", return_value=[]), \
+                patch.object(scanner, "get_pair_rules", return_value=({"YES-PAIR"}, {})), \
                 patch.object(scanner, "get_best_prices", side_effect=ValueError):
-            scanner.scan_once(Mock(), previous)
+            scanner.scan_once(Mock(), previous, self.tournament_id)
         self.assertEqual(previous, original)
         self.assertNotIn("DISAPPEARED", self.output.getvalue())
 
     def test_http_checks_and_bad_book(self):
         session = Mock()
+        session.get.return_value.status_code = 500
         session.get.return_value.raise_for_status.side_effect = requests.HTTPError
         with self.assertRaises(requests.HTTPError):
-            scanner.fetch_json(session, "https://example.test")
-        session.get.assert_called_once_with("https://example.test", timeout=10)
+            scanner.fetch_json(session, scanner.MARKETS_URL)
+        session.get.assert_called_once_with(scanner.MARKETS_URL, params=None, timeout=10, allow_redirects=False)
         session.get.return_value.json.assert_not_called()
-        with patch.object(scanner, "fetch_json", return_value={"exchanges": [
-                {"bids": [{"price": "nan", "quantity": 100}],
-                 "asks": [{"price": .5, "quantity": 100}]}]}):
+        market = {"id": "1", "isComposite": False, "isMultiOutcome": False,
+                  "exchanges": [{"id": "10", "option": "YES"}]}
+        with patch.object(scanner, "fetch_json", return_value={
+                "exchangeId": "10", "marketId": "1",
+                "asOf": {"sequence": 1, "at": datetime.now(timezone.utc).isoformat()},
+                "bids": [{"price": "nan", "quantity": 100}],
+                "asks": [{"price": .5, "quantity": 100}]}):
             with self.assertRaises(ValueError):
-                scanner.get_best_prices(session, 1)
+                scanner.get_best_prices(session, market, self.tournament_id)
 
     def test_removed_race_disappears(self):
-        previous = {("Race", "YES-PAIR"): self.opportunity()["YES-PAIR"]}
-        with patch.object(scanner, "get_races", return_value={}):
-            scanner.scan_once(Mock(), previous)
+        opportunity = self.opportunity()["YES-PAIR"]
+        opportunity["market_context"] = {"market_ids": ["1", "2"]}
+        previous = {("Race", "YES-PAIR"): opportunity}
+        with patch.object(scanner, "get_races", return_value=({}, set())), \
+                patch.object(scanner, "fetch_pages", return_value=[]):
+            scanner.scan_once(Mock(), previous, self.tournament_id)
         self.assertEqual(previous, {})
 
     def test_loop_keeps_observations_until_interrupt(self):
@@ -139,6 +175,37 @@ class ScannerTests(unittest.TestCase):
         self.assertFalse(trader.execute_paper_trade("Race", "NO-PAIR", .9, .1, 100))
         self.assertEqual(self.portfolio_path.read_text(), saved)
 
+    def test_recorded_provenance_survives_restart_and_title_change(self):
+        context = self.recorded_context()
+        self.assertTrue(trader.execute_paper_trade("Race", "YES-PAIR", .9, .1, 100, context))
+        saved = self.portfolio_path.read_bytes()
+        trader.open_positions.clear()
+        trader.paper_balance = 5000
+        self.assertTrue(trader.load_portfolio())
+        restored = trader.open_positions[0]["market_context"]
+        self.assertEqual(restored, context)
+        self.assertFalse(trader.execute_paper_trade("Renamed race", "YES-PAIR", .9, .1, 100, context))
+        # The other pair type still shares the original race's capital limit.
+        self.assertFalse(trader.execute_paper_trade("Renamed race", "NO-PAIR", .9, .1, 100, context))
+        self.assertEqual(self.portfolio_path.read_bytes(), saved)
+        self.assertEqual(trader.paper_balance, 4910)
+
+    def test_invalid_saved_provenance_stops_without_rewriting_holdings(self):
+        trader.execute_paper_trade("Race", "YES-PAIR", .9, .1, 100, self.recorded_context())
+        valid = json.loads(self.portfolio_path.read_text())
+        for changes in ({"tournament_id": None}, {"exchange_ids": ["11", "11"]},
+                        {"leg_prices": [.2, .2]}, {"settlement_fingerprint": "wrong"},
+                        {"book_versions": [{"sequence": 1, "at": None}]},
+                        {"relationships": ["invalid"]}):
+            with self.subTest(changes=changes):
+                data = copy.deepcopy(valid)
+                data["open_positions"][0]["market_context"].update(changes)
+                self.portfolio_path.write_text(json.dumps(data))
+                original = self.portfolio_path.read_bytes()
+                with self.assertRaises(trader.PortfolioError):
+                    trader.load_portfolio()
+                self.assertEqual(self.portfolio_path.read_bytes(), original)
+                self.assertEqual(trader.paper_balance, 4910)
     def test_corrupt_file_stops_startup_before_network_access(self):
         self.portfolio_path.write_text("{unfinished JSON")
         with patch("sys.argv", ["price_reader.py", "--once"]), \
@@ -208,13 +275,16 @@ class ScannerTests(unittest.TestCase):
                 self.assertEqual(list(self.portfolio_path.parent.glob("*.tmp")), [])
 
     def test_failed_first_save_stops_scanner_without_accepting_trade(self):
-        book = {"bid": .4, "ask": .45, "bid_quantity": 100, "ask_quantity": 100}
+        book = {"bid": .4, "ask": .45, "bid_quantity": 100, "ask_quantity": 100,
+                "version": {"sequence": 1, "at": "2026-10-07T12:00:00Z"}}
         with patch("sys.argv", ["price_reader.py"]), \
                 patch.object(scanner, "load_dotenv"), \
                 patch.dict(scanner.os.environ, {"SIG_API_KEY": "test-only"}), \
                 patch.object(scanner.requests, "Session"), \
-                patch.object(scanner, "get_races", return_value={"Race": (1, 2)}), \
+                patch.object(scanner, "get_races", return_value=self.race_markets()), \
+                patch.object(scanner, "fetch_pages", return_value=[]), \
                 patch.object(scanner, "get_best_prices", return_value=book), \
+                patch.object(scanner, "get_pair_rules", return_value=({"YES-PAIR"}, self.recorded_context())), \
                 patch.object(trader.os, "replace", side_effect=OSError), \
                 patch.object(scanner.time, "sleep") as sleep:
             self.assertEqual(scanner.main(), 1)
@@ -231,8 +301,10 @@ class ScannerTests(unittest.TestCase):
 import json
 import sys
 from pathlib import Path
+from datetime import datetime, timezone
 import paper_trader as trader
 trader.PORTFOLIO_PATH = Path(sys.argv[1])
+trader.TRADE_LOG_PATH = trader.PORTFOLIO_PATH.with_name("paper_trades.csv")
 restored = trader.load_portfolio()
 accepted = trader.execute_paper_trade("Race", "YES-PAIR", .9, .1, 100)
 print(json.dumps([restored, accepted, trader.paper_balance, len(trader.open_positions)]))
@@ -246,6 +318,128 @@ print(json.dumps([restored, accepted, trader.paper_balance, len(trader.open_posi
             )
             results.append(json.loads(process.stdout.splitlines()[-1]))
         self.assertEqual(results, [[False, True, 4910, 1], [True, False, 4910, 1]])
+        self.assertEqual(len(self.read_trade_log()), 1)
+
+    def read_trade_log(self):
+        with self.trade_log_path.open(encoding="utf-8", newline="") as log_file:
+            return list(csv.DictReader(log_file))
+
+    def test_csv_records_both_trade_types_and_preserves_quoted_races(self):
+        race = 'Example, "North" race'
+        self.assertTrue(trader.execute_paper_trade(race, "YES-PAIR", .9, .1, 60))
+        self.assertTrue(trader.execute_paper_trade(race, "NO-PAIR", .8, .2, 60))
+        rows = self.read_trade_log()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["race"], race)
+        self.assertEqual([row["position_type"] for row in rows], ["YES-PAIR", "NO-PAIR"])
+        self.assertEqual([float(row["cash_remaining"]) for row in rows], [4946, 4898])
+        self.assertAlmostEqual(float(rows[0]["capital_used"]), 54)
+        self.assertAlmostEqual(float(rows[1]["minimum_expected_profit"]), 12)
+        self.assertEqual(len({row["trade_id"] for row in rows}), 2)
+        self.assertEqual(rows[0]["timestamp_utc"], trader.open_positions[0]["timestamp_utc"])
+        self.assertTrue(rows[0]["timestamp_utc"].endswith("+00:00"))
+        self.assertEqual(tuple(rows[0]), trader.TRADE_LOG_FIELDS)
+
+    def test_duplicate_and_rejected_trades_do_not_add_log_rows(self):
+        trader.execute_paper_trade("Race", "YES-PAIR", .9, .1, 100)
+        original = self.trade_log_path.read_bytes()
+        self.assertFalse(trader.execute_paper_trade("Race", "YES-PAIR", .9, .1, 100))
+        self.assertFalse(trader.execute_paper_trade("Race", "NO-PAIR", .9, .1, 100))
+        self.assertFalse(trader.execute_paper_trade("Other", "YES-PAIR", .9, .1, 300))
+        self.assertEqual(self.trade_log_path.read_bytes(), original)
+
+    def test_csv_failure_keeps_trade_saved_and_startup_recovers_once(self):
+        trader.execute_paper_trade("First", "YES-PAIR", .9, .1, 100)
+        original = self.trade_log_path.read_bytes()
+        original_replace = trader.os.replace
+
+        def fail_csv_replace(source, destination):
+            if destination == self.trade_log_path:
+                raise OSError("simulated CSV write failure")
+            return original_replace(source, destination)
+
+        with patch.object(trader.os, "replace", side_effect=fail_csv_replace):
+            with self.assertRaises(trader.PortfolioError):
+                trader.execute_paper_trade("Second", "NO-PAIR", .8, .2, 100)
+        # The JSON accepted the trade before logging failed; do not roll it back.
+        self.assertEqual(trader.paper_balance, 4830)
+        self.assertEqual(len(trader.open_positions), 2)
+        self.assertEqual(self.trade_log_path.read_bytes(), original)
+        self.assertEqual(len(json.loads(self.portfolio_path.read_text())["open_positions"]), 2)
+        self.assertEqual(list(self.trade_log_path.parent.glob("*.tmp")), [])
+        trade = trader.open_positions[1].copy()
+        trader.open_positions.clear()
+        trader.paper_balance = 5000
+        self.assertTrue(trader.load_portfolio())
+        self.assertEqual(len(self.read_trade_log()), 2)
+        row = self.read_trade_log()[1]
+        self.assertEqual(row["trade_id"], trade["trade_id"])
+        self.assertEqual(row["timestamp_utc"], trade["timestamp_utc"])
+        self.assertEqual(float(row["cash_remaining"]), 4830)
+        self.assertTrue(trader.load_portfolio())
+        self.assertEqual(len(self.read_trade_log()), 2)
+        self.assertFalse(trader.execute_paper_trade("Second", "NO-PAIR", .8, .2, 100))
+
+    def test_failed_portfolio_save_does_not_log_unaccepted_trade(self):
+        with patch.object(trader.os, "replace", side_effect=OSError):
+            with self.assertRaises(trader.PortfolioError):
+                trader.execute_paper_trade("Race", "YES-PAIR", .9, .1, 100)
+        self.assertFalse(self.trade_log_path.exists())
+        self.assertEqual(trader.open_positions, [])
+
+    def test_missing_csv_is_rebuilt_with_original_trade_values(self):
+        trader.execute_paper_trade("First", "YES-PAIR", .9, .1, 100)
+        trader.execute_paper_trade("Second", "YES-PAIR", .9, .1, 100)
+        original_rows = self.read_trade_log()
+        self.trade_log_path.unlink()
+        self.assertTrue(trader.load_portfolio())
+        self.assertEqual(self.read_trade_log(), original_rows)
+
+    def test_old_portfolio_loads_without_inventing_trade_timestamps(self):
+        legacy = {"race": "Old race", "position_type": "YES-PAIR", "quantity": 100,
+                  "cost_per_pair": .9, "capital_used": 90, "minimum_profit": 10}
+        trader.save_portfolio(4910, [legacy])
+        self.assertTrue(trader.load_portfolio())
+        self.assertEqual(trader.open_positions, [legacy])
+        self.assertFalse(self.trade_log_path.exists())
+        trader.execute_paper_trade("New race", "YES-PAIR", .9, .1, 100)
+        self.assertEqual([row["race"] for row in self.read_trade_log()], ["New race"])
+
+    def test_csv_history_survives_a_fresh_paper_portfolio(self):
+        trader.execute_paper_trade("Race", "YES-PAIR", .9, .1, 100)
+        first_id = self.read_trade_log()[0]["trade_id"]
+        self.portfolio_path.unlink()
+        self.assertFalse(trader.load_portfolio())
+        trader.execute_paper_trade("Race", "YES-PAIR", .9, .1, 100)
+        rows = self.read_trade_log()
+        self.assertEqual(len(rows), 2)
+        self.assertNotEqual(rows[1]["trade_id"], first_id)
+
+    def test_corrupt_csv_is_left_untouched(self):
+        trader.execute_paper_trade("Race", "YES-PAIR", .9, .1, 100)
+        valid_log = self.trade_log_path.read_text()
+        cases = ["wrong,header\n", valid_log + "truncated,row\n",
+                 valid_log + valid_log.splitlines()[1] + "\n",
+                 valid_log.replace("4910.0", "1234.0")]
+        for contents in cases:
+            with self.subTest(contents=contents):
+                self.trade_log_path.write_text(contents)
+                original = self.trade_log_path.read_bytes()
+                with self.assertRaises(trader.PortfolioError):
+                    trader.load_portfolio()
+                self.assertEqual(self.trade_log_path.read_bytes(), original)
+                self.assertEqual(trader.paper_balance, 4910)
+                self.assertEqual(len(trader.open_positions), 1)
+
+    def test_incomplete_trade_metadata_is_rejected_before_logging(self):
+        trader.execute_paper_trade("Race", "YES-PAIR", .9, .1, 100)
+        data = json.loads(self.portfolio_path.read_text())
+        del data["open_positions"][0]["timestamp_utc"]
+        self.portfolio_path.write_text(json.dumps(data))
+        original_log = self.trade_log_path.read_bytes()
+        with self.assertRaises(trader.PortfolioError):
+            trader.load_portfolio()
+        self.assertEqual(self.trade_log_path.read_bytes(), original_log)
 
 
 if __name__ == "__main__":

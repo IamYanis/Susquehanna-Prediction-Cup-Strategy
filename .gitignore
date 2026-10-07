@@ -3,3 +3,5 @@
 __pycache__/
 paper_portfolio.json
 .paper_portfolio.json.*.tmp
+paper_trades.csv
+.paper_trades.csv.*.tmp
