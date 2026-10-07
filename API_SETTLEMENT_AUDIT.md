@@ -198,15 +198,15 @@ snapshot YES-pair cost was 1.025 and NO-pair cost 0.985: the latter's 1.5% ordin
 edge was below the existing 2% threshold. These are historical observations,
 not current quotes; neither pair was accepted.
 
-All **68 offline tests passed** (41 API checks and 27 scanner/portfolio checks).
+The original **68 offline tests passed** (41 API checks and 27 scanner/portfolio checks).
 Tests use fake API responses, controlled clocks, and temporary files
 to verify scope, pagination, settlement eligibility, book validation, rate-limit
 recovery, and saved-state behavior. They do not require API requests or modify
 the user's saved paper holdings.
 
-The final `--audit-only` run exited successfully and byte comparisons confirmed
+The original `--audit-only` run exited successfully and byte comparisons confirmed
 that `paper_portfolio.json` and `paper_trades.csv` were unchanged. No order endpoint
-or account reconciliation endpoint was called. `.env` remains ignored and untracked.
+or account reconciliation endpoint was called during that run. `.env` remains ignored and untracked.
 
 The engine returns timestamps with seven fractional digits, which the existing
 Python 3.9 runtime does not accept directly. The parser now preserves microsecond
@@ -214,6 +214,73 @@ precision for freshness checks while retaining the original API timestamp in
 saved provenance. The environment also emits an urllib3/LibreSSL compatibility
 warning; read requests succeeded, but the runtime should be updated before
 developing account execution.
+
+## Read-only account and individual race follow-up
+
+`account_reader.py` now reads the enrolled member's tournament cash, complete
+holdings response, and every open-order page using explicit competition scope.
+It validates metadata, numbers, identities, position totals, and pagination.
+Pending enrollment, missing valuations, invalid data, and failed reads remain
+unknown rather than being presented as empty holdings or no orders. It never
+places or cancels orders, enrols the user, or writes account/paper files.
+
+The official API specifies that resting orders do **not** reserve cash;
+`myBalance` is current cash, while open-order quantities are executable
+remainders. Account risk must consider those orders separately. Signed holdings
+quantities distinguish YES from NO. The checker uses reported values rather
+than guessing how NO valuation prices or average costs are normalized.
+[Official API reference](https://sig.thesuper.market/api/v1/docs).
+
+The checker completed a live GET-only account read. Byte comparisons again
+confirmed the paper portfolio and CSV were unchanged. Private account values
+are shown locally and are not stored in this document or repository.
+The **89-test suite passed**, including 21 account-reader regressions.
+
+The [Rhode Island Senate review](RHODE_ISLAND_SENATE_REVIEW.md) adds two relevant
+findings: an independent appears on the official ballot, and the platform's
+Party Winner Info template allows a winning fusion ticket to count for multiple
+parties. A single election winner therefore does not establish exclusivity of
+the two party contracts. The manual review does not approve either pair or
+change the scanner's relationship requirement.
+
+## Offline execution follow-up
+
+`execution_simulator.py` now exercises invented two-leg orders against a separate,
+durable fake venue. It covers partial fills, a rejected second leg, fills during
+cancellation, missing replies, unavailable reconciliation, and process restart.
+Stable client keys and cumulative fill accounting prevent duplicate orders and
+cash charges during recovery. Unfinished or unmatched exposure blocks new pairs.
+Cancelled remainder does not refund shares already bought. See the
+[execution simulator guide](EXECUTION_SIMULATOR.md) for commands and limits.
+
+This is a separate paper exercise. It does not contact the API, read credentials,
+change the scanner's portfolio, approve settlement evidence, or implement an
+account order adapter. The fake venue supplies complete authoritative history;
+its recovery behavior cannot be assumed for eventually consistent API responses.
+All 25 execution regressions passed; the complete offline suite now passes
+114 tests, including the existing API, account, scanner, and portfolio checks.
+
+## Read-only order preview follow-up
+
+`order_preview.py` now builds a local draft using the documented two-leg body
+for `/api/v1/orders/multi-leg`. It reads one chosen pair and the actual account;
+it has no submission, cancellation, or enabling flag. Prices are side-relative,
+rounded upward to the 0.005 tick, and rechecked against the ordinary 2% edge.
+The draft uses a temporary preview key rather than a durable execution intent.
+[Official API reference](https://sig.thesuper.market/api/v1/docs).
+
+Account risk reserves one SUSQie per remaining share on every open order,
+including sells. Nonzero holding cost bases plus all pending reserves form an
+account-wide upper bound on candidate race exposure. This conservative bound
+must leave room within the 150 race cap and actual cash; overlapping selected
+instruments block the draft. This is not a claim that unrelated holdings actually
+belong to the selected race. See [order preview guide](ORDER_PREVIEW.md).
+
+All 25 new preview regressions and the full 139-test suite passed. A live GET-only
+check of Rhode Island markets 387/388 completed the account read and then blocked
+the preview because no active relationship verified the pair. No draft was
+approved and no orders were submitted or cancelled. Private account values are
+not recorded here. Fees, refunds, and actual execution remain unverified.
 
 ## What would be needed before competition account orders
 
@@ -225,12 +292,15 @@ Readiness requires more than positive paper results:
   need interpretation alongside the actual market rules.
 - Verified competition books, stable market/exchange IDs, reviewed settlement
   rules, and profit calculations covering fees and refund cases.
-- Read-only reconciliation with the competition account's actual balances,
-  positions, and open orders. The local paper files cannot substitute for this.
+- Current competition cash, holdings, and open orders are now readable with the
+  account checker. Future execution must use and reconcile this state, including
+  changes between reads; the local paper files cannot substitute for it.
 - Account-based risk limits that include outstanding orders and partially
   filled legs, plus checks for order size, tick size, and price movement.
-- A tested execution plan for either leg failing, partial fills, cancellation,
-  uncertain request outcomes, and recovery after restarting. The API documents
+- The offline exercises cover either leg failing, partial fills, cancellation,
+  uncertain request outcomes, and recovery after restarting. A future account
+  execution plan must verify these behaviors against actual API semantics.
+  The API documents
   atomic multi-leg admission and idempotency, but this does not establish
   guaranteed matching of equal quantities on both legs. Review integer order
   quantities and the documented 0.005 limit-price tick before constructing
@@ -254,8 +324,9 @@ independent YES and NO eligibility, exhaustive groups with additional members,
 empty relationship graphs, incomplete observations retaining state, confirmed
 disappearance, one-sided books, stale quote rejection, rate-limit handling,
 read-only audit mode, and legacy portfolio restoration without rewriting entry
-costs. Cancellation and refund accounting remains future work; the tests do not
-establish an unconditional profit guarantee.
+costs. Separate execution tests cover fake order cancellation and restart;
+real account execution and settlement refund accounting remain future work.
+The tests do not establish an unconditional profit guarantee.
 
 These tests use fake API responses, a fake clock, and temporary portfolios.
 They do not read `.env`, submit orders, or change the user's paper holdings.

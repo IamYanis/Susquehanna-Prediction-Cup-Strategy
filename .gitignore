@@ -5,3 +5,8 @@ paper_portfolio.json
 .paper_portfolio.json.*.tmp
 paper_trades.csv
 .paper_trades.csv.*.tmp
+execution_simulation/
+execution_state.json
+.execution_state.json.*.tmp
+simulated_venue.json
+.simulated_venue.json.*.tmp

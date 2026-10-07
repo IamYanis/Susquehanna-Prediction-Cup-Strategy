@@ -26,6 +26,44 @@ Both modes submit GET requests only. No competition account orders are implement
 `--tournament` selects another competition slug, but it must resolve to an active
 SUSQies tournament and pass the same checks.
 
+To inspect your competition account's reported cash, holdings, and open orders:
+
+```bash
+.venv/bin/python account_reader.py
+```
+
+Add `--details` to print each holding and order, or `--tournament` to select a
+competition. This separate checker makes GET requests only and never loads or
+updates the paper portfolio, writes an account snapshot, or submits/cancels
+orders. Your competition account and local paper simulation remain independent.
+Account values are displayed locally rather than recorded in repository files.
+
+The checker follows all open-order pages with explicit tournament scope and
+rejects incomplete reads. A network error, unavailable valuation, pending
+enrollment, or invalid response reports an unknown account state instead of
+zero holdings or zero orders. Signed position quantities are displayed as YES
+or NO shares; open-order quantities are the remaining shares.
+
+Resting orders do not reserve cash on the platform. A displayed cash balance
+therefore does not account for all possible future fills. These sequential
+reads do not provide an atomic account snapshot or establish execution readiness.
+
+A separate read-only order preview checks one selected pair against actual
+account cash, holdings, open orders, current settlement evidence, and books:
+
+```bash
+.venv/bin/python order_preview.py --dem-market 387 --rep-market 388 --position NO-PAIR --quantity 10
+```
+
+It can display a local two-leg request body, but has no submission or cancellation
+path. Buy limits round upward to the API's 0.005 tick, then the edge and capital
+checks run again. All resting order remainders receive a conservative one-unit
+reserve per share, and all holding costs count toward an upper bound on race
+exposure. Either selected exchange having a holding or order blocks the draft.
+The example market IDs do not imply an approved trade; missing relationship
+evidence blocks the preview. See [order preview guide](ORDER_PREVIEW.md) for the
+account checks, schema details, and limits of this read-only tool.
+
 The scanner fetches relationships once per scan and skips rule/book requests
 when evidence cannot approve a pair. Large eligible universes can still make a
 full scan take minutes under the request budget; 15 seconds is a target, not a
@@ -102,13 +140,33 @@ recorded API provenance. No position is automatically closed or settled.
 
 All projected profits depend on ordinary binary settlement. Cancellation/N/A
 refunds can erase the gain or produce a different result. Fees and partial fills
-are not modeled; paper fills still assume the observed quantities are available.
+are not modeled by the scanner's immediate paper fills; it still assumes the
+observed quantities are available.
+
+A separate offline simulator now exercises two-leg order handling:
+
+```bash
+.venv/bin/python execution_simulator.py --scenario all
+```
+
+It uses invented prices and a fake venue to show partial fills, failed legs,
+fills during cancellation, missing replies, and restart recovery. Default runs
+use disposable temporary files. An unfinished or unmatched pair blocks new
+pairs, and cancellation never returns the cost of shares already bought.
+It reuses the configured capital limits and charges each observed fill once.
+The simulator has no network or credential access and does not use the scanner's
+paper portfolio or CSV. It is not connected to competition order endpoints.
+See [execution exercises](EXECUTION_SIMULATOR.md) for persistent-state and resume
+commands, accounting rules, and the limits of this model.
 
 The 7 October 2026 audit found 117 title pairs but an empty scoped relationship
 graph, so none passed automatic approval. This does not prove arbitrage is
 impossible; it means the scanner lacks the required payout evidence. Read the
 [API and settlement audit](API_SETTLEMENT_AUDIT.md) for sources, findings, and
 remaining work before competition account execution.
+The [Rhode Island Senate review](RHODE_ISLAND_SENATE_REVIEW.md) documents the
+independent candidate and the platform's fusion-ticket rule. Neither party-pair
+type is enabled by that manual review.
 
 Offline tests:
 
@@ -119,5 +177,6 @@ Offline tests:
 Tests use fake API responses and clocks, temporary portfolios, and a restart
 across two Python processes. They cover pagination, venue identity, settlement
 eligibility, snapshot freshness, network/rate failures, event transitions, risk
-limits, provenance, portfolio/CSV recovery, and read-only audit mode. They do not
-call the API or touch your saved portfolio or `.env`.
+limits, provenance, portfolio/CSV recovery, simulated execution/recovery, local
+order drafting, and read-only account/audit modes. They do not call the API or touch your saved
+portfolio or `.env`.
