@@ -6,11 +6,12 @@ import json
 import math
 import os
 import re
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from uuid import uuid4
 
@@ -20,17 +21,134 @@ from dotenv import load_dotenv
 import execution_quarantine as quarantine
 import account_test as single
 from account_reader import account_error_reason, read_account
-from order_preview import PreviewBlocked, account_risk, conditional_proposal, preview_pair, read_selected_pair
+from order_preview import PreviewBlocked, account_risk, conditional_proposal, observed_limits, preview_pair, read_selected_pair
 from paper_trader import validate_market_context
 from price_reader import (
-    API_BASE_URL, API_ERRORS, MIN_EDGE, DataValidationError, fetch_json,
-    get_election_rule, get_exchange_id, get_pair_rules, numeric_id,
+    API_BASE_URL, API_ERRORS, MIN_EDGE, DataValidationError, check_context, fetch_json,
+    get_best_prices, get_election_rule, get_exchange_id, get_pair_rules, numeric_id,
 )
 
 STATE_DIR = Path(__file__).resolve().with_name("paired_account_test")
 STATES = {"PREPARED", "EXECUTING", "UNKNOWN", "RESTING", "UNMATCHED",
           "COMPLETE", "CLOSED_NO_FILL", "CANCELLING"}
 VERIFIED_POLICY = "verified-no-pair-first-full-fill-then-second"
+MANUAL_POLICY = "manual-senate-no-pair-supervised-separate-legs"
+MANUAL_MARKETS = ["153", "154"]
+MANUAL_EXCHANGES = ["842", "843"]
+MANUAL_TOURNAMENT = "bda92870-621e-47b0-bc3c-3602c5c26f55"
+MANUAL_PROPOSITION = (
+    "Under ordinary binary settlement, Democratic and Republican majority control "
+    "of the same U.S. Senate at the new-Congress reference time cannot both hold. "
+    "One NO share in each market therefore pays at least 1 SUSQie."
+)
+MANUAL_LIMITATIONS = [
+    "Both contracts must use the same reference time and interpretation of majority control.",
+    "Congress-seating and news-call timing, ties and caucus classification require human interpretation.",
+    "Cancelled/N/A outcomes refund refundable cost and do not preserve the ordinary payout floor.",
+    "Administrator rulings, overrides or corrections can depart from the reviewed interpretation.",
+    "Partial fills, UNKNOWN submissions and one-sided execution remain possible; no retries are authorized.",
+]
+
+
+def manual_rule_description(party):
+    # This pilot approves only the exact official wording already reviewed for
+    # 153/154. A wording change requires a fresh human review, never a fallback.
+    return (f"Resolves YES if the {party} Party wins majority control of the U.S. Senate "
+            "in the November 3, 2026 U.S. midterm elections, and NO otherwise. "
+            "Control is determined by the party holding the majority of seats when the new "
+            "Congress is seated; the market is settled manually once major news organizations "
+            "have called control of the chamber.")
+
+
+def manual_evidence_hash(record):
+    # The operator approves this evidence hash. The journal's existing approval
+    # hash also covers the approval timestamp, both order bodies and prices.
+    material = {key: value for key, value in record.items() if key not in {"evidence_hash", "approved_at"}}
+    return hashlib.sha256(json.dumps(material, sort_keys=True, allow_nan=False).encode()).hexdigest()
+
+
+def validate_manual_evidence(record):
+    single.require(isinstance(record, dict) and set(record) == {
+        "version", "market_ids", "exchange_ids", "tournament_id", "position", "proposition",
+        "source_refs", "rules", "limitations", "max_quantity", "allowed_mode", "evidence_hash", "approved_at"},
+        "Invalid manual approval record")
+    single.require(type(record["version"]) is int and record["version"] == 1
+                   and record["market_ids"] == MANUAL_MARKETS and record["exchange_ids"] == MANUAL_EXCHANGES
+                   and record["tournament_id"] == MANUAL_TOURNAMENT and record["position"] == "NO-PAIR"
+                   and record["proposition"] == MANUAL_PROPOSITION and record["limitations"] == MANUAL_LIMITATIONS
+                   and type(record["max_quantity"]) is int and record["max_quantity"] == 1
+                   and record["allowed_mode"] == MANUAL_POLICY,
+                   "Manual approval is limited to one supervised 153/154 NO pair")
+    sources = [f"{API_BASE_URL}/markets/{market_id}/nodes?tournamentId={MANUAL_TOURNAMENT}"
+               for market_id in MANUAL_MARKETS] + ["https://sig.thesuper.market/docs/settlement-and-payouts"]
+    single.require(record["source_refs"] == sources and isinstance(record["rules"], list)
+                   and len(record["rules"]) == 2, "Manual approval has missing or different evidence sources")
+    for root, party in zip(record["rules"], ("Democratic", "Republican")):
+        single.require(root["node_type"] == "contract" and root["contract_type"] == "Freeform"
+                       and root["settled_with"] is None
+                       and root["contract_details"]["description"] == manual_rule_description(party),
+                       "The reviewed Senate settlement wording changed")
+    single.require(record["evidence_hash"] == manual_evidence_hash(record), "Manual evidence hash changed")
+
+
+def validate_manual_context(context):
+    record = context["manual_approval"]
+    validate_manual_evidence(record)
+    single.require(context["mode"] == MANUAL_POLICY
+                   and context["settlement_fingerprint"] == record["evidence_hash"]
+                   and context["market_ids"] == record["market_ids"]
+                   and context["exchange_ids"] == record["exchange_ids"]
+                   and context["tournament_id"] == record["tournament_id"],
+                   "Manual approval identity or evidence hash changed")
+    single.require(isinstance(record["approved_at"], str), "Explicit manual approval has not been recorded")
+    single.parse_api_timestamp(record["approved_at"])
+
+
+def read_manual_evidence(session, tournament_id, democrat_id, republican_id):
+    single.require([str(democrat_id), str(republican_id)] == MANUAL_MARKETS
+                   and tournament_id == MANUAL_TOURNAMENT, "Manual review is limited to Senate markets 153/154")
+    markets = read_selected_pair(session, tournament_id, democrat_id, republican_id)
+    exchanges = [get_exchange_id(market) for market in markets]
+    single.require(exchanges == MANUAL_EXCHANGES, "Reviewed Senate exchange identities changed")
+    quarantine.require_unblocked_exchanges(exchanges)
+    roots, sources = [], []
+    for market_id in MANUAL_MARKETS:
+        url = f"{API_BASE_URL}/markets/{market_id}/nodes"
+        tree = fetch_json(session, url, params={"tournamentId": tournament_id})
+        single.require(numeric_id(tree["market_id"]) == market_id, "Wrong manual settlement tree")
+        # Validate tournament scope through the same helper as scanner reads.
+        check_context(tree["contexts"], tournament_id)
+        roots.append(tree["root"])
+        sources.append(f"{url}?tournamentId={tournament_id}")
+    record = {"version": 1, "market_ids": list(MANUAL_MARKETS), "exchange_ids": exchanges,
+              "tournament_id": tournament_id, "position": "NO-PAIR", "proposition": MANUAL_PROPOSITION,
+              "source_refs": sources + ["https://sig.thesuper.market/docs/settlement-and-payouts"],
+              "rules": roots, "limitations": list(MANUAL_LIMITATIONS), "max_quantity": 1,
+              "allowed_mode": MANUAL_POLICY, "approved_at": None}
+    record["evidence_hash"] = manual_evidence_hash(record)
+    validate_manual_evidence(record)  # No approval timestamp is created here.
+    return markets, record
+
+
+def manual_preview(session, account, democrat_id, republican_id, started, approval=None, approved_at=None):
+    """GET-only review. Approval becomes persistent only through explicit prepare."""
+    markets, record = read_manual_evidence(session, account["tournament"]["id"], democrat_id, republican_id)
+    if approval is not None:
+        single.require(approval == record["evidence_hash"], "Exact reviewed manual evidence hash is required")
+        record["approved_at"] = approved_at or datetime.now(timezone.utc).isoformat(timespec="seconds")
+    risk = account_risk(account, record["exchange_ids"])
+    books = [get_best_prices(session, market, record["tournament_id"]) for market in markets]
+    prices, quantity, cost, edge = observed_limits("NO-PAIR", books, started, quantity=1)
+    single.check_risk(risk, float(cost))
+    context = {"mode": MANUAL_POLICY, "tournament_id": record["tournament_id"],
+               "market_ids": record["market_ids"], "exchange_ids": record["exchange_ids"],
+               "settlement_fingerprint": record["evidence_hash"], "manual_approval": record,
+               "leg_prices": prices, "book_versions": [copy.deepcopy(book["version"]) for book in books]}
+    legs = [{"exchangeId": exchange, "side": "no", "action": "buy", "quantity": quantity,
+             "price": price, "tournamentId": record["tournament_id"]} for exchange, price in zip(MANUAL_EXCHANGES, prices)]
+    return {"market_context": context, "request": {"legs": legs}, "risk": risk,
+            "max_new_spend": float(cost), "ordinary_edge": float(edge)}
+
 CONDITIONAL_POLICY = "conditional-ri-no-pair-first-full-fill-then-second"
 # This opt-in is limited to the particular one-pair test the user requested.
 # It does not relax the scanner, the paper trader, or other races' eligibility.
@@ -60,7 +178,7 @@ def approval_hash(pair):
 def validate_pair(pair):
     single.require(isinstance(pair, dict) and type(pair["version"]) is int and pair["version"] == 1,
                    "Invalid pair journal version")
-    single.require(pair["policy"] in {VERIFIED_POLICY, CONDITIONAL_POLICY},
+    single.require(pair["policy"] in {VERIFIED_POLICY, CONDITIONAL_POLICY, MANUAL_POLICY},
                    "Unsupported pair settlement or execution policy")
     single.require(pair["state"] in STATES and pair["approval"] == approval_hash(pair),
                    "Invalid pair state or approval")
@@ -88,7 +206,11 @@ def validate_pair(pair):
     cost = sum(Decimal(str(body["price"])) for body in bodies)
     single.require(Decimal(1) - cost >= Decimal(str(MIN_EDGE)), "Pair limits fail the minimum edge policy")
     context = pair["market_context"]
-    if pair["policy"] == CONDITIONAL_POLICY:
+    if pair["policy"] == MANUAL_POLICY:
+        validate_manual_context(context)
+        single.require(all(material["tournament_slug"] == "midterm-elections" for material in materials),
+                       "Manual test belongs to another competition")
+    elif pair["policy"] == CONDITIONAL_POLICY:
         validate_conditional_context(context)
         single.require(cost <= CONDITIONAL_SPEND_CAP, "Conditional pair exceeds its 0.970 contract-cost cap")
         single.require(all(material["tournament_slug"] == "midterm-elections" for material in materials),
@@ -227,18 +349,22 @@ def set_state(pair, directory, state):
     pair.update(proposed)
 
 
-def prepare_pair(session, directory, democrat_id, republican_id, slug="midterm-elections", conditional=False):
+def prepare_pair(session, directory, democrat_id, republican_id, slug="midterm-elections", conditional=False,
+                 manual_approval=None):
     quarantine.require_writable_path(directory)
     quarantine.require_unblocked_markets([democrat_id, republican_id])
     single.require(not Path(directory).exists(), "Pair directory already exists; preserve every prior attempt")
     single.require(not single.STATE_PATH.exists(), "A single-order test journal exists; resolve it before preparing a pair")
     single.require(type(conditional) is bool, "Preparation policy must be explicit")
+    single.require(not (conditional and manual_approval is not None), "Choose exactly one settlement policy")
     if conditional:
         single.require([str(democrat_id), str(republican_id)] == CONDITIONAL_MARKETS
                        and slug == "midterm-elections", "Conditional preparation is limited to markets 387/388")
     started = time.monotonic()
     account = read_account(session, slug)
-    if conditional:
+    if manual_approval is not None:
+        preview = manual_preview(session, account, democrat_id, republican_id, started, approval=manual_approval)
+    elif conditional:
         preview = conditional_preview(session, account, democrat_id, republican_id, started)
     else:
         preview = preview_pair(session, account, democrat_id, republican_id, "NO-PAIR", started, quantity=1)
@@ -253,7 +379,7 @@ def prepare_pair(session, directory, democrat_id, republican_id, slug="midterm-e
         intent["approval"] = single.approval_hash(intent)
         single.validate_intent(intent)
         legs.append(intent)
-    policy = CONDITIONAL_POLICY if conditional else VERIFIED_POLICY
+    policy = MANUAL_POLICY if manual_approval is not None else CONDITIONAL_POLICY if conditional else VERIFIED_POLICY
     pair = {"version": 1, "policy": policy, "state": "PREPARED",
             "created_at": now.isoformat(timespec="seconds"), "market_context": copy.deepcopy(preview["market_context"]),
             "requests": [{key: leg[key] for key in ("market_id", "tournament_slug", "request")} for leg in legs]}
@@ -282,7 +408,11 @@ def preflight_pair(session, pair):
     materials = pair["requests"]
     quarantine.require_unblocked_markets([material["market_id"] for material in materials])
     account = read_account(session, materials[0]["tournament_slug"])
-    if pair["policy"] == CONDITIONAL_POLICY:
+    if pair["policy"] == MANUAL_POLICY:
+        saved = pair["market_context"]["manual_approval"]
+        preview = manual_preview(session, account, materials[0]["market_id"], materials[1]["market_id"], started,
+                                 approval=saved["evidence_hash"], approved_at=saved["approved_at"])
+    elif pair["policy"] == CONDITIONAL_POLICY:
         preview = conditional_preview(session, account, materials[0]["market_id"], materials[1]["market_id"], started)
     else:
         preview = preview_pair(session, account, materials[0]["market_id"], materials[1]["market_id"],
@@ -339,7 +469,7 @@ def reconcile_pair_account(session, pair, legs):
     single.require(account["tournament"]["id"] == pair["market_context"]["tournament_id"],
                    "Reconciliation account scope changed")
     positions = {numeric_id(row["exchangeId"]): row for row in account["positions"]}
-    total_cost = 0
+    total_cost = Decimal(0)
     for leg in legs:
         exchange_id = leg["request"]["exchangeId"]
         quantity = filled_quantity(leg)
@@ -353,9 +483,23 @@ def reconcile_pair_account(session, pair, legs):
                        "Account inventory or cost disagrees with confirmed NO fills")
         single.require(not any(numeric_id(order["exchangeId"]) == exchange_id for order in account["orders"]),
                        "A selected exchange still has an open order")
-        total_cost += cost
-    single.require(math.isclose(account["tournament"]["myBalance"], pair["starting_cash"] - total_cost,
-                                rel_tol=0, abs_tol=1e-8),
+        total_cost += Decimal(str(cost))
+    cash = Decimal(str(account["tournament"]["myBalance"]))
+    baseline = Decimal(str(pair["starting_cash"]))
+    cash_matches = math.isclose(float(cash), float(baseline - total_cost), rel_tol=0, abs_tol=1e-8)
+    cent = Decimal(".01")
+    if all(math.isclose(float(value), float(value.quantize(cent)), rel_tol=0, abs_tol=1e-8)
+           for value in (baseline, cash)):
+        # The API documents myBalance as rounded to cents, while a fill can
+        # cost .335. Two rounded balances can show a debit of .33 or .34.
+        # Whole-cent fills still require the exact debit: this is not a blanket
+        # one-cent tolerance that could hide another trade or a late fill.
+        debit = total_cost.quantize(Decimal(".00000001"))  # Drop float arithmetic noise only.
+        cash_matches = cash_matches or any(
+            math.isclose(float(cash), float(baseline - debit.quantize(cent, rounding=rounding)),
+                         rel_tol=0, abs_tol=1e-8)
+            for rounding in (ROUND_FLOOR, ROUND_CEILING))
+    single.require(cash_matches,
                    "Account cash disagrees with confirmed spend; inspect other activity or reporting")
     single.require(0 <= time.monotonic() - started <= 15, "Account reconciliation became stale")
 
@@ -363,6 +507,11 @@ def reconcile_pair_account(session, pair, legs):
 def recheck_second_leg_settlement(session, pair):
     """A full first fill does not authorize buying after settlement rules change."""
     original = pair["market_context"]
+    if pair["policy"] == MANUAL_POLICY:
+        _, record = read_manual_evidence(session, original["tournament_id"], *original["market_ids"])
+        single.require(record["evidence_hash"] == original["settlement_fingerprint"],
+                       "Manual settlement evidence changed; second leg blocked")
+        return
     markets = read_selected_pair(session, original["tournament_id"], *original["market_ids"])
     single.require([get_exchange_id(market) for market in markets] == original["exchange_ids"],
                    "Pair exchange identity changed after the first leg")
@@ -397,6 +546,7 @@ def submit_pair(session, directory, approval):
     with operation_lock(directory):
         pair, legs = load_pair(directory)
         require_approval(pair, approval)
+        single.require(pair["policy"] != MANUAL_POLICY, "Manual pairs require separate supervised leg commands")
         single.require(pair["state"] == "PREPARED", "This pair was already attempted; do not replay or replace it")
         single.require(not single.STATE_PATH.exists(), "A single-order journal exists; resolve it before this pair")
         pair["starting_cash"] = preflight_pair(session, pair)
@@ -424,6 +574,53 @@ def submit_pair(session, directory, approval):
             # the in-memory ticket or infer that an exception means no execution.
             set_state(pair, directory, "UNKNOWN")
             raise single.TestError("Pair stopped with an unresolved outcome; restore journals and check known orders") from error
+        return load_pair(directory)
+
+
+def submit_manual_leg(session, directory, index):
+    """Submit exactly one selected leg after an interactive human confirmation.
+
+    A second process invocation is required for leg two. Restart/check/cancel
+    commands never call this function or submit a still-PREPARED remainder.
+    """
+    quarantine.require_writable_path(directory)
+    with operation_lock(directory):
+        pair, legs = load_pair(directory)
+        single.require(pair["policy"] == MANUAL_POLICY and type(index) is int and index in (0, 1),
+                       "Separate leg commands are limited to the supervised manual pair")
+        single.require(not single.STATE_PATH.exists(), "A single-order journal exists; resolve it before this pair")
+        if index == 0:
+            single.require(pair["state"] == "PREPARED", "Leg one was already attempted; never retry it")
+        else:
+            single.require(pair["state"] == "UNMATCHED" and legs[0]["state"] == "OBSERVED_TERMINAL"
+                           and math.isclose(filled_quantity(legs[0]), 1, rel_tol=0, abs_tol=1e-9)
+                           and legs[1]["state"] == "PREPARED",
+                           "Leg two requires a reconciled full leg one and an unattempted leg two")
+        print_pair(pair, legs)
+        single.require(sys.stdin.isatty(), "Manual placement requires an interactive supervising terminal")
+        confirmation = input(f"Submit ONLY leg {index + 1}? Paste the full reviewed pair fingerprint: ")
+        require_approval(pair, confirmation)
+        # Re-read after the human prompt so time spent reviewing cannot make
+        # the account, quotes or settlement observations stale before placement.
+        if index == 0:
+            pair["starting_cash"] = preflight_pair(session, pair)
+        else:
+            recheck_second_leg_settlement(session, pair)
+            reconcile_pair_account(session, pair, legs)
+        set_state(pair, directory, "EXECUTING")
+        try:
+            leg, path = legs[index], leg_path(directory, index)
+            single.submit_test(session, leg, path, leg["approval"])
+            if leg["order_id"] is not None:
+                single.check_test(session, leg, path)
+                if (leg["observation"] or {}).get("open"):
+                    single.cancel_test(session, leg, path, leg["approval"])
+            # The existing account reconciliation retains actual partial or
+            # one-sided holdings. UNKNOWN observations never authorize leg two.
+            record_pair_outcome(session, pair, legs, directory)
+        except API_ERRORS as error:
+            set_state(pair, directory, "UNKNOWN")
+            raise single.TestError("Manual leg stopped unresolved; preserve journals and do not retry") from error
         return load_pair(directory)
 
 
@@ -534,8 +731,18 @@ def print_pair(pair, legs):
     quarantine.print_quarantine(pair["market_context"]["tournament_id"])
     maximum = sum(Decimal(str(material["request"]["price"])) for material in pair["requests"])
     print(f"SUPERVISED ONE-PAIR TEST | {pair['state']} | maximum contract spend {maximum:.3f} SUSQies; fees unverified")
-    if pair["policy"] == CONDITIONAL_POLICY:
-        print("CONDITIONAL SETTLEMENT POLICY | not a verified arbitrage")
+    if pair["policy"] == MANUAL_POLICY:
+        record = pair["market_context"]["manual_approval"]
+        print("MANUALLY VERIFIED | supervised one-contract test only | automatic use prohibited")
+        print(f"Settlement approval recorded: {record['approved_at']} | evidence {record['evidence_hash']}")
+        print(record["proposition"])
+        for source in record["source_refs"]:
+            print(f"Official evidence: {source}")
+        for limitation in record["limitations"]:
+            print(limitation)
+        print("Separate human-confirmed commands are required for each leg.")
+    elif pair["policy"] == CONDITIONAL_POLICY:
+        print("UNVERIFIED | CONDITIONAL SETTLEMENT POLICY | not a verified arbitrage")
         evidence = "present" if pair["market_context"]["relationship_verified"] else "MISSING"
         print(f"Engine ordinary-payout relationship at preparation: {evidence}")
         for assumption in pair["market_context"]["assumptions"]:
@@ -543,7 +750,7 @@ def print_pair(pair, legs):
         print(f"Conditional gain if both fill at their limits and exactly one selected party wins: {Decimal(1) - maximum:.3f}")
         print(f"Both NO shares losing can lose {maximum:.3f} SUSQies before unverified fees.")
     else:
-        print("Saved normal-payout evidence was verified at preparation and is rechecked before submission.")
+        print("MACHINE-VERIFIED | saved normal-payout evidence is rechecked before submission.")
     print("Exceptional refunds and execution remain risks.")
     print("Approval covers up to two one-share BUY NO orders, plus cancellation of their unfilled remainders.")
     print("First leg must be fully confirmed before second. Held shares are never automatically sold or refunded.")
@@ -564,16 +771,20 @@ def print_pair(pair, legs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "show", "submit", "check", "diagnose", "cancel", "quarantine"))
+    parser.add_argument("action", choices=("prepare", "show", "submit", "check", "diagnose", "cancel", "quarantine",
+                                         "review-manual", "submit-leg-1", "submit-leg-2"))
     parser.add_argument("--dem-market")
     parser.add_argument("--rep-market")
     parser.add_argument("--tournament", default="midterm-elections")
     parser.add_argument("--approve", help="Full saved pair fingerprint for submission or cancellation")
+    parser.add_argument("--manual-approval", help="Prepare only: explicitly approve the reviewed 153/154 evidence hash")
     parser.add_argument("--conditional", action="store_true",
                         help="Preparation only: accept conditional settlement risks for the capped Rhode Island pair")
     args = parser.parse_args()
     if args.conditional and args.action != "prepare":
         parser.error("--conditional is a preparation policy; submission uses the saved policy and exact approval")
+    if args.manual_approval is not None and args.action != "prepare":
+        parser.error("--manual-approval records settlement approval only during explicit preparation")
     if args.action == "prepare" and (args.dem_market is None or args.rep_market is None):
         parser.error("Preparation requires both market IDs")
     try:
@@ -591,8 +802,9 @@ def main():
         if args.action == "show" and not args.state.exists() and quarantine.load_quarantine():
             print("No active pair prepared. Unrelated verified pairs may undergo readiness checks.")
             return 0
-        if args.action == "prepare":
+        if args.action in {"prepare", "review-manual"}:
             single.require(not args.state.exists(), "Pair directory already exists; preserve it")
+            single.require(not single.STATE_PATH.exists(), "A single-order journal exists; resolve it before this pair")
         else:
             pair, legs = load_pair(args.state)
             if args.action == "show":
@@ -605,9 +817,23 @@ def main():
         single.require(bool(api_key), "Set SIG_API_KEY locally before using the paired test")
         with requests.Session() as session:
             session.headers.update({"Authorization": f"Bearer {api_key}"})
-            if args.action == "prepare":
+            if args.action == "review-manual":
+                started = time.monotonic()
+                account = read_account(session, "midterm-elections")
+                proposal = manual_preview(session, account, *MANUAL_MARKETS, started)
+                print("GET-ONLY READINESS | 153/154 | quantity exactly 1 NO per leg")
+                print("Settlement review awaits the operator's explicit approval; no approval or journal created.")
+                print(json.dumps(proposal["market_context"]["manual_approval"], indent=2))
+                print(f"Current tick-rounded prices: {proposal['market_context']['leg_prices']} | "
+                      f"maximum new contract spend {proposal['max_new_spend']:.3f} | "
+                      f"ordinary edge {proposal['ordinary_edge']:.3f}")
+                print(f"Quarantine reserve retained: {proposal['risk']['quarantine_reserve']:.3f}")
+                return 0
+            elif args.action == "prepare":
                 pair, legs = prepare_pair(session, args.state, args.dem_market, args.rep_market,
-                                          args.tournament, conditional=args.conditional)
+                                          args.tournament, conditional=args.conditional, manual_approval=args.manual_approval)
+            elif args.action in {"submit-leg-1", "submit-leg-2"}:
+                pair, legs = submit_manual_leg(session, args.state, 0 if args.action == "submit-leg-1" else 1)
             elif args.action == "submit":
                 pair, legs = submit_pair(session, args.state, args.approve)
             elif args.action == "check":

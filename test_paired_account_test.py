@@ -159,6 +159,194 @@ class PairedAccountTests(unittest.TestCase):
         with patch.object(paired, "preflight_pair", return_value=self.account["tournament"]["myBalance"]), patch.object(single, "read_test_inputs", side_effect=inputs):
             return paired.submit_pair(self.session, self.directory, pair["approval"])
 
+    def manual_payloads(self):
+        markets = [party_market(party, market, exchange) for party, market, exchange in
+                   (("Democratic", 153, 842), ("Republican", 154, 843))]
+        trees = []
+        for party, market in (("Democratic", 153), ("Republican", 154)):
+            tree = election_tree(party, market)
+            tree["root"].update(contract_type="Freeform",
+                                contract_details={"description": paired.manual_rule_description(party),
+                                                  "contractType": "Freeform"})
+            trees.append(tree)
+        return markets + trees + [exchange_book(153, 842, bid=.6), exchange_book(154, 843, bid=.6)]
+
+    def prepare_manual(self):
+        patcher = patch.object(paired, "MANUAL_TOURNAMENT", TOURNAMENT_ID)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.session.get.side_effect = [self.response(payload) for payload in self.manual_payloads()]
+        review = paired.manual_preview(self.session, self.account, "153", "154", 100)
+        self.assertIsNone(review["market_context"]["manual_approval"]["approved_at"])
+        self.assertFalse(self.directory.exists())
+        self.session.get.side_effect = [self.response(payload) for payload in self.manual_payloads()]
+        with patch.object(paired, "read_account", return_value=self.account):
+            return paired.prepare_pair(self.session, self.directory, "153", "154",
+                                       manual_approval=review["market_context"]["settlement_fingerprint"])
+
+    def execute_manual_leg(self, pair, index):
+        def inputs(session, market_id, side, slug):
+            exchange = "842" if market_id == "153" else "843"
+            account = self.venue_account()
+            index = pair["market_context"]["market_ids"].index(market_id)
+            price = pair["requests"][index]["request"]["price"]
+            return account, exchange, price, single.account_risk(account, [exchange])
+        with patch.object(paired, "preflight_pair", return_value=self.account["tournament"]["myBalance"]), \
+                patch.object(single, "read_test_inputs", side_effect=inputs), \
+                patch.object(paired.sys.stdin, "isatty", return_value=True), \
+                patch("builtins.input", return_value=pair["approval"]), contextlib.redirect_stdout(self.output):
+            return paired.submit_manual_leg(self.session, self.directory, index)
+
+    def test_manual_approval_is_persistent_pair_specific_and_not_granted_by_review(self):
+        pair, legs = self.prepare_manual()
+        saved, _ = paired.load_pair(self.directory)
+        record = saved["market_context"]["manual_approval"]
+        self.assertEqual(pair["policy"], paired.MANUAL_POLICY)
+        self.assertEqual(record["market_ids"], ["153", "154"])
+        self.assertEqual(record["exchange_ids"], ["842", "843"])
+        self.assertEqual(record["max_quantity"], 1)
+        self.assertEqual(record["allowed_mode"], paired.MANUAL_POLICY)
+        self.assertTrue(record["approved_at"])
+        self.assertEqual([leg["request"]["quantity"] for leg in legs], [1, 1])
+        self.session.post.assert_not_called()
+
+    def test_manual_approval_cannot_change_ids_sources_mode_quantity_rules_or_hash(self):
+        pair, _ = self.prepare_manual()
+        changes = (("market_ids", ["387", "388"]), ("exchange_ids", ["11", "12"]),
+                   ("tournament_id", "550e8400-e29b-41d4-a716-446655440001"),
+                   ("source_refs", []), ("max_quantity", 2), ("max_quantity", True),
+                   ("allowed_mode", "automatic"), ("evidence_hash", "a" * 64),
+                   ("approved_at", None), ("proposition", "Both YES can win"), ("limitations", []))
+        for name, value in changes:
+            with self.subTest(field=name):
+                bad = copy.deepcopy(pair)
+                bad["market_context"]["manual_approval"][name] = value
+                bad["approval"] = paired.approval_hash(bad)
+                with self.assertRaises(single.TestError):
+                    paired.validate_pair(bad)
+        bad = copy.deepcopy(pair)
+        bad["market_context"]["manual_approval"]["rules"][0]["contract_details"]["description"] += " changed"
+        bad["approval"] = paired.approval_hash(bad)
+        with self.assertRaises(single.TestError):
+            paired.validate_pair(bad)
+
+    def test_manual_preflight_rejects_changed_rule_evidence_before_any_post(self):
+        pair, _ = self.prepare_manual()
+        payloads = self.manual_payloads()
+        payloads[2]["root"]["settlement_date"] = "2026-12-01T17:00:00Z"
+        self.session.get.side_effect = [self.response(payload) for payload in payloads]
+        with patch.object(paired, "read_account", return_value=self.account):
+            with self.assertRaisesRegex(single.TestError, "evidence hash"):
+                paired.preflight_pair(self.session, pair)
+        self.session.post.assert_not_called()
+
+    def test_manual_pair_cannot_use_the_automatic_two_leg_command(self):
+        pair, _ = self.prepare_manual()
+        with self.assertRaisesRegex(single.TestError, "separate supervised"):
+            paired.submit_pair(self.session, self.directory, pair["approval"])
+        self.session.post.assert_not_called()
+
+    def test_manual_leg_requires_a_human_terminal_and_exact_confirmation(self):
+        pair, _ = self.prepare_manual()
+        with contextlib.redirect_stdout(self.output), patch.object(paired.sys.stdin, "isatty", return_value=False):
+            with self.assertRaisesRegex(single.TestError, "interactive"):
+                paired.submit_manual_leg(self.session, self.directory, 0)
+        with contextlib.redirect_stdout(self.output), patch.object(paired.sys.stdin, "isatty", return_value=True), \
+                patch("builtins.input", return_value="wrong"):
+            with self.assertRaisesRegex(single.TestError, "Exact saved"):
+                paired.submit_manual_leg(self.session, self.directory, 0)
+        self.session.post.assert_not_called()
+        self.assertEqual(paired.load_pair(self.directory)[0]["state"], "PREPARED")
+
+    def test_manual_full_first_leg_stops_and_restart_check_never_submits_second(self):
+        pair, _ = self.prepare_manual()
+        self.install_venue()
+        first, legs = self.execute_manual_leg(pair, 0)
+        self.assertEqual(first["state"], "UNMATCHED")
+        self.assertEqual([paired.filled_quantity(leg) for leg in legs], [1, 0])
+        self.assertEqual(self.session.post.call_count, 1)
+        paired.check_pair(self.session, self.directory)
+        self.assertEqual(self.session.post.call_count, 1)
+        completed, _ = self.execute_manual_leg(first, 1)
+        self.assertEqual(completed["state"], "COMPLETE")
+        self.assertEqual(self.session.post.call_count, 2)
+        for index in (0, 1):
+            with self.assertRaises(single.TestError):
+                self.execute_manual_leg(completed, index)
+        self.assertEqual(self.session.post.call_count, 2)
+
+    def test_manual_half_cent_prices_reconcile_rounded_cash_after_each_leg(self):
+        payloads = self.manual_payloads()
+        payloads[-2:] = [exchange_book(153, 842, bid=.665, ask=.67),
+                        exchange_book(154, 843, bid=.365, ask=.37)]
+        with patch.object(self, "manual_payloads", return_value=payloads):
+            pair, _ = self.prepare_manual()
+        self.install_venue()
+        def rounded_account(*args):
+            account = self.venue_account()
+            account["tournament"]["myBalance"] = round(account["tournament"]["myBalance"], 2)
+            return account
+        with patch.object(paired, "read_account", side_effect=rounded_account):
+            first, _ = self.execute_manual_leg(pair, 0)
+            self.assertEqual(first["state"], "UNMATCHED")
+            self.assertEqual(self.session.post.call_count, 1)
+            completed, _ = self.execute_manual_leg(first, 1)
+        self.assertEqual(completed["state"], "COMPLETE")
+        self.assertEqual(self.session.post.call_count, 2)
+        self.assertEqual(rounded_account()["tournament"]["myBalance"], 4999.03)
+
+    def test_manual_partial_first_leg_blocks_second_and_retries(self):
+        pair, _ = self.prepare_manual()
+        self.install_venue(fills=(.5, 1))
+        first, legs = self.execute_manual_leg(pair, 0)
+        self.assertEqual(first["state"], "UNMATCHED")
+        self.assertEqual(paired.filled_quantity(legs[0]), .5)
+        for index in (0, 1):
+            with self.assertRaises(single.TestError):
+                self.execute_manual_leg(first, index)
+        self.assertEqual(self.session.post.call_count, 1)
+
+    def test_manual_timeout_first_leg_is_unknown_and_never_retried(self):
+        pair, _ = self.prepare_manual()
+        self.install_venue(unknown_at=0)
+        with self.assertRaisesRegex(single.TestError, "unresolved"):
+            self.execute_manual_leg(pair, 0)
+        unknown, _ = paired.load_pair(self.directory)
+        self.assertEqual(unknown["state"], "UNKNOWN")
+        for index in (0, 1):
+            with self.assertRaises(single.TestError):
+                self.execute_manual_leg(unknown, index)
+        self.assertEqual(self.session.post.call_count, 1)
+
+    def test_manual_second_leg_changed_evidence_blocks_before_submission(self):
+        pair, _ = self.prepare_manual()
+        payloads = self.manual_payloads()[:4]
+        payloads[2]["root"]["settlement_date"] = "2026-12-01T17:00:00Z"
+        self.session.get.side_effect = [self.response(payload) for payload in payloads]
+        with self.assertRaisesRegex(single.TestError, "evidence changed"):
+            paired.recheck_second_leg_settlement(self.session, pair)
+        self.session.post.assert_not_called()
+
+    def test_manual_preview_keeps_existing_depth_edge_and_account_risk_checks(self):
+        pair, _ = self.prepare_manual()
+        for change in ("depth", "edge", "cash", "holding"):
+            with self.subTest(check=change):
+                payloads = self.manual_payloads()
+                account = copy.deepcopy(self.account)
+                if change == "depth":
+                    payloads[4]["bids"][0]["quantity"] = 1
+                elif change == "edge":
+                    payloads[4]["bids"][0]["price"] = .35
+                    payloads[5]["bids"][0]["price"] = .35
+                elif change == "cash":
+                    account["tournament"]["myBalance"] = .1
+                else:
+                    account = account_snapshot([position("842", "153", -1)])
+                self.session.get.side_effect = [self.response(payload) for payload in payloads]
+                with self.assertRaises((single.TestError, order_preview.PreviewBlocked)):
+                    paired.manual_preview(self.session, account, "153", "154", 100)
+        self.session.post.assert_not_called()
+
     def test_full_pair_uses_two_durable_distinct_requests_and_never_replays(self):
         pair, _ = self.prepare()
         self.install_venue()
@@ -778,6 +966,44 @@ class PairedAccountTests(unittest.TestCase):
                 self.assertEqual(legs[1]["state"], "PREPARED")
                 self.assertEqual(self.session.post.call_count, 1)
                 self.session.delete.assert_not_called()
+
+    def test_reconciliation_accepts_only_documented_cent_rounding_of_confirmed_spend(self):
+        pair, legs = self.prepare_manual()
+        pair["starting_cash"] = 5000
+        cases = ((1, .335, (4999.66, 4999.67), (4999.65, 4999.68)),
+                 (.5, .1675, (4999.83, 4999.84), (4999.82, 4999.85)),
+                 (1, .4, (4999.6,), (4999.59, 4999.61)))
+        for quantity, cost, accepted, rejected in cases:
+            legs[0].update(state="OBSERVED_TERMINAL", order_id=101,
+                           observation={"filled_quantity": quantity, "filled_cost": cost, "open": False})
+            holding = position(842, 153, -quantity)
+            holding["costBasis"] = cost
+            for cash in accepted + rejected:
+                with self.subTest(quantity=quantity, cost=cost, cash=cash), \
+                        patch.object(paired, "read_account", return_value=account_snapshot([holding], cash=cash)):
+                    if cash in accepted:
+                        paired.reconcile_pair_account(self.session, pair, legs)
+                    else:
+                        with self.assertRaisesRegex(single.TestError, "Account cash disagrees"):
+                            paired.reconcile_pair_account(self.session, pair, legs)
+        self.session.post.assert_not_called()
+
+    def test_reconciliation_retains_exact_checks_for_unrounded_cash(self):
+        pair, legs = self.prepare_manual()
+        pair["starting_cash"] = 5000.003
+        legs[0].update(state="OBSERVED_TERMINAL", order_id=101,
+                       observation={"filled_quantity": 1, "filled_cost": .335, "open": False})
+        holding = position(842, 153, -1)
+        holding["costBasis"] = .335
+        for cash in (4999.668, 4999.67):
+            with self.subTest(cash=cash), \
+                    patch.object(paired, "read_account", return_value=account_snapshot([holding], cash=cash)):
+                if cash == 4999.668:
+                    paired.reconcile_pair_account(self.session, pair, legs)
+                else:
+                    with self.assertRaisesRegex(single.TestError, "Account cash disagrees"):
+                        paired.reconcile_pair_account(self.session, pair, legs)
+        self.session.post.assert_not_called()
 
     def test_final_account_mismatch_cannot_report_complete_and_get_only_check_recovers(self):
         for change in ("inventory", "cash"):
