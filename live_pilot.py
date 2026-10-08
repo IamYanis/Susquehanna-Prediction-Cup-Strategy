@@ -23,13 +23,15 @@ import requests
 from dotenv import load_dotenv
 
 import config
+import live_settlement
+import pilot_account
 import account_test as single
 import paired_account_test as paired
 import execution_quarantine as quarantine
 import price_reader as scanner
 from account_reader import read_account
 from order_preview import account_risk, observed_limits, read_selected_pair
-from paper_trader import parse_api_timestamp, validate_paper_market_context
+from paper_trader import parse_api_timestamp, validate_market_context, validate_quote_context
 
 ALLOCATION_PATH = Path(__file__).resolve().with_name("live_pilot_allocation.json")
 UNCERTAIN_STATES = {"SUBMITTING", "UNKNOWN", "CANCEL_REQUESTED", "CANCEL_UNKNOWN", "EXECUTING", "CANCELLING"}
@@ -377,60 +379,99 @@ def pilot_risk(account, exchange_ids, proposed_capital, quantity, checkpoint):
             "total_exposure_after": float(exposure + capital)}
 
 
-def configured_approval(market_ids, tournament_id=None):
-    matches = [entry for entry in scanner.load_approved_settlements()
-               if entry["market_ids"] == market_ids
-               and (tournament_id is None or entry["tournament_id"] == tournament_id)]
-    require(len(matches) == 1, "Pair is not explicitly approved in the settlement configuration")
-    return matches[0]
+def configured_approval(market_ids, tournament_id=None, slug="midterm-elections"):
+    """LIVE permission is independent of approved_settlements.json (PAPER)."""
+    return live_settlement.configured_authorization(market_ids, tournament_id, slug)
 
 
 def read_settlement(session, markets, tournament_id, approval):
-    """Reuse current ID, rule, evidence-hash and quarantine revalidation."""
-    scanner.check_approved_pair(approval, markets, tournament_id)
-    quarantine.require_unblocked_markets(approval["market_ids"])
-    quarantine.require_unblocked_exchanges(approval["exchange_ids"])
-    missing_graph = False
+    return live_settlement.verify_settlement(session, markets, tournament_id, approval)
+
+
+def read_live_pair(session, approval):
+    """Fresh identity/evidence reads; unavailable or mismatched facts block LIVE."""
     try:
-        allowed, context = scanner.get_pair_rules(session, *markets, tournament_id)
-    except scanner.DataValidationError as error:
-        if ("manual_approval" not in approval
-                or str(error) != "No active relationship verifies this pair's normal payout"):
-            raise
-        missing_graph = True
-    if "manual_approval" in approval:
-        manual = scanner.manual_paper_context(session, tournament_id, approval)
-        if missing_graph:
-            allowed, context = {"NO-PAIR"}, manual
-    return set(allowed).intersection(approval["position_types"]), context
+        markets = read_selected_pair(session, approval["tournament_id"], *approval["market_ids"])
+        allowed, context = read_settlement(session, markets, approval["tournament_id"], approval)
+        return markets, allowed, context
+    except live_settlement.LiveSettlementBlocked:
+        raise
+    except scanner.API_ERRORS as error:
+        raise live_settlement.LiveSettlementBlocked("Authorized markets/mappings or official settlement evidence could not be revalidated") from error
+
+
+def require_settlement_review_clear(checkpoint):
+    """Keep the settlement failure code visible across restarts and config edits."""
+    prefix = live_settlement.NEEDS_REVALIDATION + " | "
+    if checkpoint["manual_review_required"] and checkpoint["review_reason"].startswith(prefix):
+        raise live_settlement.LiveSettlementBlocked(checkpoint["review_reason"][len(prefix):])
+
+
+def actual_account_readiness(session, account, checkpoint, exchange_ids, capital, quantity, started, slug):
+    """GET-only history/receipt checks; never equate fill notional with cash debit.
+
+    Unverified fees/debits are an explicit readiness failure, even if balances,
+    holdings, quotes and settlement all look healthy. There is no override.
+    """
+    snapshot = pilot_account.read_snapshot(session, slug, checkpoint, initial_account=account, started=started)
+    assessment = pilot_account.assess_snapshot(snapshot, checkpoint, exchange_ids, capital, quantity)
+    pilot_account.require_ready(assessment)
+    return snapshot["account"], assessment
 
 
 def audit_candidate(session, market_ids, checkpoint, slug="midterm-elections", position_type="NO-PAIR", quantity=1):
+    """Latch live settlement failures using the existing durable process lock."""
+    with pilot_lock() as state_path:
+        current = _read_checkpoint_locked(state_path)
+        require_settlement_review_clear(current)
+        require_execution_clear(current)
+        require(current == checkpoint, "Stale pilot checkpoint; reload before readiness checks")
+        try:
+            return _audit_candidate(session, market_ids, current, slug, position_type, quantity)
+        except (live_settlement.LiveSettlementBlocked, pilot_account.AccountReadinessBlocked) as error:
+            if isinstance(error, pilot_account.AccountReadinessBlocked) or error.code == live_settlement.NEEDS_REVALIDATION:
+                _save_checkpoint_locked(halted_result(current, str(error))["checkpoint"], state_path)
+            raise
+
+
+def _audit_candidate(session, market_ids, checkpoint, slug="midterm-elections", position_type="NO-PAIR", quantity=1):
     """GET-only assessment. No request body, order key, staged trade or journal."""
-    configured_approval(market_ids)  # Reject unlisted pairs before any API read.
-    require_execution_clear(checkpoint)
+    approval = configured_approval(market_ids, checkpoint["tournament_id"], slug)
     started = time.monotonic()
-    account = read_account(session, slug)
+    account = pilot_account.read_current_account(session, slug)
     tournament_id = account["tournament"]["id"]
-    approval = configured_approval(market_ids, tournament_id)
+    live_settlement.require(tournament_id == approval["tournament_id"] and account["tournament"]["slug"] == slug,
+                            "Actual account tournament scope changed")
+    live_settlement.revalidate_authorization(approval)
     require(position_type in approval["position_types"] and type(quantity) is int
             and quantity == 1 and quantity <= approval["max_quantity"], "Pair direction or quantity is not approved")
-    markets = read_selected_pair(session, tournament_id, *market_ids)
-    allowed, context = read_settlement(session, markets, tournament_id, approval)
+    markets, allowed, context = read_live_pair(session, approval)
     require(position_type in allowed, "Settlement relationship is unverified or invalid")
     books = [scanner.get_best_prices(session, market, tournament_id) for market in markets]
     prices, _, cost, edge = observed_limits(position_type, books, started, quantity=quantity)
     context = {**context, "leg_prices": prices, "book_versions": [book["version"] for book in books]}
-    validate_paper_market_context({"market_context": context, "position_type": position_type,
-                                  "quantity": quantity, "cost_per_pair": float(cost)})
-    risk = pilot_risk(account, approval["exchange_ids"], cost, quantity, checkpoint)
+    position = {"market_context": context, "position_type": position_type, "quantity": quantity, "cost_per_pair": float(cost)}
+    if "manual_approval" in context:
+        paired.validate_manual_context(context)
+        validate_quote_context(position)
+    else:
+        validate_market_context(position)
+    account, account_readiness = actual_account_readiness(
+        session, account, checkpoint, approval["exchange_ids"], cost, quantity, started, slug)
+    risk = account_readiness["risk"]
+    # History reads take time. Retest the SAME quotes at the end; do not silently
+    # refresh or accept books that aged while account reconciliation was read.
+    observed_limits(position_type, books, started, quantity=quantity)
+    live_settlement.revalidate_authorization(approval)
     return {"mode": config.LIVE_PILOT_DISABLED, "live_eligible": False, "submission_enabled": False,
             "checks_passed": True, "pair": approval["pair_name"], "market_ids": market_ids,
             "exchange_ids": approval["exchange_ids"], "position": position_type, "quantity_per_leg": quantity,
             "prices": prices, "capital": float(cost), "edge": float(edge), "risk": risk,
-            "settlement_route": "manual-paper-approval" if "manual_approval" in context else "machine-verified",
-            "blockers": ["Pilot submission is disabled and has no adapter",
-                         "approved_settlements.json currently authorizes PAPER only"]}
+            "account_readiness": account_readiness,
+            "settlement_route": approval["verification_route"], "settlement_status": live_settlement.VERIFIED,
+            "live_authorization": {"approval_version": approval["approval_version"], "approved_at": approval["approved_at"],
+                                   "evidence_hash": approval["evidence_hash"], "execution_mode": approval["execution_mode"]},
+            "blockers": ["Pilot submission is disabled and has no adapter"]}
 
 
 def halted_result(checkpoint, reason, legs=None):
@@ -465,6 +506,11 @@ def _observe_pilot_pair(session, pair, legs, checkpoint, on_observation):
                 leg["state"], leg["observation"] = single.observe_test(session, leg)
                 on_observation(observed)  # Persist each confirmed leg before reading the next.
         account = paired.reconcile_pair_account(session, pair, observed)
+        # Keep observed inventory/notional charges durably for review, but do
+        # not report completed debit accounting or credit available capacity
+        # until the fee/cash model has an authoritative basis. This is a halt,
+        # never a reason to retry the already observed order.
+        pilot_account.require_verified_accounting()
         fingerprint = pair["approval"]
         prior_cost = amount(checkpoint["accounted_pair_costs"].get(fingerprint, 0))
         if fingerprint not in checkpoint["accounted_pair_costs"]:
@@ -487,6 +533,8 @@ def _observe_pilot_pair(session, pair, legs, checkpoint, on_observation):
                 "pair_approval": pair["approval"],
                 "account": account, "observed_at": time.monotonic(), "confirmed_quantities": quantities,
                 "confirmed_cost": float(total_cost), "live_eligible": False, "submission_enabled": False}
+    except pilot_account.AccountReadinessBlocked as error:
+        return halted_result(checkpoint, str(error), observed)
     except scanner.API_ERRORS:
         # Includes timeout, 429, incomplete/stale fill pages and account mismatch.
         return halted_result(checkpoint, "Order/fill/account reconciliation uncertain; stop for manual review", observed)
@@ -590,12 +638,14 @@ def consider_second_leg(session, pair, reconciliation, manually_supervised=False
             "Second leg requires a fresh explicit supervised decision; restart cannot continue it")
     with pilot_lock() as state_path:
         current = _read_checkpoint_locked(state_path)
+        require_settlement_review_clear(current)
         require(not current["manual_review_required"], "Pilot halted for manual review")
         require(current == reconciliation["checkpoint"], "Second-leg diagnostic has a stale pilot checkpoint")
         try:
             return _consider_second_leg(session, pair, reconciliation, manually_supervised, restarted)
-        except scanner.API_ERRORS:
-            halted = halted_result(current, "Second-leg checks failed; manual review required")["checkpoint"]
+        except scanner.API_ERRORS as error:
+            reason = str(error) if isinstance(error, (live_settlement.LiveSettlementBlocked, pilot_account.AccountReadinessBlocked)) else "Second-leg checks failed; manual review required"
+            halted = halted_result(current, reason)["checkpoint"]
             _save_checkpoint_locked(halted, state_path)
             raise
 
@@ -617,11 +667,13 @@ def _consider_second_leg(session, pair, reconciliation, manually_supervised=Fals
     checkpoint = reconciliation["checkpoint"]
     require(not checkpoint["manual_review_required"], "Pilot halted for manual review")
     context = pair["market_context"]
-    approval = configured_approval(context["market_ids"], context["tournament_id"])
-    markets = read_selected_pair(session, context["tournament_id"], *context["market_ids"])
-    allowed, current = read_settlement(session, markets, context["tournament_id"], approval)
-    require("NO-PAIR" in allowed and current["settlement_fingerprint"] == context["settlement_fingerprint"],
-            "Second-leg settlement evidence changed; needs revalidation")
+    try:
+        approval = configured_approval(context["market_ids"], context["tournament_id"], first["tournament_slug"])
+    except live_settlement.LiveSettlementBlocked as error:
+        raise live_settlement.LiveSettlementBlocked("Second-leg pair is not explicitly live-approved or its authorization changed") from error
+    markets, allowed, current = read_live_pair(session, approval)
+    live_settlement.require("NO-PAIR" in allowed and current["settlement_fingerprint"] == context["settlement_fingerprint"],
+                            "Second-leg settlement evidence changed")
     books = [scanner.get_best_prices(session, market, context["tournament_id"]) for market in markets]
     prices, _, _, _ = observed_limits("NO-PAIR", books, reconciliation["observed_at"], quantity=1)
     second_price = amount(prices[1])
@@ -630,8 +682,14 @@ def _consider_second_leg(session, pair, reconciliation, manually_supervised=Fals
     require(Decimal(1) - first_cost - second_price >= Decimal(str(scanner.MIN_EDGE)),
             "Actual first fill plus current second quote fails the existing live edge")
     require(first_cost + second_price <= config.MAX_LIVE_CAPITAL_PER_TRADE, "Pilot paired capital limit exceeded")
-    risk = pilot_risk(reconciliation["account"], [context["exchange_ids"][1]], second_price, 1, checkpoint)
+    _, account_readiness = actual_account_readiness(
+        session, reconciliation["account"], checkpoint, [context["exchange_ids"][1]],
+        second_price, 1, reconciliation["observed_at"], first["tournament_slug"])
+    risk = account_readiness["risk"]
+    observed_limits("NO-PAIR", books, reconciliation["observed_at"], quantity=1)
+    live_settlement.revalidate_authorization(approval)
     return {"checks_passed": True, "second_leg_price": float(second_price), "risk": risk,
+            "account_readiness": account_readiness,
             "live_eligible": False, "submission_enabled": False}
 
 
@@ -642,7 +700,7 @@ def print_policy():
           f"quantity/leg {config.MAX_LIVE_QUANTITY_PER_LEG}")
     print("Existing live edge remains 2%; quote freshness and depth checks are unchanged.")
     print("Activation blockers: explicit account baseline initialization, pilot-scoped settlement authorization, "
-          "and an explicitly gated supervised executor. None is enabled by this checker.")
+          "verified fee/debit accounting, and an explicitly gated supervised executor. None is enabled by this checker.")
 
 
 def print_checkpoint(checkpoint):
@@ -691,9 +749,15 @@ def main():
                 print_checkpoint(checkpoint)
                 if not diagnostic:
                     return 1 if checkpoint["manual_review_required"] else 0
+                require_settlement_review_clear(checkpoint)
                 require(not checkpoint["manual_review_required"], "Pilot halted for manual review; no further live trading")
                 ids = [scanner.numeric_id(args.dem_market), scanner.numeric_id(args.rep_market)]
-                configured_approval(ids)
+                try:
+                    configured_approval(ids, checkpoint["tournament_id"])
+                except live_settlement.LiveSettlementBlocked as error:
+                    if error.code == live_settlement.NEEDS_REVALIDATION:
+                        _save_checkpoint_locked(halted_result(checkpoint, str(error))["checkpoint"], state_path)
+                    raise
             load_dotenv()
             api_key = os.getenv("SIG_API_KEY")
             require(bool(api_key), "Set SIG_API_KEY locally before GET-only diagnostics")
@@ -709,8 +773,11 @@ def main():
                         checkpoint = _save_checkpoint_locked(checkpoint, state_path)
                         print(json.dumps(result, indent=2))
                     except (KeyboardInterrupt, *scanner.API_ERRORS) as error:
-                        checkpoint = halted_result(checkpoint, "Pilot readiness/account checks failed; manual review required")["checkpoint"]
-                        _save_checkpoint_locked(checkpoint, state_path)
+                        checkpoint = _read_checkpoint_locked(state_path)
+                        if not checkpoint["manual_review_required"]:
+                            reason = str(error) if isinstance(error, (live_settlement.LiveSettlementBlocked, pilot_account.AccountReadinessBlocked)) else "Pilot readiness/account checks failed; manual review required"
+                            checkpoint = halted_result(checkpoint, reason)["checkpoint"]
+                            _save_checkpoint_locked(checkpoint, state_path)
                         if isinstance(error, KeyboardInterrupt):
                             raise
                         raise
@@ -718,7 +785,7 @@ def main():
         print("Stopped; any unfinished execution remains blocked for manual review.")
         return 130
     except scanner.API_ERRORS as error:
-        print(f"BLOCKED | {str(error) if isinstance(error, PilotBlocked) else 'Read-only pilot observations unavailable or invalid'}")
+        print(f"BLOCKED | {str(error) if isinstance(error, (PilotBlocked, live_settlement.LiveSettlementBlocked, pilot_account.AccountReadinessBlocked)) else 'Read-only pilot observations unavailable or invalid'}")
         return 1
     return 0
 

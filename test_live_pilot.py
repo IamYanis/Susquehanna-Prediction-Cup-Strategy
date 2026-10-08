@@ -1,6 +1,7 @@
 """Disabled pilot tests: fake HTTP, synthetic accounting, temporary files only."""
 import contextlib
 import copy
+import hashlib
 import io
 import json
 import tempfile
@@ -14,10 +15,30 @@ import config
 import account_test as single
 import paired_account_test as paired
 import live_pilot as pilot
+import live_settlement as live
+import pilot_account
 import price_reader as scanner
 from test_account_reader import holdings, isolate_quarantine, orders_page, position, tournament, order
 from test_api_audit import QUOTE_TIME, TOURNAMENT_ID, approved_pair, election_tree, exchange_book, page, pair_relationship, party_market
 from test_order_preview import account_snapshot, context, parsed_book
+
+
+def live_approval():
+    """Explicit test-only LIVE permission, bound to the exact fake engine evidence."""
+    relationship = context(exhaustive=False)["relationships"]
+    roots = [election_tree(party, market_id)["root"] for party, market_id in (("Democratic", 1), ("Republican", 2))]
+    fingerprint = hashlib.sha256(json.dumps([*roots, relationship], sort_keys=True).encode()).hexdigest()
+    approval = {"approval_version": 1, "pair_name": "Synthetic live-authorized pair",
+                "tournament_id": TOURNAMENT_ID, "tournament_slug": "midterm-elections",
+                "market_ids": ["1", "2"], "exchange_ids": ["11", "12"],
+                "relationship_type": "mutually_exclusive", "position_types": ["NO-PAIR"],
+                "max_quantity": 1, "execution_mode": live.SUPERVISED_MODE, "verification_route": live.MACHINE,
+                "settlement_rationale": "The fake engine relationship makes the two YES outcomes mutually exclusive.",
+                "evidence_hash": fingerprint, "source_refs": [],
+                "limitations": ["Ordinary binary settlement only; cancellation/N/A refunds and administrator overrides can alter payout."],
+                "approved_at": "2026-10-07T12:00:00+00:00"}
+    approval["source_refs"] = live.evidence_sources(approval)
+    return approval
 
 
 class LivePilotTests(unittest.TestCase):
@@ -29,7 +50,10 @@ class LivePilotTests(unittest.TestCase):
         self.approval_path = self.root / "approved_settlements.json"
         self.approval_path.write_text(json.dumps({"version": 1, "allowed_mode": "paper-only",
                                                   "pairs": [approved_pair()]}))
+        self.live_approval_path = self.root / "live_approved_settlements.json"
+        self.live_approval_path.write_text(json.dumps({"version": 1, "allowed_mode": "LIVE_PILOT", "pairs": [live_approval()]}))
         for target, name, value in ((scanner, "APPROVED_SETTLEMENTS_PATH", self.approval_path),
+                                    (live, "APPROVAL_PATH", self.live_approval_path),
                                     (single, "STATE_PATH", self.root / "single.json"),
                                     (pilot, "ALLOCATION_PATH", self.root / "allocation.json"),
                                     (scanner, "READ_REQUEST_SPACING", 0),
@@ -45,6 +69,18 @@ class LivePilotTests(unittest.TestCase):
         self.account = account_snapshot(cash=20000)
         self.checkpoint = pilot.initialize_checkpoint(self.account)
         self.session = MagicMock()
+        # These existing tests isolate settlement, risk and durability. The real
+        # account gate is tested with complete fake GETs in test_pilot_account;
+        # production accounting remains UNVERIFIED and has no boolean override.
+        def isolated_account_gate(session, account, checkpoint, exchange_ids, capital, quantity, started, slug):
+            return account, {"risk": pilot.pilot_risk(account, exchange_ids, capital, quantity, checkpoint),
+                             "test_only": "account gate isolated"}
+        self.account_gate_patch = patch.object(pilot, "actual_account_readiness", side_effect=isolated_account_gate)
+        self.account_gate_patch.start()
+        self.addCleanup(self.account_gate_patch.stop)
+        self.accounting_gate_patch = patch.object(pilot_account, "require_verified_accounting")
+        self.accounting_gate_patch.start()
+        self.addCleanup(self.accounting_gate_patch.stop)
 
     def assert_no_writes(self):
         for method in ("post", "delete", "put", "patch"):
@@ -168,13 +204,15 @@ class LivePilotTests(unittest.TestCase):
         self.assert_no_writes()
 
     def test_unlisted_unverified_stale_or_shallow_candidates_are_blocked(self):
-        with self.assertRaisesRegex(pilot.PilotBlocked, "not explicitly approved"):
+        with self.assertRaisesRegex(live.LiveSettlementBlocked, live.NOT_AUTHORIZED):
             pilot.audit_candidate(self.session, ["3", "4"], self.checkpoint)
         self.session.get.assert_not_called()
-        for kwargs in ({"relationships": []}, {"quote_age": 60}, {"depth": 49}):
+        for index, kwargs in enumerate(({"relationships": []}, {"quote_age": 60}, {"depth": 49})):
             self.session.get.side_effect = [self.response(payload) for payload in self.candidate_payloads(**kwargs)]
-            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
-                pilot.audit_candidate(self.session, ["1", "2"], self.checkpoint)
+            with self.subTest(kwargs=kwargs), patch.object(pilot, "ALLOCATION_PATH", self.root / f"candidate-{index}.json"):
+                checkpoint = pilot.initialize_checkpoint(self.account)
+                with self.assertRaises(ValueError):
+                    pilot.audit_candidate(self.session, ["1", "2"], checkpoint)
         self.assert_no_writes()
 
     def test_live_edge_stays_two_percent(self):
@@ -218,7 +256,7 @@ class LivePilotTests(unittest.TestCase):
 
     def synthetic_pair(self, submitted=(True, True)):
         """Pure dictionaries; never call a preparation or submission function."""
-        market_context = context()
+        market_context = self.live_context()
         market_context.update(leg_prices=[.4, .4], book_versions=[parsed_book()["version"]] * 2)
         legs = []
         for index in range(2):
@@ -237,6 +275,11 @@ class LivePilotTests(unittest.TestCase):
                 "requests": [{key: leg[key] for key in ("market_id", "tournament_slug", "request")} for leg in legs]}
         pair["approval"] = paired.approval_hash(pair)
         return pair, legs
+
+    def live_context(self):
+        result = context(exhaustive=False)
+        result["settlement_fingerprint"] = live_approval()["evidence_hash"]
+        return result
 
     def venue_observations(self, legs, quantities=(1, 1), prices=(.4, .4), opened=False, incomplete=False):
         """Fresh order/fill GETs plus an actual signed inventory/cash snapshot."""
@@ -300,7 +343,7 @@ class LivePilotTests(unittest.TestCase):
                 pilot.consider_second_leg(self.session, pair, result)
             books = [parsed_book(bid=.6), parsed_book(bid=.6)]
             with patch.object(pilot, "read_selected_pair", return_value=[party_market("Democratic", 1, 11), party_market("Republican", 2, 12)]), \
-                    patch.object(scanner, "get_pair_rules", return_value=({"NO-PAIR"}, context())), \
+                    patch.object(scanner, "get_pair_rules", return_value=({"NO-PAIR"}, self.live_context())), \
                     patch.object(scanner, "get_best_prices", side_effect=books):
                 decision = pilot.consider_second_leg(self.session, pair, result, manually_supervised=True, restarted=False)
         self.assertTrue(decision["checks_passed"])
@@ -318,7 +361,7 @@ class LivePilotTests(unittest.TestCase):
                 if failure == "stale":
                     result["observed_at"] = 80
                 with patch.object(pilot, "read_selected_pair", return_value=[party_market("Democratic", 1, 11), party_market("Republican", 2, 12)]), \
-                        patch.object(scanner, "get_pair_rules", return_value=({"NO-PAIR"}, context())), \
+                        patch.object(scanner, "get_pair_rules", return_value=({"NO-PAIR"}, self.live_context())), \
                         patch.object(scanner, "get_best_prices", side_effect=[parsed_book(bid=.6), parsed_book(bid=.59)]), \
                         self.assertRaisesRegex(pilot.PilotBlocked, message):
                     pilot.consider_second_leg(self.session, pair, result, manually_supervised=True, restarted=False)
@@ -327,7 +370,7 @@ class LivePilotTests(unittest.TestCase):
 
     def test_second_leg_needs_same_pair_and_current_explicit_settlement_approval(self):
         pair, legs = self.synthetic_pair((True, False))
-        for failure, message in (("pair", "different pair"), ("approval", "not explicitly approved")):
+        for failure, message in (("pair", "different pair"), ("approval", "not explicitly live-approved")):
             with self.subTest(failure=failure), patch.object(pilot, "ALLOCATION_PATH", self.root / f"{failure}.json"), pilot.pilot_lock():
                 checkpoint = pilot.initialize_checkpoint(self.account)
                 account = self.venue_observations(legs, (1, 0))
@@ -336,8 +379,8 @@ class LivePilotTests(unittest.TestCase):
                 if failure == "pair":
                     result["pair_approval"] = "0" * 64
                 else:
-                    self.approval_path.write_text(json.dumps({"version": 1, "allowed_mode": "paper-only", "pairs": []}))
-                with self.assertRaisesRegex(pilot.PilotBlocked, message):
+                    self.live_approval_path.write_text(json.dumps({"version": 1, "allowed_mode": "LIVE_PILOT", "pairs": []}))
+                with self.assertRaisesRegex(ValueError, message):
                     pilot.consider_second_leg(self.session, pair, result, manually_supervised=True, restarted=False)
         self.assert_no_writes()
 
