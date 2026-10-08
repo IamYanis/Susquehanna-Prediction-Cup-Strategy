@@ -43,7 +43,7 @@ class LivePilotTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         self.account = account_snapshot(cash=20000)
-        self.checkpoint = pilot.allocation_checkpoint(self.account)
+        self.checkpoint = pilot.initialize_checkpoint(self.account)
         self.session = MagicMock()
 
     def assert_no_writes(self):
@@ -71,6 +71,7 @@ class LivePilotTests(unittest.TestCase):
             remaining -= cost
         checkpoint["allocated_cash_remaining"] = str(Decimal(5000) - Decimal(str(consumed)))
         checkpoint["last_reconciled_account_cash"] = str(Decimal(20000) - Decimal(str(consumed)))
+        pilot.refresh_totals(checkpoint)
         return checkpoint
 
     def test_cash_above_5000_never_increases_allocation(self):
@@ -86,7 +87,7 @@ class LivePilotTests(unittest.TestCase):
 
     def test_spent_allocation_cannot_be_replenished_from_reserve_after_restart(self):
         checkpoint = self.consumed_checkpoint(4999.5)
-        pilot.ALLOCATION_PATH.write_text(json.dumps(checkpoint))
+        pilot.save_checkpoint(checkpoint)
         restored = pilot.load_checkpoint()
         account = account_snapshot(cash=15000.5)
         self.assertEqual(self.risk(.5, account=account, checkpoint=restored)["allocation_remaining_after_reserves"], .5)
@@ -200,6 +201,7 @@ class LivePilotTests(unittest.TestCase):
         self.assertFalse(config.LIVE_PILOT_SUBMISSION_ENABLED)
 
     def test_missing_checkpoint_cannot_silently_initialize_a_new_allocation(self):
+        pilot.ALLOCATION_PATH.unlink()  # Remove only this test's temporary baseline.
         with self.assertRaisesRegex(pilot.PilotBlocked, "checkpoint missing or invalid"):
             pilot.load_checkpoint()
         self.assertFalse(pilot.ALLOCATION_PATH.exists())
@@ -278,7 +280,9 @@ class LivePilotTests(unittest.TestCase):
         self.assertEqual(result["status"], "RECONCILED_PAIR")
         self.assertEqual(result["confirmed_quantities"], [1, 1])
         self.assertEqual(pilot.amount(result["checkpoint"]["allocated_cash_remaining"]), Decimal("4999.2"))
-        self.assertEqual(repeated["checkpoint"], result["checkpoint"])
+        for key in ("accounted_pair_costs", "allocated_cash_remaining", "live_exposures"):
+            self.assertEqual(repeated["checkpoint"][key], result["checkpoint"][key])
+        self.assertEqual(pilot.load_checkpoint(), repeated["checkpoint"])
         self.assertEqual((pair, legs, self.checkpoint), original)
         self.assertEqual(self.session.get.call_count, 8)
         self.assert_no_writes()
@@ -286,58 +290,66 @@ class LivePilotTests(unittest.TestCase):
     def test_first_fill_requires_manual_second_leg_and_restart_cannot_continue(self):
         pair, legs = self.synthetic_pair((True, False))
         account = self.venue_observations(legs, (1, 0))
-        with patch.object(paired, "read_account", return_value=account):
-            result = pilot.reconcile_pilot(self.session, pair, legs, self.checkpoint)
-        self.assertEqual(result["status"], "AWAITING_MANUAL_SECOND_LEG")
-        self.assertEqual(result["confirmed_quantities"], [1, 0])
-        self.assertEqual(result["confirmed_cost"], .4)
-        with self.assertRaisesRegex(pilot.PilotBlocked, "restart cannot continue"):
-            pilot.consider_second_leg(self.session, pair, result)
-        books = [parsed_book(bid=.6), parsed_book(bid=.6)]
-        with patch.object(pilot, "read_selected_pair", return_value=[party_market("Democratic", 1, 11), party_market("Republican", 2, 12)]), \
-                patch.object(scanner, "get_pair_rules", return_value=({"NO-PAIR"}, context())), \
-                patch.object(scanner, "get_best_prices", side_effect=books):
-            decision = pilot.consider_second_leg(self.session, pair, result, manually_supervised=True, restarted=False)
+        with pilot.pilot_lock():  # One supervised run owns the lock throughout.
+            with patch.object(paired, "read_account", return_value=account):
+                result = pilot.reconcile_pilot(self.session, pair, legs, self.checkpoint)
+            self.assertEqual(result["status"], "AWAITING_MANUAL_SECOND_LEG")
+            self.assertEqual(result["confirmed_quantities"], [1, 0])
+            self.assertEqual(result["confirmed_cost"], .4)
+            with self.assertRaisesRegex(pilot.PilotBlocked, "restart cannot continue"):
+                pilot.consider_second_leg(self.session, pair, result)
+            books = [parsed_book(bid=.6), parsed_book(bid=.6)]
+            with patch.object(pilot, "read_selected_pair", return_value=[party_market("Democratic", 1, 11), party_market("Republican", 2, 12)]), \
+                    patch.object(scanner, "get_pair_rules", return_value=({"NO-PAIR"}, context())), \
+                    patch.object(scanner, "get_best_prices", side_effect=books):
+                decision = pilot.consider_second_leg(self.session, pair, result, manually_supervised=True, restarted=False)
         self.assertTrue(decision["checks_passed"])
         self.assertFalse(decision["submission_enabled"])
         self.assert_no_writes()
 
     def test_quote_movement_after_first_fill_blocks_second_leg(self):
         pair, legs = self.synthetic_pair((True, False))
-        account = self.venue_observations(legs, (1, 0))
-        with patch.object(paired, "read_account", return_value=account):
-            result = pilot.reconcile_pilot(self.session, pair, legs, self.checkpoint)
-        with patch.object(pilot, "read_selected_pair", return_value=[party_market("Democratic", 1, 11), party_market("Republican", 2, 12)]), \
-                patch.object(scanner, "get_pair_rules", return_value=({"NO-PAIR"}, context())), \
-                patch.object(scanner, "get_best_prices", side_effect=[parsed_book(bid=.6), parsed_book(bid=.59)]), \
-                self.assertRaisesRegex(pilot.PilotBlocked, "original second-leg limit"):
-            pilot.consider_second_leg(self.session, pair, result, manually_supervised=True, restarted=False)
-        stale = copy.deepcopy(result)
-        stale["observed_at"] = 80
-        with self.assertRaisesRegex(pilot.PilotBlocked, "state is stale"):
-            pilot.consider_second_leg(self.session, pair, stale, manually_supervised=True, restarted=False)
+        for failure, message in (("movement", "original second-leg limit"), ("stale", "state is stale")):
+            with self.subTest(failure=failure), patch.object(pilot, "ALLOCATION_PATH", self.root / f"{failure}.json"), pilot.pilot_lock():
+                checkpoint = pilot.initialize_checkpoint(self.account)
+                account = self.venue_observations(legs, (1, 0))
+                with patch.object(paired, "read_account", return_value=account):
+                    result = pilot.reconcile_pilot(self.session, pair, legs, checkpoint)
+                if failure == "stale":
+                    result["observed_at"] = 80
+                with patch.object(pilot, "read_selected_pair", return_value=[party_market("Democratic", 1, 11), party_market("Republican", 2, 12)]), \
+                        patch.object(scanner, "get_pair_rules", return_value=({"NO-PAIR"}, context())), \
+                        patch.object(scanner, "get_best_prices", side_effect=[parsed_book(bid=.6), parsed_book(bid=.59)]), \
+                        self.assertRaisesRegex(pilot.PilotBlocked, message):
+                    pilot.consider_second_leg(self.session, pair, result, manually_supervised=True, restarted=False)
+                self.assertEqual(pilot.load_checkpoint()["state"], pilot.HALTED)
         self.assert_no_writes()
 
     def test_second_leg_needs_same_pair_and_current_explicit_settlement_approval(self):
         pair, legs = self.synthetic_pair((True, False))
-        account = self.venue_observations(legs, (1, 0))
-        with patch.object(paired, "read_account", return_value=account):
-            result = pilot.reconcile_pilot(self.session, pair, legs, self.checkpoint)
-        wrong_pair = copy.deepcopy(result)
-        wrong_pair["pair_approval"] = "0" * 64
-        with self.assertRaisesRegex(pilot.PilotBlocked, "different pair"):
-            pilot.consider_second_leg(self.session, pair, wrong_pair, manually_supervised=True, restarted=False)
-        self.approval_path.write_text(json.dumps({"version": 1, "allowed_mode": "paper-only", "pairs": []}))
-        with self.assertRaisesRegex(pilot.PilotBlocked, "not explicitly approved"):
-            pilot.consider_second_leg(self.session, pair, result, manually_supervised=True, restarted=False)
+        for failure, message in (("pair", "different pair"), ("approval", "not explicitly approved")):
+            with self.subTest(failure=failure), patch.object(pilot, "ALLOCATION_PATH", self.root / f"{failure}.json"), pilot.pilot_lock():
+                checkpoint = pilot.initialize_checkpoint(self.account)
+                account = self.venue_observations(legs, (1, 0))
+                with patch.object(paired, "read_account", return_value=account):
+                    result = pilot.reconcile_pilot(self.session, pair, legs, checkpoint)
+                if failure == "pair":
+                    result["pair_approval"] = "0" * 64
+                else:
+                    self.approval_path.write_text(json.dumps({"version": 1, "allowed_mode": "paper-only", "pairs": []}))
+                with self.assertRaisesRegex(pilot.PilotBlocked, message):
+                    pilot.consider_second_leg(self.session, pair, result, manually_supervised=True, restarted=False)
         self.assert_no_writes()
 
     def test_partial_rejected_or_failed_second_leg_latches_manual_review(self):
-        for quantities, submitted in (((.5, 0), (True, False)), ((1, 0), (True, True)), ((0, 0), (True, False))):
+        for index, (quantities, submitted) in enumerate((((.5, 0), (True, False)), ((1, 0), (True, True)), ((0, 0), (True, False)))):
             pair, legs = self.synthetic_pair(submitted)
             account = self.venue_observations(legs, quantities)
-            with self.subTest(quantities=quantities), patch.object(paired, "read_account", return_value=account):
-                result = pilot.reconcile_pilot(self.session, pair, legs, self.checkpoint)
+            with self.subTest(quantities=quantities), patch.object(paired, "read_account", return_value=account), \
+                    patch.object(pilot, "ALLOCATION_PATH", self.root / f"partial-{index}.json"):
+                checkpoint = pilot.initialize_checkpoint(self.account)
+                result = pilot.reconcile_pilot(self.session, pair, legs, checkpoint)
+                self.assertEqual(pilot.load_checkpoint(), result["checkpoint"])
             self.assertEqual(result["status"], "MANUAL_REVIEW")
             self.assertTrue(result["checkpoint"]["manual_review_required"])
             with self.assertRaisesRegex(pilot.PilotBlocked, "halted for manual review"):
@@ -356,18 +368,19 @@ class LivePilotTests(unittest.TestCase):
                                                 else scanner.RateLimitError("fake-secret"))
             elif failure == "account_mismatch":
                 account["tournament"]["myBalance"] += 1
-            with self.subTest(failure=failure), patch.object(paired, "read_account", return_value=account):
-                result = pilot.reconcile_pilot(self.session, pair, current_legs, self.checkpoint)
-            self.assertEqual(result["status"], "MANUAL_REVIEW")
-            self.assertNotIn("fake-secret", result["reason"])
-            pilot.ALLOCATION_PATH.write_text(json.dumps(result["checkpoint"]))
-            restored = pilot.load_checkpoint()
-            with self.assertRaisesRegex(pilot.PilotBlocked, "halted for manual review"):
-                self.risk(checkpoint=restored)
-            self.session.get.reset_mock()
-            again = pilot.reconcile_pilot(self.session, pair, legs, restored)
-            self.assertEqual(again["status"], "MANUAL_REVIEW")
-            self.session.get.assert_not_called()
+            with self.subTest(failure=failure), patch.object(paired, "read_account", return_value=account), \
+                    patch.object(pilot, "ALLOCATION_PATH", self.root / f"{failure}.json"):
+                checkpoint = pilot.initialize_checkpoint(self.account)
+                result = pilot.reconcile_pilot(self.session, pair, current_legs, checkpoint)
+                self.assertEqual(result["status"], "MANUAL_REVIEW")
+                self.assertNotIn("fake-secret", result["reason"])
+                restored = pilot.load_checkpoint()
+                with self.assertRaisesRegex(pilot.PilotBlocked, "halted for manual review"):
+                    self.risk(checkpoint=restored)
+                self.session.get.reset_mock()
+                again = pilot.reconcile_pilot(self.session, pair, legs, restored)
+                self.assertEqual(again["status"], "MANUAL_REVIEW")
+                self.session.get.assert_not_called()
         self.assert_no_writes()
 
     def test_decimal_fill_noise_does_not_reset_or_corrupt_allocation(self):
@@ -376,7 +389,6 @@ class LivePilotTests(unittest.TestCase):
         with patch.object(paired, "read_account", return_value=account):
             result = pilot.reconcile_pilot(self.session, pair, legs, self.checkpoint)
         self.assertEqual(result["status"], "RECONCILED_PAIR")
-        pilot.ALLOCATION_PATH.write_text(json.dumps(result["checkpoint"]))
         self.assertEqual(pilot.load_checkpoint(), result["checkpoint"])
         self.assert_no_writes()
 

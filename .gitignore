@@ -22,3 +22,5 @@ paired_account_test/
 execution_quarantine.json
 active_paired_account_test/
 live_pilot_allocation.json
+.live_pilot_allocation.json.lock
+.live_pilot_allocation.json.*.tmp

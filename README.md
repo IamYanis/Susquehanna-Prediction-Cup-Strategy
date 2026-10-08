@@ -2,8 +2,11 @@
 
 The separate [disabled live-pilot checker](LIVE_PILOT.md) models a fixed
 5,000-SUSQie allocation with 50/trade, 100/race, 500 total exposure and one share
-per leg. It has no submission adapter and creates no order intents or runtime
-state. Run `.venv/bin/python live_pilot.py` for its local readiness report.
+per leg. It has no submission adapter and creates no order intents. Its separate
+accounting file persists confirmed debits, exposure and manual-review halts under
+an exclusive process lock. Run `.venv/bin/python live_pilot.py` for its local
+readiness/state report; a missing baseline blocks readiness rather than resetting
+the allocation. See the guide for explicit disabled-state initialization.
 Paper scanning and the existing live edge threshold remain unchanged.
 
 Run from this directory using the existing virtual environment:

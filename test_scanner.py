@@ -340,10 +340,13 @@ class ScannerTests(unittest.TestCase):
                 patch.object(scanner.os, "getenv", return_value="offline-test-key"), \
                 patch.object(scanner.requests, "Session", return_value=session), \
                 patch.object(scanner, "READ_REQUEST_SPACING", 0), \
+                patch.object(scanner, "_last_request_started", None), \
                 patch.object(scanner.time, "time", return_value=QUOTE_TIME), \
                 patch.object(scanner.time, "monotonic", return_value=10), \
                 patch.object(scanner.time, "sleep", side_effect=[None, KeyboardInterrupt]) as sleep:
             self.assertEqual(scanner.main(), 0)
+        # Fixture reads ran before the frozen clock. Reset pacing above so that
+        # moving the test clock backward cannot consume the loop's stop signal.
         self.assertEqual(sleep.call_count, 2)
         self.assertEqual(session.get.call_count, 16)
         self.assertEqual(self.output.getvalue().count("explicitly approved manual evidence"), 2)
