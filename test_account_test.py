@@ -16,7 +16,7 @@ import requests
 import account_test as supervised
 import paper_trader as paper
 import price_reader as scanner
-from test_account_reader import holdings, order, orders_page, position, tournament
+from test_account_reader import holdings, isolate_quarantine, order, orders_page, position, tournament
 from test_api_audit import (
     OTHER_TOURNAMENT_ID, QUOTE_TIME, TOURNAMENT_ID, exchange_book, party_market,
 )
@@ -24,6 +24,7 @@ from test_api_audit import (
 
 class AccountTestTests(unittest.TestCase):
     def setUp(self):
+        isolate_quarantine(self)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.path = Path(self.temporary.name) / "one_share_test.json"

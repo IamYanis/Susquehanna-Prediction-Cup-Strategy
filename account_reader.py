@@ -10,6 +10,7 @@ from uuid import UUID
 import requests
 from dotenv import load_dotenv
 
+import execution_quarantine as quarantine
 from paper_trader import is_finite_number, parse_api_timestamp
 from price_reader import (
     API_BASE_URL,
@@ -148,7 +149,8 @@ def read_account(session, slug="midterm-elections"):
     orders = get_open_orders(session, tournament_id)
     fields = ("id", "slug", "name", "status", "currencyName", "myBalance", "initialBalance", "isPendingEnrolment")
     return {"tournament": {field: tournament[field] for field in fields},
-            "positions": positions, "summary": summary, "orders": orders}
+            "positions": positions, "summary": summary, "orders": orders,
+            "quarantine_reserve": quarantine.reserved_cost(tournament_id)}
 
 
 def print_account_summary(account, details=False):
@@ -164,6 +166,10 @@ def print_account_summary(account, details=False):
     print(f"Position cost basis (reported): {summary['totalCostBasis']:,.2f}")
     print(f"Unrealized P&L (reported): {summary['totalUnrealizedPnl']:,.2f}")
     print(f"Open orders: {len(orders)} (all pages read)")
+    quarantine.print_quarantine(tournament["id"])
+    quarantined = quarantine.reserved_cost(tournament["id"])
+    print(f"Cash after pending/quarantine reserves: "
+          f"{tournament['myBalance'] - sum(order['quantity'] for order in orders) - quarantined:,.3f}")
     now = datetime.now(timezone.utc)
     expired = sum(order["expirationDate"] is not None
                   and parse_api_timestamp(order["expirationDate"]) <= now for order in orders)
@@ -186,6 +192,8 @@ def print_account_summary(account, details=False):
 
 def account_error_reason(error):
     """Explain common HTTP failures without printing bodies, URLs or headers."""
+    if isinstance(error, quarantine.QuarantineError):
+        return str(error)  # Our fixed local messages contain no server/key data.
     if isinstance(error, RateLimitError):
         return "API read cooldown or rate limit; try again after the cooldown"
     if isinstance(error, requests.HTTPError) and error.response is not None:

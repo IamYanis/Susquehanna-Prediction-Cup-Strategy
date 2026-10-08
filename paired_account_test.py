@@ -17,11 +17,15 @@ from uuid import uuid4
 import requests
 from dotenv import load_dotenv
 
+import execution_quarantine as quarantine
 import account_test as single
 from account_reader import account_error_reason, read_account
-from order_preview import PreviewBlocked, account_risk, conditional_proposal, preview_pair
+from order_preview import PreviewBlocked, account_risk, conditional_proposal, preview_pair, read_selected_pair
 from paper_trader import validate_market_context
-from price_reader import API_BASE_URL, API_ERRORS, MIN_EDGE, fetch_json, numeric_id
+from price_reader import (
+    API_BASE_URL, API_ERRORS, MIN_EDGE, DataValidationError, fetch_json,
+    get_election_rule, get_exchange_id, get_pair_rules, numeric_id,
+)
 
 STATE_DIR = Path(__file__).resolve().with_name("paired_account_test")
 STATES = {"PREPARED", "EXECUTING", "UNKNOWN", "RESTING", "UNMATCHED",
@@ -60,6 +64,9 @@ def validate_pair(pair):
                    "Unsupported pair settlement or execution policy")
     single.require(pair["state"] in STATES and pair["approval"] == approval_hash(pair),
                    "Invalid pair state or approval")
+    if "starting_cash" in pair:
+        single.require(single.is_finite_number(pair["starting_cash"]) and pair["starting_cash"] >= 0,
+                       "Invalid saved pre-submission cash")
     materials = pair["requests"]
     single.require(isinstance(materials, list) and len(materials) == 2, "Exactly two saved legs are required")
     for material in materials:
@@ -148,6 +155,7 @@ def save_pair(pair, directory):
     """Save the controller intent before writes; every leg has its own journal."""
     temporary = None
     try:
+        quarantine.require_writable_path(directory)
         validate_pair(pair)
         directory = Path(directory)
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
@@ -220,6 +228,8 @@ def set_state(pair, directory, state):
 
 
 def prepare_pair(session, directory, democrat_id, republican_id, slug="midterm-elections", conditional=False):
+    quarantine.require_writable_path(directory)
+    quarantine.require_unblocked_markets([democrat_id, republican_id])
     single.require(not Path(directory).exists(), "Pair directory already exists; preserve every prior attempt")
     single.require(not single.STATE_PATH.exists(), "A single-order test journal exists; resolve it before preparing a pair")
     single.require(type(conditional) is bool, "Preparation policy must be explicit")
@@ -270,6 +280,7 @@ def preflight_pair(session, pair):
     """Recheck both instruments, settlement fingerprint, cash and approved spend."""
     started = time.monotonic()
     materials = pair["requests"]
+    quarantine.require_unblocked_markets([material["market_id"] for material in materials])
     account = read_account(session, materials[0]["tournament_slug"])
     if pair["policy"] == CONDITIONAL_POLICY:
         preview = conditional_preview(session, account, materials[0]["market_id"], materials[1]["market_id"], started)
@@ -292,6 +303,7 @@ def preflight_pair(session, pair):
     # Use the approved maximum, even if today's quote is cheaper.
     risk = account_risk(account, original["exchange_ids"])
     single.check_risk(risk, float(sum(Decimal(str(material["request"]["price"])) for material in materials)))
+    return account["tournament"]["myBalance"]
 
 
 def filled_quantity(leg):
@@ -312,15 +324,88 @@ def classify(legs):
     return "UNMATCHED" if any(quantities) else "CLOSED_NO_FILL"
 
 
+def reconcile_pair_account(session, pair, legs):
+    """Match confirmed fills to actual inventory and cash before proceeding.
+
+    Preparation forbids holdings/orders on either exchange, so these fills must
+    account for all selected inventory. Unrelated trading or lagging reporting
+    can break the cash comparison; stop rather than crediting guessed proceeds.
+    """
+    single.require(all(leg["state"] in {"PREPARED", "NOOP", "OBSERVED_TERMINAL"} for leg in legs),
+                   "Unconfirmed orders prevent exact account reconciliation")
+    single.require("starting_cash" in pair, "No saved cash baseline; reconcile this legacy attempt manually")
+    started = time.monotonic()
+    account = read_account(session, pair["requests"][0]["tournament_slug"])
+    single.require(account["tournament"]["id"] == pair["market_context"]["tournament_id"],
+                   "Reconciliation account scope changed")
+    positions = {numeric_id(row["exchangeId"]): row for row in account["positions"]}
+    total_cost = 0
+    for leg in legs:
+        exchange_id = leg["request"]["exchangeId"]
+        quantity = filled_quantity(leg)
+        cost = (leg["observation"] or {}).get("filled_cost", 0)
+        holding = positions.get(exchange_id)
+        single.require(holding is None or (numeric_id(holding["marketId"]) == leg["market_id"]
+                                           and holding["settled"] is False),
+                       "Selected holding identity or settlement changed")
+        single.require(math.isclose(holding["quantity"] if holding else 0, -quantity, rel_tol=0, abs_tol=1e-9)
+                       and math.isclose(holding["costBasis"] if holding else 0, cost, rel_tol=0, abs_tol=1e-8),
+                       "Account inventory or cost disagrees with confirmed NO fills")
+        single.require(not any(numeric_id(order["exchangeId"]) == exchange_id for order in account["orders"]),
+                       "A selected exchange still has an open order")
+        total_cost += cost
+    single.require(math.isclose(account["tournament"]["myBalance"], pair["starting_cash"] - total_cost,
+                                rel_tol=0, abs_tol=1e-8),
+                   "Account cash disagrees with confirmed spend; inspect other activity or reporting")
+    single.require(0 <= time.monotonic() - started <= 15, "Account reconciliation became stale")
+
+
+def recheck_second_leg_settlement(session, pair):
+    """A full first fill does not authorize buying after settlement rules change."""
+    original = pair["market_context"]
+    markets = read_selected_pair(session, original["tournament_id"], *original["market_ids"])
+    single.require([get_exchange_id(market) for market in markets] == original["exchange_ids"],
+                   "Pair exchange identity changed after the first leg")
+    try:
+        allowed, current = get_pair_rules(session, *markets, original["tournament_id"])
+        single.require("NO-PAIR" in allowed, "Second leg has no verified normal-payout coverage")
+        fingerprint = current["settlement_fingerprint"]
+    except DataValidationError as error:
+        if (pair["policy"] != CONDITIONAL_POLICY
+                or str(error) != "No active relationship verifies this pair's normal payout"):
+            raise
+        # Reproduce the existing conditional observation fingerprint. Missing
+        # evidence remains an accepted assumption, never a verified guarantee.
+        rules = [get_election_rule(session, market, party, original["tournament_id"])
+                 for market, party in zip(markets, ("Democratic", "Republican"))]
+        fingerprint = hashlib.sha256(json.dumps(
+            ["conditional-rule-analysis", rules], sort_keys=True, allow_nan=False
+        ).encode()).hexdigest()
+    single.require(fingerprint == original["settlement_fingerprint"],
+                   "Settlement evidence changed after the first leg; second leg blocked")
+
+
+def record_pair_outcome(session, pair, legs, directory):
+    outcome = classify(legs)
+    if outcome in {"COMPLETE", "UNMATCHED", "CLOSED_NO_FILL"}:
+        reconcile_pair_account(session, pair, legs)
+    set_state(pair, directory, outcome)
+
+
 def submit_pair(session, directory, approval):
+    quarantine.require_writable_path(directory)
     with operation_lock(directory):
         pair, legs = load_pair(directory)
         require_approval(pair, approval)
         single.require(pair["state"] == "PREPARED", "This pair was already attempted; do not replay or replace it")
-        preflight_pair(session, pair)
+        single.require(not single.STATE_PATH.exists(), "A single-order journal exists; resolve it before this pair")
+        pair["starting_cash"] = preflight_pair(session, pair)
         set_state(pair, directory, "EXECUTING")
         try:
             for index, leg in enumerate(legs):
+                if index == 1:
+                    recheck_second_leg_settlement(session, pair)
+                    reconcile_pair_account(session, pair, legs)
                 path = leg_path(directory, index)
                 single.submit_test(session, leg, path, leg["approval"])
                 if leg["order_id"] is not None:
@@ -333,7 +418,7 @@ def submit_pair(session, directory, approval):
                     # Do not submit leg two unless leg one is definitely full.
                     # A late full fill during cancellation can still pass here.
                     break
-            set_state(pair, directory, classify(legs))
+            record_pair_outcome(session, pair, legs, directory)
         except API_ERRORS as error:
             # A leg save may have failed after an accepted order: do not rely on
             # the in-memory ticket or infer that an exception means no execution.
@@ -343,6 +428,7 @@ def submit_pair(session, directory, approval):
 
 
 def check_pair(session, directory):
+    quarantine.require_writable_path(directory)
     with operation_lock(directory):
         pair, legs = load_pair(directory)
         if pair["state"] == "PREPARED":
@@ -351,7 +437,7 @@ def check_pair(session, directory):
             for index, leg in enumerate(legs):
                 if leg["order_id"] is not None:
                     single.check_test(session, leg, leg_path(directory, index))
-            set_state(pair, directory, classify(legs))
+            record_pair_outcome(session, pair, legs, directory)
         except API_ERRORS as error:
             set_state(pair, directory, "UNKNOWN")
             raise single.TestError("Pair reporting is incomplete; preserve both leg journals") from error
@@ -427,6 +513,7 @@ def diagnose_pair(session, directory):
 
 
 def cancel_pair(session, directory, approval):
+    quarantine.require_writable_path(directory)
     with operation_lock(directory):
         pair, legs = load_pair(directory)
         require_approval(pair, approval)
@@ -436,7 +523,7 @@ def cancel_pair(session, directory, approval):
             for index, leg in enumerate(legs):
                 if leg["order_id"] is not None:
                     single.cancel_test(session, leg, leg_path(directory, index), leg["approval"])
-            set_state(pair, directory, classify(legs))
+            record_pair_outcome(session, pair, legs, directory)
         except API_ERRORS as error:
             set_state(pair, directory, "UNKNOWN")
             raise single.TestError("Pair cancellation is unresolved; held shares remain held") from error
@@ -444,6 +531,7 @@ def cancel_pair(session, directory, approval):
 
 
 def print_pair(pair, legs):
+    quarantine.print_quarantine(pair["market_context"]["tournament_id"])
     maximum = sum(Decimal(str(material["request"]["price"])) for material in pair["requests"])
     print(f"SUPERVISED ONE-PAIR TEST | {pair['state']} | maximum contract spend {maximum:.3f} SUSQies; fees unverified")
     if pair["policy"] == CONDITIONAL_POLICY:
@@ -460,7 +548,13 @@ def print_pair(pair, legs):
     print("Approval covers up to two one-share BUY NO orders, plus cancellation of their unfilled remainders.")
     print("First leg must be fully confirmed before second. Held shares are never automatically sold or refunded.")
     for index, leg in enumerate(legs):
-        print(f"Leg {index + 1} | {leg['state']} | order {leg['order_id']} | confirmed acquired shares {filled_quantity(leg):g}")
+        observation = leg["observation"] or {}
+        cost = observation.get("filled_cost", observation.get("placement_cost", 0))
+        print(f"Leg {index + 1} | {leg['state']} | order {leg['order_id']} | "
+              f"confirmed acquired shares {filled_quantity(leg)} | confirmed contract cost {cost} SUSQies")
+        if leg["state"] not in {"PREPARED", "NOOP", "OBSERVED_TERMINAL"}:
+            print(f"Execution is unresolved: total exposure may reach 1 NO share and "
+                  f"{leg['request']['price']:.3f} SUSQies contract cost. Confirmed zero is not proof of no fill.")
         single.print_placement_diagnostic(leg)
         print(json.dumps(leg["request"], indent=2, allow_nan=False))
     print(f"Pair approval fingerprint: {pair['approval']}")
@@ -470,7 +564,7 @@ def print_pair(pair, legs):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "show", "submit", "check", "diagnose", "cancel"))
+    parser.add_argument("action", choices=("prepare", "show", "submit", "check", "diagnose", "cancel", "quarantine"))
     parser.add_argument("--dem-market")
     parser.add_argument("--rep-market")
     parser.add_argument("--tournament", default="midterm-elections")
@@ -480,12 +574,23 @@ def main():
     args = parser.parse_args()
     if args.conditional and args.action != "prepare":
         parser.error("--conditional is a preparation policy; submission uses the saved policy and exact approval")
-    # One fixed production directory prevents creating another attempt under a
-    # different path while the default journals still contain an unknown order.
-    args.state = STATE_DIR
     if args.action == "prepare" and (args.dem_market is None or args.rep_market is None):
         parser.error("Preparation requires both market IDs")
     try:
+        if args.action == "quarantine":
+            quarantine.create_quarantine()
+            quarantine.print_quarantine()
+            print("Local quarantine saved. Original journals unchanged; no API requests made.")
+            return 0
+        # The original pair stays frozen. Only one fixed additional active pair
+        # is permitted, and only while its quarantine evidence verifies intact.
+        args.state = quarantine.active_pair_directory(STATE_DIR)
+        quarantine.print_quarantine()
+        if args.action == "diagnose" and quarantine.load_quarantine():
+            args.state = STATE_DIR  # This command is GET-only and changes no journal.
+        if args.action == "show" and not args.state.exists() and quarantine.load_quarantine():
+            print("No active pair prepared. Unrelated verified pairs may undergo readiness checks.")
+            return 0
         if args.action == "prepare":
             single.require(not args.state.exists(), "Pair directory already exists; preserve it")
         else:

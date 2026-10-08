@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 import requests
 from dotenv import load_dotenv
 
+import execution_quarantine as quarantine
 from account_reader import account_error_reason, read_account, require_number, validate_positions
 from paper_trader import (
     MAX_CAPITAL_PER_RACE, MAX_CAPITAL_PER_TRADE, is_finite_number,
@@ -76,6 +77,8 @@ def account_risk(account, exchange_ids):
                     "One or two selected exchanges are required")
     selected = {numeric_id(exchange_id) for exchange_id in exchange_ids}
     require_preview(len(selected) == len(exchange_ids), "The selected exchanges must be different")
+    quarantine.require_unblocked_exchanges(selected)
+    quarantined = quarantine.reserved_cost(tournament_id)
     holdings_cost = 0
     for position in positions:
         if position["quantity"] == 0:
@@ -112,10 +115,13 @@ def account_risk(account, exchange_ids):
     require_preview(is_finite_number(holdings_cost) and is_finite_number(reserve),
                     "Account exposure is too large or invalid")
     return {"reported_cash": cash, "existing_order_reserve": reserve,
-            "existing_holdings_cost_basis": holdings_cost, "available_cash": cash - reserve,
+            "quarantine_reserve": quarantined,
+            "existing_holdings_cost_basis": holdings_cost, "available_cash": cash - reserve - quarantined,
             # No title-based race mapping: every existing instrument might be
             # in this race. This bound is restrictive but cannot undercount it.
-            "race_exposure_upper_bound": holdings_cost + reserve}
+            # Add the full uncertain cost even if visible holdings/orders might
+            # already include it. Without a receipt we cannot safely net it out.
+            "race_exposure_upper_bound": holdings_cost + reserve + quarantined}
 
 
 def validate_request_body(body):
@@ -231,6 +237,7 @@ def read_selected_pair(session, tournament_id, democrat_market_id, republican_ma
     """Confirm market scope and titles before reading rules or executable quotes."""
     ids = [numeric_id(democrat_market_id), numeric_id(republican_market_id)]
     require_preview(ids[0] != ids[1], "Select two different markets")
+    quarantine.require_unblocked_markets(ids)
     markets, races = [], []
     for market_id, party in zip(ids, ("Democratic", "Republican")):
         market = fetch_json(session, f"{API_BASE_URL}/markets/{market_id}",
@@ -344,6 +351,7 @@ def conditional_proposal(session, account, democrat_market_id, republican_market
 def print_conditional_proposal(proposal):
     """Display the numerical plan and its assumptions, without an order payload."""
     print("CONDITIONAL PROPOSAL | 1 NO share per leg | EXECUTION NOT APPROVED")
+    quarantine.print_quarantine(proposal["tournament_id"])
     for party, leg in zip(("Democratic", "Republican"), proposal["legs"]):
         print(f"{party} NO | market {leg['market_id']} | exchange {leg['exchange_id']} | "
               f"limit {leg['price']:.3f} | depth {leg['depth']:g} | quote {leg['quote_at']}")
@@ -365,9 +373,11 @@ def print_conditional_proposal(proposal):
 def print_preview(preview):
     """Print local diagnostics and the draft body, never credential headers."""
     risk = preview["risk"]
+    quarantine.print_quarantine(preview["market_context"]["tournament_id"])
     print(f"PREVIEW READY | {preview['position_type']} | {preview['quantity']} shares per leg")
     print(f"Reported cash: {risk['reported_cash']:.2f} | existing order reserve: {risk['existing_order_reserve']:.2f}")
-    print(f"Available after reserve: {risk['available_cash']:.2f} | maximum new spend: {preview['max_new_spend']:.2f}")
+    print(f"Quarantine reserve: {risk['quarantine_reserve']:.3f} | "
+          f"available after all reserves: {risk['available_cash']:.3f} | maximum new spend: {preview['max_new_spend']:.2f}")
     print(f"Race exposure after draft (account-wide upper bound): {risk['race_exposure_after_upper_bound']:.2f} / {MAX_CAPITAL_PER_RACE}")
     print(f"Projected profit at ordinary settlement, before unverified fees/refunds: {preview['conditional_projected_profit']:.2f}")
     print(f"Draft body for {preview['endpoint_path']} (display only):")

@@ -18,3 +18,5 @@ research_report.csv
 research_pair_report.csv
 .research_pair_report.csv.*.tmp
 paired_account_test/
+execution_quarantine.json
+active_paired_account_test/

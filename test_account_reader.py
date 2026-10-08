@@ -11,12 +11,25 @@ from unittest.mock import MagicMock, Mock, patch
 import requests
 
 import account_reader as account
+import execution_quarantine as quarantine
 import paper_trader as paper
 import price_reader as scanner
 
 
 TOURNAMENT_ID = "550e8400-e29b-41d4-a716-446655440000"
 OTHER_TOURNAMENT_ID = "550e8400-e29b-41d4-a716-446655440001"
+
+
+def isolate_quarantine(test):
+    """Account tests must never load the user's real execution/quarantine files."""
+    temporary = tempfile.TemporaryDirectory()
+    test.addCleanup(temporary.cleanup)
+    root = Path(temporary.name)
+    for name, path in (("STATE_PATH", root / "quarantine.json"),
+                       ("SOURCE_DIR", root / "source"), ("ACTIVE_DIR", root / "active")):
+        patcher = patch.object(quarantine, name, path)
+        patcher.start()
+        test.addCleanup(patcher.stop)
 
 
 def tournament():
@@ -74,6 +87,7 @@ def orders_page(rows=None, more=False, cursor=None, coverage=None):
 
 class AccountReaderTests(unittest.TestCase):
     def setUp(self):
+        isolate_quarantine(self)
         self.output = io.StringIO()
         self.redirect = contextlib.redirect_stdout(self.output)
         self.redirect.__enter__()

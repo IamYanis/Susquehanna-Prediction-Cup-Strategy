@@ -12,7 +12,7 @@ import requests
 
 import order_preview as preview
 import price_reader as scanner
-from test_account_reader import holdings, order, orders_page, position, tournament
+from test_account_reader import holdings, isolate_quarantine, order, orders_page, position, tournament
 from test_api_audit import (
     OTHER_TOURNAMENT_ID, QUOTE_TIME, TOURNAMENT_ID, election_tree,
     exchange_book, page, pair_relationship, party_market,
@@ -44,6 +44,7 @@ def parsed_book(ask=.4, bid=.35, quantity=100):
 
 class OrderPreviewTests(unittest.TestCase):
     def setUp(self):
+        isolate_quarantine(self)
         for target, value in (("time.monotonic", 100), ("time.time", QUOTE_TIME)):
             patcher = patch.object(preview.time, target.split(".")[1], return_value=value)
             patcher.start()

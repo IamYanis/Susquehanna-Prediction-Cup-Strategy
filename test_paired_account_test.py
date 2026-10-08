@@ -15,13 +15,14 @@ import order_preview
 import paired_account_test as paired
 import paper_trader as paper
 import price_reader as scanner
-from test_account_reader import holdings, orders_page, tournament
+from test_account_reader import holdings, isolate_quarantine, order, orders_page, position, tournament
 from test_api_audit import QUOTE_TIME, TOURNAMENT_ID, election_tree, exchange_book, page, pair_relationship, party_market
 from test_order_preview import account_snapshot, context, parsed_book
 
 
 class PairedAccountTests(unittest.TestCase):
     def setUp(self):
+        isolate_quarantine(self)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.directory = Path(self.temporary.name) / "paired"
@@ -68,11 +69,43 @@ class PairedAccountTests(unittest.TestCase):
         self.session.get.side_effect = [self.response(payload) for payload in self.conditional_payloads()]
         return paired.prepare_pair(self.session, self.directory, "387", "388", conditional=True)
 
-    def install_venue(self, fills=(1, 1), unknown_at=None, late_full=False):
+    def venue_account(self, *args):
+        # Report what this fake venue actually executed, including one-sided
+        # fills. These values are independent of the controller's saved state.
+        rows, pending, spent = [], [], 0
+        for order_id, record in self.records.items():
+            body, quantity = record["body"], record["quantity"]
+            cost = quantity * body["price"]
+            spent += cost
+            if quantity:
+                market = next(material["market_id"] for material in paired.load_pair(self.directory)[0]["requests"]
+                              if material["request"]["exchangeId"] == body["exchangeId"])
+                row = position(body["exchangeId"], market, -quantity)
+                row.update(costBasis=cost, marketValue=quantity * .5,
+                           currentPrice=.5, unrealizedPnl=quantity * .5 - cost)
+                rows.append(row)
+            if record["open"]:
+                resting = order(order_id, body["exchangeId"])
+                resting.update(side="no", quantity=1 - quantity, priceLimit=body["price"])
+                pending.append(resting)
+        return account_snapshot(rows, pending, self.account["tournament"]["myBalance"] - spent)
+
+    def install_venue(self, fills=(1, 1), unknown_at=None, late_full=False,
+                      stub_settlement=True, stub_account=True):
+        self.records = {}
+        if stub_account:
+            patcher = patch.object(paired, "read_account", side_effect=self.venue_account)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        if stub_settlement:
+            patcher = patch.object(paired, "recheck_second_leg_settlement")
+            patcher.start()
+            self.addCleanup(patcher.stop)
         def post(url, **kwargs):
             pair, legs = paired.load_pair(self.directory)
             index = self.session.post.call_count - 1
             self.assertEqual(pair["state"], "EXECUTING")
+            self.assertEqual(pair["starting_cash"], self.account["tournament"]["myBalance"])
             self.assertEqual(legs[index]["state"], "SUBMITTING")
             body = kwargs["json"]
             self.assertEqual(body, pair["requests"][index]["request"])
@@ -123,7 +156,7 @@ class PairedAccountTests(unittest.TestCase):
         def inputs(session, market_id, side, slug):
             exchange = "11" if market_id == "1" else "12"
             return self.account, exchange, .4, single.account_risk(self.account, [exchange])
-        with patch.object(paired, "preflight_pair"), patch.object(single, "read_test_inputs", side_effect=inputs):
+        with patch.object(paired, "preflight_pair", return_value=self.account["tournament"]["myBalance"]), patch.object(single, "read_test_inputs", side_effect=inputs):
             return paired.submit_pair(self.session, self.directory, pair["approval"])
 
     def test_full_pair_uses_two_durable_distinct_requests_and_never_replays(self):
@@ -202,7 +235,7 @@ class PairedAccountTests(unittest.TestCase):
             if market_id == "2":
                 raise single.TestError("Current second quote exceeds the limit")
             return self.account, "11", .4, single.account_risk(self.account, ["11"])
-        with patch.object(paired, "preflight_pair"), patch.object(single, "read_test_inputs", side_effect=inputs):
+        with patch.object(paired, "preflight_pair", return_value=self.account["tournament"]["myBalance"]), patch.object(single, "read_test_inputs", side_effect=inputs):
             with self.assertRaises(single.TestError):
                 paired.submit_pair(self.session, self.directory, pair["approval"])
         self.assertEqual(self.session.post.call_count, 1)
@@ -216,7 +249,7 @@ class PairedAccountTests(unittest.TestCase):
         with self.assertRaises(single.TestError):
             paired.submit_pair(self.session, self.directory, "wrong")
         self.session.get.assert_not_called()
-        with patch.object(paired, "preflight_pair"), patch.object(paired, "save_pair", side_effect=single.TestError("save failed")):
+        with patch.object(paired, "preflight_pair", return_value=self.account["tournament"]["myBalance"]), patch.object(paired, "save_pair", side_effect=single.TestError("save failed")):
             with self.assertRaises(single.TestError):
                 paired.submit_pair(self.session, self.directory, pair["approval"])
         self.session.post.assert_not_called()
@@ -379,7 +412,8 @@ class PairedAccountTests(unittest.TestCase):
                                                        "action": "buy", "side": "no", "quantity": 1,
                                                        "price": body["price"], "open": False, "quantityTraded": 0,
                                                        "totalCost": 0, "remainingQuantity": 0, "fillPrice": None})
-        result, legs = self.execute(pair)
+        with patch.object(paired, "read_account", return_value=self.account):
+            result, legs = self.execute(pair)
         self.assertEqual(result["state"], "CLOSED_NO_FILL")
         self.assertEqual(legs[0]["state"], "NOOP")
         self.assertIsNone(legs[0]["order_id"])
@@ -515,7 +549,7 @@ class PairedAccountTests(unittest.TestCase):
         def inputs(session, market_id, side, slug):
             exchange, price = ("1076", .125) if market_id == "387" else ("1077", .845)
             return self.account, exchange, price, single.account_risk(self.account, [exchange])
-        with patch.object(paired, "preflight_pair"), patch.object(single, "read_test_inputs", side_effect=inputs):
+        with patch.object(paired, "preflight_pair", return_value=self.account["tournament"]["myBalance"]), patch.object(single, "read_test_inputs", side_effect=inputs):
             result, legs = paired.submit_pair(self.session, self.directory, pair["approval"])
         self.assertEqual(result["state"], "UNMATCHED")
         self.assertEqual([paired.filled_quantity(leg) for leg in legs], [1, .5])
@@ -630,7 +664,7 @@ class PairedAccountTests(unittest.TestCase):
 
     def test_failed_controller_directory_flush_prevents_any_post_or_retry(self):
         pair, _ = self.prepare()
-        with patch.object(paired, "preflight_pair"), \
+        with patch.object(paired, "preflight_pair", return_value=self.account["tournament"]["myBalance"]), \
                 patch.object(single, "sync_directory", side_effect=OSError('synthetic directory failure')), \
                 self.assertRaises(single.TestError):
             paired.submit_pair(self.session, self.directory, pair['approval'])
@@ -666,6 +700,192 @@ class PairedAccountTests(unittest.TestCase):
         with self.assertRaises(single.TestError):
             paired.submit_pair(self.session, self.directory, pair['approval'])
         self.assertEqual(self.session.post.call_count, 1)
+
+    def test_changed_or_unavailable_settlement_after_first_fill_blocks_second(self):
+        for change in ("rules", "missing-relationship", "exchange", "rate-limit"):
+            with self.subTest(change=change):
+                self.directory = Path(self.temporary.name) / change
+                self.session.reset_mock()
+                pair, _ = self.prepare()
+                self.install_venue(stub_settlement=False)
+                markets = [party_market("Democratic", 1, 11), party_market("Republican", 2, 12)]
+                current = context()
+                error = None
+                if change == "rules":
+                    current["settlement_fingerprint"] = "b" * 64
+                elif change == "missing-relationship":
+                    error = scanner.DataValidationError("No active relationship verifies this pair's normal payout")
+                elif change == "exchange":
+                    markets[0]["exchanges"][0]["id"] = "99"
+                else:
+                    error = scanner.RateLimitError("API read rate limit reached")
+                with patch.object(paired, "read_selected_pair", return_value=markets), \
+                        patch.object(paired, "get_pair_rules", return_value=({"NO-PAIR"}, current), side_effect=error), \
+                        self.assertRaises(single.TestError):
+                    self.execute(pair)
+                restored, legs = paired.load_pair(self.directory)
+                self.assertEqual(restored["state"], "UNKNOWN")
+                self.assertEqual(legs[0]["state"], "OBSERVED_TERMINAL")
+                self.assertEqual(legs[1]["state"], "PREPARED")
+                self.assertEqual(self.session.post.call_count, 1)
+
+    def test_conditional_second_gate_rereads_rules_and_rejects_changes(self):
+        pair, _ = self.prepare_conditional()
+        for changed in (False, True):
+            payloads = self.conditional_payloads()[3:8]
+            if changed:
+                payloads[3]["root"]["contract_details"]["extraRule"] = "changed"
+            self.session.get.side_effect = [self.response(payload) for payload in payloads]
+            if changed:
+                with self.assertRaisesRegex(single.TestError, "Settlement evidence changed"):
+                    paired.recheck_second_leg_settlement(self.session, pair)
+            else:
+                paired.recheck_second_leg_settlement(self.session, pair)
+        self.session.post.assert_not_called()
+        self.session.delete.assert_not_called()
+
+    def test_account_discrepancies_after_first_fill_block_second(self):
+        for change in ("missing-holding", "wrong-side", "extra-shares", "cost", "open-order", "cash", "scope", "timeout"):
+            with self.subTest(change=change):
+                self.directory = Path(self.temporary.name) / change
+                self.session.reset_mock()
+                pair, _ = self.prepare()
+                self.install_venue()
+                def account(*args):
+                    result = self.venue_account()
+                    if change == "missing-holding":
+                        result["positions"] = []
+                    elif change == "wrong-side":
+                        result["positions"][0]["quantity"] = 1
+                    elif change == "extra-shares":
+                        result["positions"][0]["quantity"] = -1.1
+                    elif change == "cost":
+                        result["positions"][0]["costBasis"] += .01
+                    elif change == "open-order":
+                        result["orders"] = [order(500, 11)]
+                    elif change == "cash":
+                        result["tournament"]["myBalance"] -= .01
+                    elif change == "scope":
+                        result["tournament"]["id"] = "550e8400-e29b-41d4-a716-446655440001"
+                    else:
+                        raise requests.Timeout("synthetic-secret")
+                    return result
+                with patch.object(paired, "read_account", side_effect=account), self.assertRaises(single.TestError):
+                    self.execute(pair)
+                restored, legs = paired.load_pair(self.directory)
+                self.assertEqual(restored["state"], "UNKNOWN")
+                self.assertEqual(paired.filled_quantity(legs[0]), 1)
+                self.assertEqual(legs[1]["state"], "PREPARED")
+                self.assertEqual(self.session.post.call_count, 1)
+                self.session.delete.assert_not_called()
+
+    def test_final_account_mismatch_cannot_report_complete_and_get_only_check_recovers(self):
+        for change in ("inventory", "cash"):
+            with self.subTest(change=change):
+                self.directory = Path(self.temporary.name) / change
+                self.session.reset_mock()
+                pair, _ = self.prepare()
+                self.install_venue()
+                def account(*args):
+                    result = self.venue_account()
+                    if self.session.post.call_count == 2:
+                        if change == "inventory":
+                            result["positions"][1]["quantity"] = -.5
+                        else:
+                            result["tournament"]["myBalance"] += .01
+                    return result
+                with patch.object(paired, "read_account", side_effect=account), self.assertRaises(single.TestError):
+                    self.execute(pair)
+                restored, legs = paired.load_pair(self.directory)
+                self.assertEqual(restored["state"], "UNKNOWN")
+                self.assertEqual([paired.filled_quantity(leg) for leg in legs], [1, 1])
+                self.assertEqual(self.session.post.call_count, 2)
+                checked, _ = paired.check_pair(self.session, self.directory)
+                self.assertEqual(checked["state"], "COMPLETE")
+                self.assertEqual(self.session.post.call_count, 2)
+                self.session.delete.assert_not_called()
+
+    def test_crash_after_first_fill_restores_one_sided_spend_without_second_post(self):
+        pair, _ = self.prepare()
+        self.install_venue()
+        with patch.object(paired, "recheck_second_leg_settlement", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            self.execute(pair)
+        restored, legs = paired.load_pair(self.directory)
+        self.assertEqual(restored["state"], "EXECUTING")
+        self.assertEqual(restored["starting_cash"], 5000)
+        self.assertEqual(legs[1]["state"], "PREPARED")
+        with self.assertRaises(single.TestError):
+            self.execute(restored)
+        checked, legs = paired.check_pair(self.session, self.directory)
+        self.assertEqual(checked["state"], "UNMATCHED")
+        self.assertEqual(legs[0]["observation"]["filled_quantity"], 1)
+        self.assertEqual(legs[0]["observation"]["filled_cost"], .4)
+        self.assertEqual(self.session.post.call_count, 1)
+        self.session.delete.assert_not_called()
+
+    def test_cash_baseline_validation_and_legacy_recovery_fail_closed(self):
+        pair, _ = self.prepare()
+        for value in (True, -1, float("nan"), "5000"):
+            with self.subTest(value=value), self.assertRaises(single.TestError):
+                paired.validate_pair(dict(pair, starting_cash=value))
+        self.install_venue()
+        result, _ = self.execute(pair)
+        result.pop("starting_cash")
+        paired.save_pair(result, self.directory)
+        with self.assertRaisesRegex(single.TestError, "Pair reporting is incomplete"):
+            paired.check_pair(self.session, self.directory)
+        self.assertEqual(paired.load_pair(self.directory)[0]["state"], "UNKNOWN")
+        self.assertEqual(self.session.post.call_count, 2)
+
+    def test_unknown_output_reports_possible_exposure_instead_of_implying_zero(self):
+        pair = self.unknown_pair()
+        _, legs = paired.load_pair(self.directory)
+        with contextlib.redirect_stdout(self.output):
+            paired.print_pair(pair, legs)
+        self.assertIn("total exposure may reach 1 NO share and 0.125", self.output.getvalue())
+        self.assertIn("Confirmed zero is not proof of no fill", self.output.getvalue())
+        self.session.post.assert_not_called()
+
+    def test_entire_verified_lifecycle_uses_real_parsers_and_account_checks_with_fake_http(self):
+        markets = [party_market("Democratic", 1, 11), party_market("Republican", 2, 12)]
+        payloads = [tournament(), holdings([]), orders_page([]), *markets, page([pair_relationship()]),
+                    election_tree("Democratic", 1), election_tree("Republican", 2),
+                    exchange_book(1, 11, bid=.6), exchange_book(2, 12, bid=.6)]
+        self.session.get.side_effect = [self.response(payload) for payload in payloads]
+        pair, _ = paired.prepare_pair(self.session, self.directory, "1", "2")
+        self.session.post.assert_not_called()
+        self.install_venue(stub_settlement=False, stub_account=False)
+        order_get = self.session.get.side_effect
+        def get(url, **kwargs):
+            route = url.removeprefix(scanner.API_BASE_URL)
+            if route == "/tournaments/midterm-elections":
+                return self.response(self.venue_account()["tournament"])
+            if route == "/tournaments/midterm-elections/portfolio/positions":
+                account = self.venue_account()
+                return self.response({"positions": account["positions"], "summary": account["summary"]})
+            if route == "/orders":
+                return self.response(orders_page(self.venue_account()["orders"]))
+            if route == "/relationships":
+                return self.response(page([pair_relationship()]))
+            for index, market in enumerate(markets):
+                if route == f"/markets/{index + 1}":
+                    return self.response(market)
+                if route == f"/markets/{index + 1}/nodes":
+                    return self.response(election_tree("Democratic" if index == 0 else "Republican", index + 1))
+                if route == f"/exchanges/{11 + index}/orderbook":
+                    return self.response(exchange_book(index + 1, 11 + index, bid=.6))
+            return order_get(url, **kwargs)
+        self.session.get.side_effect = get
+        result, legs = paired.submit_pair(self.session, self.directory, pair["approval"])
+        self.assertEqual(result["state"], "COMPLETE")
+        self.assertEqual([leg["observation"]["filled_quantity"] for leg in legs], [1, 1])
+        self.assertAlmostEqual(self.venue_account()["tournament"]["myBalance"], result["starting_cash"] - .8)
+        self.assertEqual(self.session.post.call_count, 2)
+        checked, _ = paired.check_pair(self.session, self.directory)
+        self.assertEqual(checked["state"], "COMPLETE")
+        self.assertEqual(self.session.post.call_count, 2)
+        self.session.delete.assert_not_called()
 
 
 if __name__ == "__main__":

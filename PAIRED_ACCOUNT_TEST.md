@@ -12,6 +12,43 @@ settlement risks for the capped Rhode Island test described below. A price gap
 or an ordinary preparation command does not select this policy. The scanner and
 paper trader still require their existing engine evidence.
 
+## Quarantine the unresolved market-387 attempt
+
+The original fixed journal directory normally blocks another supervised attempt
+globally. The local-only command below records a quarantine without moving,
+rewriting or resolving any original journal, or making an API request:
+
+```bash
+.venv/bin/python paired_account_test.py quarantine
+```
+
+This narrow exception accepts only the existing first-leg `UNKNOWN` NO buy in
+market 387 / exchange 1076, with its second leg still unsubmitted. An ignored
+`execution_quarantine.json` record pins the SHA-256 of all three source journals.
+The original directory becomes frozen: neither its first order nor its saved
+second order can be submitted, checked into a new state or cancelled by this
+tool. `diagnose` remains a GET-only inspection of the original attempt.
+
+Every new order in market 387, and every pair containing it, is blocked. The
+account risk checker reserves the full possible one-share contract cost, **0.125
+SUSQies**, against both cash and the conservative race exposure bound. The reserve
+is additional to reported holdings and pending orders, even when those may
+already include the unknown execution. Expiry or empty history never releases it.
+
+After quarantine registration, the same paired commands use one fixed ignored
+`active_paired_account_test/` directory for an unrelated verified pair. Existing
+approval, settlement, freshness, overlap, cash, capital and reconciliation checks
+still apply. An existing active directory blocks another pair; there is no
+arbitrary-path or repeated-attempt option. Missing/corrupt quarantine evidence or
+changed/missing source journals fail closed. `show` and account/preview output
+display the quarantine. Restart reloads it from disk; nothing infers an outcome
+or retries the unknown order.
+
+Late execution of the original order can still change cash during another test.
+The existing exact cash reconciliation then stops execution for manual review;
+quarantine does not relax that check. Quarantine enables independent readiness
+checks, not a settlement approval or authorization to submit another trade.
+
 ## Prepare an exact proposal
 
 From the repository directory:
@@ -99,8 +136,20 @@ Execution is **sequential and not atomic**:
 2. If it is open, cancel its unfilled remainder and reconcile any late fills.
 3. Submit the second order only if the first is confirmed closed with one full
    acquired share. A late full fill during cancellation can satisfy this condition.
+   Recheck settlement identities and the saved rules fingerprint, then match the
+   first fill to actual NO holdings, cost basis, cash and absence of selected open
+   orders. Any discrepancy blocks the second order.
 4. Reconcile the second order and cancel an unfilled remainder if necessary.
-5. Report `COMPLETE` only when both acquired quantities are confirmed as one.
+5. Report `COMPLETE` only when both acquired quantities are confirmed as one and
+   selected account holdings/costs match, no selected orders remain, and cash equals
+   the saved pre-submission balance minus confirmed fill costs.
+
+The pre-submission cash baseline is flushed with the controller before any order.
+Unrelated account activity, delayed reporting or unmodeled charges can fail the
+cash comparison; execution then stops for manual inspection. Terminal checks
+repeat the account comparison. Old journals without this baseline remain readable,
+but cannot pass exact reconciliation. Unknown placements display their possible
+one-share exposure instead of treating zero confirmed fills as zero execution.
 
 A first partial fill stops before the second order. A second-leg failure or
 partial fill can leave unmatched exposure. **Cancellation does not sell, refund

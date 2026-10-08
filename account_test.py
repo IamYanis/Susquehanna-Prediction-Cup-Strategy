@@ -17,6 +17,7 @@ from uuid import UUID, uuid4
 import requests
 from dotenv import load_dotenv
 
+import execution_quarantine as quarantine
 from account_reader import account_error_reason, read_account
 from order_preview import account_risk, ceil_buy_limit
 from paper_trader import MAX_CAPITAL_PER_RACE, MAX_CAPITAL_PER_TRADE, is_finite_number, parse_api_timestamp
@@ -161,6 +162,7 @@ def save_intent(intent, path, new=False):
     """New files are exclusive; updates replace atomically after flushing to disk."""
     temporary = None
     try:
+        quarantine.require_writable_path(path)
         validate_intent(intent)
         path = Path(path)
         # Exclusive creation blocks overwriting another test, even a finished one.
@@ -211,6 +213,7 @@ def commit_state(intent, path, state, **changes):
 def read_test_inputs(session, market_id, side, slug):
     """Fresh scoped GETs; a single directional test has no pair payout claim."""
     require(side in ("yes", "no"), "Choose YES or NO")
+    quarantine.require_unblocked_markets([market_id])
     started = time.monotonic()
     account = read_account(session, slug)
     tournament_id = account["tournament"]["id"]
@@ -305,6 +308,9 @@ def submit_test(session, intent, path, approval, recover=False):
     No replay is implemented without a documented deduplication retention window.
     """
     require_approval(intent, approval)
+    quarantine.require_writable_path(path)
+    quarantine.require_unblocked_markets([intent["market_id"]])
+    quarantine.require_unblocked_exchanges([intent["request"]["exchangeId"]])
     require(not recover, "Receipt replay is disabled; an unknown placement needs manual reconciliation")
     # Resolve aliases once so the lock, restore and atomic replacement all
     # protect the same file rather than replacing a symlink beside the journal.
@@ -451,6 +457,7 @@ def check_test(session, intent, path):
 
 
 def cancel_test(session, intent, path, approval):
+    quarantine.require_writable_path(path)
     require_approval(intent, approval)
     order = read_order(session, intent)
     if not order["open"]:
@@ -471,6 +478,7 @@ def cancel_test(session, intent, path, approval):
 
 
 def print_intent(intent):
+    quarantine.print_quarantine(intent["request"]["tournamentId"])
     print(f"SUPERVISED ACCOUNT TEST | {intent['state']} | order ID: {intent['order_id']}")
     print_placement_diagnostic(intent)
     print(json.dumps(intent["request"], indent=2, allow_nan=False))

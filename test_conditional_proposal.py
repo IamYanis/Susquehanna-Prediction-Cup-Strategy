@@ -9,7 +9,7 @@ import requests
 
 import order_preview as preview
 import price_reader as scanner
-from test_account_reader import holdings, order, orders_page, position, tournament
+from test_account_reader import holdings, isolate_quarantine, order, orders_page, position, tournament
 from test_api_audit import (
     OTHER_TOURNAMENT_ID, QUOTE_TIME, TOURNAMENT_ID, election_tree,
     exchange_book, page, pair_relationship, party_market,
@@ -18,6 +18,7 @@ from test_api_audit import (
 
 class ConditionalProposalTests(unittest.TestCase):
     def setUp(self):
+        isolate_quarantine(self)
         for obj, name, value in ((preview.time, "monotonic", 100),
                                  (preview.time, "time", QUOTE_TIME)):
             patcher = patch.object(obj, name, return_value=value)
