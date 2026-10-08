@@ -22,9 +22,33 @@ updates, or logs paper positions:
 .venv/bin/python price_reader.py --audit-only
 ```
 
-Both modes submit GET requests only. No competition account orders are implemented.
+Both scanner modes submit GET requests only. Competition account orders require
+the separate supervised account test tools described below.
 `--tournament` selects another competition slug, but it must resolve to an active
 SUSQies tournament and pass the same checks.
+
+To investigate prices even when settlement evidence cannot approve a pair:
+
+```bash
+.venv/bin/python research_report.py
+```
+
+This separate GET-only tool ranks apparent price gaps and saves all YES/NO-pair
+rows to the ignored local `research_report.csv`. It shows each leg's buy price,
+rounded limit cost, visible depth, quote timestamps, and available/missing
+settlement evidence. It also inspects the strongest observed pair's structured
+rule identity. Every row has `execution_approved=False`; neither this ranking nor
+matching rule identity authorizes trading. See [research report guide](RESEARCH_REPORT.md)
+for the columns, snapshot limitations, and remaining manual checks.
+
+To refresh only the Rhode Island Senate pair, keeping the full report:
+
+```bash
+.venv/bin/python research_report.py --dem-market 387 --rep-market 388
+```
+
+This writes the separately ignored `research_pair_report.csv`. The focused
+report uses the same freshness and settlement checks and cannot approve orders.
 
 To inspect your competition account's reported cash, holdings, and open orders:
 
@@ -63,6 +87,63 @@ exposure. Either selected exchange having a holding or order blocks the draft.
 The example market IDs do not imply an approved trade; missing relationship
 evidence blocks the preview. See [order preview guide](ORDER_PREVIEW.md) for the
 account checks, schema details, and limits of this read-only tool.
+
+For a numerical one-pair NO proposal while settlement evidence remains unresolved:
+
+```bash
+.venv/bin/python order_preview.py --dem-market 387 --rep-market 388 --conditional-proposal
+```
+
+This GET-only option checks the current account and books and shows conditional
+gains, refund risks and losses if only one leg fills. It creates no order body or
+execution intent and does not approve a trade. The strict settlement gate on
+default order preparation and submission remains in place.
+
+For a supervised one-share test on a competition account, the separate
+`account_test.py` tool can first prepare and save a limit order using GETs:
+
+```bash
+.venv/bin/python account_test.py prepare --market 387 --side yes
+```
+
+The example chooses a directional YES purchase; it is not an approved arbitrage
+or a recommendation to buy that market. Preparation saves an ignored local
+`account_test.json` with its exact body and approval fingerprint. It does not
+submit the order. Submission and specific-order cancellation each require a
+separate command with that fingerprint; the scanner never calls this tool.
+A filled share can remain in the account after cancellation of any remainder.
+See [supervised account test guide](ACCOUNT_TEST.md) before any account write.
+
+The separate `paired_account_test.py` adds a supervised one-pair NO workflow:
+
+```bash
+.venv/bin/python paired_account_test.py prepare --dem-market 387 --rep-market 388
+```
+
+Preparation is GET-only and requires the existing engine settlement evidence;
+that is the default policy. For the separately accepted Rhode Island test,
+`prepare --dem-market 387 --rep-market 388 --conditional` selects an explicit
+conditional policy, limited to those contracts and a combined cost cap of 0.970
+SUSQies. It records the missing evidence and accepted settlement/partial-fill
+risks rather than claiming verified arbitrage. Both policies retain account and
+liquidity checks. Successful preparation saves two one-share
+limit orders and an exact pair fingerprint in the ignored `paired_account_test/`
+directory. Submission is a separate opt-in command. The handler confirms a full
+first fill before attempting the second, stops on uncertain replies, and records
+unmatched shares after a failed leg. It can cancel known unfilled remainders but
+cannot undo fills. See [paired execution guide](PAIRED_ACCOUNT_TEST.md).
+
+The authorized test on 8 October 2026 left its first order `UNKNOWN`; the second
+was not submitted. No successful pair is confirmed. Preserve the ignored local
+journals and resolve the original attempt before any further submission. The
+read-only diagnostic checks the current account and recent scoped trade audit:
+
+```bash
+.venv/bin/python paired_account_test.py diagnose
+```
+
+It leaves execution journals unchanged. Empty reads do not release an uncertain
+attempt for replay. See the execution guide for the recorded checks and limits.
 
 The scanner fetches relationships once per scan and skips rule/book requests
 when evidence cannot approve a pair. Large eligible universes can still make a
@@ -178,5 +259,6 @@ Tests use fake API responses and clocks, temporary portfolios, and a restart
 across two Python processes. They cover pagination, venue identity, settlement
 eligibility, snapshot freshness, network/rate failures, event transitions, risk
 limits, provenance, portfolio/CSV recovery, simulated execution/recovery, local
-order drafting, and read-only account/audit modes. They do not call the API or touch your saved
+order drafting, supervised account-test control with fake HTTP writes, and
+read-only research/account/audit modes. They do not call the API or touch your saved
 portfolio or `.env`.

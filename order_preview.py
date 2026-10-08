@@ -1,6 +1,7 @@
 """Prepare a local order preview from GET reads. Never submit or cancel orders."""
 import argparse
 import copy
+import hashlib
 import json
 import math
 import os
@@ -20,7 +21,7 @@ from paper_trader import (
 from price_reader import (
     API_BASE_URL, API_ERRORS, MAX_TRADE_QUANTITY, MIN_EDGE, MIN_LIQUIDITY,
     DataValidationError, check_context, fetch_json, find_opportunities, get_best_prices,
-    get_exchange_id, get_pair_rules, numeric_id,
+    get_election_rule, get_exchange_id, get_pair_rules, numeric_id,
 )
 
 PRICE_TICK = Decimal("0.005")
@@ -71,10 +72,10 @@ def account_risk(account, exchange_ids):
                     "The preview needs an enrolled active competition account")
     cash = require_number(tournament["myBalance"], nonnegative=True)
     positions, _ = validate_positions({"positions": account["positions"], "summary": account["summary"]})
-    require_preview(isinstance(exchange_ids, (list, tuple)) and len(exchange_ids) == 2,
-                    "Two selected exchanges are required")
+    require_preview(isinstance(exchange_ids, (list, tuple)) and 1 <= len(exchange_ids) <= 2,
+                    "One or two selected exchanges are required")
     selected = {numeric_id(exchange_id) for exchange_id in exchange_ids}
-    require_preview(len(selected) == 2, "The selected exchanges must be different")
+    require_preview(len(selected) == len(exchange_ids), "The selected exchanges must be different")
     holdings_cost = 0
     for position in positions:
         if position["quantity"] == 0:
@@ -153,8 +154,8 @@ def validate_request_body(body):
                     "The two preview legs must share scope, side and quantity")
 
 
-def build_preview(account, position_type, market_context, books, account_started, quantity=None):
-    """Build a conditional two-leg draft after validating evidence and account risk."""
+def observed_limits(position_type, books, account_started, quantity=None):
+    """Check fresh prices and depth. Price arithmetic alone never approves a trade."""
     require_preview(position_type in ("YES-PAIR", "NO-PAIR"), "Unknown pair type")
     require_preview(is_finite_number(account_started)
                     and 0 <= time.monotonic() - account_started <= MAX_ACCOUNT_READ_AGE,
@@ -189,6 +190,15 @@ def build_preview(account, position_type, market_context, books, account_started
     pair_cost = sum(Decimal(str(price)) for price in prices)
     edge = Decimal(1) - pair_cost
     require_preview(edge >= Decimal(str(MIN_EDGE)), "Tick-rounded limits fall below the 2% edge requirement")
+    for book in books:
+        require_preview(abs(parse_api_timestamp(book["version"]["at"]).timestamp() - book["quoted_at"]) < 1e-6,
+                        "Book version and quote timestamps disagree")
+    return prices, quantity, pair_cost, edge
+
+
+def build_preview(account, position_type, market_context, books, account_started, quantity=None):
+    """Build a two-leg draft after validating settlement evidence and account risk."""
+    prices, quantity, pair_cost, edge = observed_limits(position_type, books, account_started, quantity)
     context = copy.deepcopy(market_context)
     context["leg_prices"] = prices
     context["book_versions"] = [copy.deepcopy(book["version"]) for book in books]
@@ -196,11 +206,6 @@ def build_preview(account, position_type, market_context, books, account_started
                              "cost_per_pair": float(pair_cost)})
     require_preview(context["tournament_id"] == account["tournament"]["id"],
                     "Market evidence belongs to another competition account")
-    # Both the engine version timestamp and its parsed quote time must describe
-    # the same observation, including seven-decimal-place engine timestamps.
-    for book in books:
-        require_preview(abs(parse_api_timestamp(book["version"]["at"]).timestamp() - book["quoted_at"]) < 1e-6,
-                        "Book version and quote timestamps disagree")
     risk = account_risk(account, context["exchange_ids"])
     capital = float(pair_cost * quantity)
     require_preview(capital <= MAX_CAPITAL_PER_TRADE, "The draft exceeds the per-trade capital limit")
@@ -222,10 +227,8 @@ def build_preview(account, position_type, market_context, books, account_started
             "book_versions": context["book_versions"], "market_context": context}
 
 
-def preview_pair(session, account, democrat_market_id, republican_market_id,
-                 position_type, account_started, quantity=None):
-    """Read exactly one selected pair; use the same settlement gate as the scanner."""
-    tournament_id = account["tournament"]["id"]
+def read_selected_pair(session, tournament_id, democrat_market_id, republican_market_id):
+    """Confirm market scope and titles before reading rules or executable quotes."""
     ids = [numeric_id(democrat_market_id), numeric_id(republican_market_id)]
     require_preview(ids[0] != ids[1], "Select two different markets")
     markets, races = [], []
@@ -242,6 +245,16 @@ def preview_pair(session, account, democrat_market_id, republican_market_id,
         races.append(market["title"][len(prefix):].removesuffix("?").strip())
         markets.append(market)
     require_preview(bool(races[0]) and races[0] == races[1], "Selected market titles describe different races")
+    require_preview(get_exchange_id(markets[0]) != get_exchange_id(markets[1]),
+                    "Select two different exchanges")
+    return markets
+
+
+def preview_pair(session, account, democrat_market_id, republican_market_id,
+                 position_type, account_started, quantity=None):
+    """Read exactly one selected pair; use the same settlement gate as the scanner."""
+    tournament_id = account["tournament"]["id"]
+    markets = read_selected_pair(session, tournament_id, democrat_market_id, republican_market_id)
     # No manual override or unsupported guessed payout: absent relationships
     # remain blocked. Rule trees also establish the shared structured race key.
     try:
@@ -256,6 +269,97 @@ def preview_pair(session, account, democrat_market_id, republican_market_id,
     account_risk(account, context["exchange_ids"])
     books = [get_best_prices(session, market, tournament_id) for market in markets]
     return build_preview(account, position_type, context, books, account_started, quantity)
+
+
+def conditional_proposal(session, account, democrat_market_id, republican_market_id, account_started):
+    """Analyze one NO share per leg without creating any executable order intent.
+
+    Matching election rules establish which race we are discussing. They do not
+    prove mutual exclusivity or coordinated refunds. Missing relationship
+    evidence is recorded explicitly; the strict execution tools still reject it.
+    """
+    tournament_id = account["tournament"]["id"]
+    markets = read_selected_pair(session, tournament_id, democrat_market_id, republican_market_id)
+    exchange_ids = [get_exchange_id(market) for market in markets]
+    risk = account_risk(account, exchange_ids)
+    try:
+        allowed, context = get_pair_rules(session, markets[0], markets[1], tournament_id)
+        require_preview("NO-PAIR" in allowed, "No ordinary NO-pair coverage was verified")
+        relationship_verified = True
+        race_key = context["race_key"]
+        evidence_fingerprint = context["settlement_fingerprint"]
+    except DataValidationError as error:
+        # Only this specific missing-evidence condition allows further analysis.
+        # Network failures, malformed evidence and mismatched scopes still stop.
+        if str(error) != "No active relationship verifies this pair's normal payout":
+            raise
+        relationship_verified = False
+        rules = [get_election_rule(session, market, party, tournament_id)
+                 for market, party in zip(markets, ("Democratic", "Republican"))]
+        require_preview(rules[0][0] == rules[1][0]
+                        and rules[0][1]["settlement_date"] == rules[1][1]["settlement_date"],
+                        "Party contracts describe different races or stages")
+        race_key = list(rules[0][0])
+        # Pin the actual structured rules for a later supervised preparation.
+        # This fingerprint identifies observations; it does not verify payouts.
+        evidence_fingerprint = hashlib.sha256(json.dumps(
+            ["conditional-rule-analysis", rules], sort_keys=True, allow_nan=False
+        ).encode()).hexdigest()
+    books = [get_best_prices(session, market, tournament_id) for market in markets]
+    prices, quantity, cost, edge = observed_limits("NO-PAIR", books, account_started, quantity=1)
+    capital = float(cost)
+    require_preview(capital <= MAX_CAPITAL_PER_TRADE, "The proposal exceeds the per-trade capital limit")
+    require_preview(risk["race_exposure_upper_bound"] + capital <= MAX_CAPITAL_PER_RACE + 1e-9,
+                    "The conservative race exposure bound exceeds 150; structured exposure mapping is required")
+    require_preview(capital <= risk["available_cash"] + 1e-9,
+                    "Reported cash minus existing open-order reserves cannot cover the proposal")
+    risk["race_exposure_after_upper_bound"] = risk["race_exposure_upper_bound"] + capital
+    # All gains assume BOTH shares fill at their displayed limits. Refund cases
+    # additionally assume the complete acquisition cost is refundable. Neither
+    # assumption is verified by this numerical plan; fees are not modeled.
+    scenarios = [
+        ("Only Democratic or only Republican party wins", float(edge)),
+        ("Neither party wins", float(Decimal(2) - cost)),
+        ("Both party markets resolve YES", -capital),
+        ("Both shares refunded at acquisition cost", 0.0),
+        ("Democratic NO refunded; Republican NO loses", -prices[1]),
+        ("Republican NO refunded; Democratic NO loses", -prices[0]),
+        ("Only Democratic NO fills and later loses", -prices[0]),
+        ("Only Republican NO fills and later loses", -prices[1]),
+    ]
+    # Deliberately omit a request body, idempotency key, approval hash and
+    # market_context: this result cannot be loaded by the execution handler.
+    return {"mode": "conditional-proposal", "submission_enabled": False,
+            "execution_approved": False, "quantity": quantity, "position_type": "NO-PAIR",
+            "relationship_verified": relationship_verified, "race_key": race_key,
+            "tournament_id": tournament_id, "evidence_fingerprint": evidence_fingerprint,
+            "book_versions": [copy.deepcopy(book["version"]) for book in books],
+            "legs": [{"market_id": numeric_id(market["id"]), "exchange_id": exchange_id,
+                      "price": price, "depth": book["bid_quantity"], "quote_at": book["version"]["at"]}
+                     for market, exchange_id, price, book in zip(markets, exchange_ids, prices, books)],
+            "max_new_spend": capital, "conditional_projected_profit": float(edge),
+            "risk": risk, "scenarios": scenarios}
+
+
+def print_conditional_proposal(proposal):
+    """Display the numerical plan and its assumptions, without an order payload."""
+    print("CONDITIONAL PROPOSAL | 1 NO share per leg | EXECUTION NOT APPROVED")
+    for party, leg in zip(("Democratic", "Republican"), proposal["legs"]):
+        print(f"{party} NO | market {leg['market_id']} | exchange {leg['exchange_id']} | "
+              f"limit {leg['price']:.3f} | depth {leg['depth']:g} | quote {leg['quote_at']}")
+    print(f"Maximum contract spend / loss before unverified fees: {proposal['max_new_spend']:.3f} SUSQies")
+    risk = proposal["risk"]
+    print(f"Account checks passed | available after open-order reserves {risk['available_cash']:.2f} | "
+          f"exposure after proposal (account-wide upper bound) {risk['race_exposure_after_upper_bound']:.3f} / {MAX_CAPITAL_PER_RACE}")
+    evidence = "present" if proposal["relationship_verified"] else "MISSING; strict execution remains blocked"
+    print(f"Engine ordinary-payout relationship: {evidence}")
+    print("Conditional gains/losses at these limits; refunds assume full acquisition-cost reimbursement:")
+    for scenario, gain in proposal["scenarios"]:
+        print(f"  {scenario}: {gain:+.3f} SUSQies")
+    print("The first two cases assume ordinary binary settlement. Matching rules do not prove exclusive party outcomes.")
+    print("Quotes do not guarantee fills. Cancelling a remaining order cannot undo a filled share.")
+    print("Account and book reads are sequential observations, not an atomic executable snapshot.")
+    print("No order body, execution key, approval fingerprint, or execution journal was created.")
 
 
 def print_preview(preview):
@@ -278,8 +382,13 @@ def main():
     parser.add_argument("--rep-market", required=True, help="Republican market ID")
     parser.add_argument("--position", choices=("YES-PAIR", "NO-PAIR"), default="NO-PAIR")
     parser.add_argument("--quantity", type=int, help="Shares per leg (1..100); default uses available depth up to 100")
+    parser.add_argument("--conditional-proposal", action="store_true",
+                        help="Read-only one-pair NO analysis, even without relationship evidence; never an order draft")
     parser.add_argument("--tournament", default="midterm-elections", help="Competition slug")
     args = parser.parse_args()
+    if args.conditional_proposal and (args.position != "NO-PAIR" or args.quantity not in (None, 1)):
+        print("CONDITIONAL PROPOSAL BLOCKED | Select NO-PAIR and exactly one share per leg.")
+        return 1
     # Load the secret only at the CLI boundary; never put it in a draft or log.
     load_dotenv(Path(__file__).resolve().with_name(".env"))
     api_key = os.getenv("SIG_API_KEY")
@@ -299,9 +408,15 @@ def main():
             print(f"Account read complete | reported cash {account['tournament']['myBalance']:.2f} | "
                   f"nonzero holdings {sum(position['quantity'] != 0 for position in account['positions'])} | "
                   f"open orders {len(account['orders'])}")
-            preview = preview_pair(session, account, args.dem_market, args.rep_market,
-                                   args.position, account_started, args.quantity)
-        print_preview(preview)
+            if args.conditional_proposal:
+                preview = conditional_proposal(session, account, args.dem_market, args.rep_market, account_started)
+            else:
+                preview = preview_pair(session, account, args.dem_market, args.rep_market,
+                                       args.position, account_started, args.quantity)
+        if args.conditional_proposal:
+            print_conditional_proposal(preview)
+        else:
+            print_preview(preview)
     except PreviewBlocked as error:
         print(f"PREVIEW BLOCKED | {error}. No order draft approved.")
         return 1

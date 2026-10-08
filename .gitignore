@@ -10,3 +10,10 @@ execution_state.json
 .execution_state.json.*.tmp
 simulated_venue.json
 .simulated_venue.json.*.tmp
+account_test.json
+.account_test.json.*.tmp
+research_report.csv
+.research_report.csv.*.tmp
+research_pair_report.csv
+.research_pair_report.csv.*.tmp
+paired_account_test/

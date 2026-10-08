@@ -37,6 +37,31 @@ bypassing the checks.
 to the same scope and eligibility checks. There is no override for an unverified
 pair.
 
+## Analyze a conditional one-pair proposal
+
+To inspect a numerical proposal while settlement evidence remains unresolved:
+
+```bash
+.venv/bin/python order_preview.py --dem-market 387 --rep-market 388 --conditional-proposal
+```
+
+This option fixes the quantity at **one NO share per leg**. An explicit quantity
+other than one, or a YES pair, is rejected before reading credentials or the
+account. It still checks actual account cash, holdings, open orders, capital
+limits, scoped matching election rules, fresh books, depth of at least 50 and a
+tick-rounded price gap of at least 0.02.
+
+A missing relationship permits numerical analysis only. Malformed evidence,
+failed reads or mismatched rules still stop the tool. The output labels any
+missing relationship and shows conditional ordinary payouts, both-party-YES
+losses, refund assumptions and the loss if only one leg fills. Fees are not
+modeled. It does not produce an order body, execution key, approval fingerprint
+or journal, even if relationship evidence is present. **Execution is never
+approved by this option.** The default preview and default paired preparation
+retain their existing settlement gate. A separately accepted conditional paired
+preparation is described in [the execution guide](PAIRED_ACCOUNT_TEST.md); this
+analysis cannot prepare or submit it.
+
 ## How the draft is checked
 
 The tool resolves the tournament slug to its UUID and uses that explicit scope
@@ -109,20 +134,30 @@ orders without placing them. This draft is checked locally for schema and risk
 compatibility; it is **not server-approved**, an execution guarantee, or proof of
 risk-free profit. Fees and cancellation/refund outcomes are not modeled.
 Atomic multi-leg placement also does not guarantee equal or complete fills.
-Live submission and execution recovery remain unimplemented.
+Supervised submission and recovery are implemented separately in the
+[paired account test](PAIRED_ACCOUNT_TEST.md); this preview cannot invoke them.
 
 ## Verification
 
 Run the focused tests with:
 
 ```bash
-.venv/bin/python -m unittest test_order_preview -v
+.venv/bin/python -m unittest test_order_preview test_conditional_proposal -v
 ```
 
-All 25 preview tests and the complete 139-test suite passed on 7 October 2026.
 The tests use fake API responses and temporary files; they cover price rounding,
 NO complements, real-account risk calculations, fresh observations, scope,
 settlement gates, protected files, and GET-only behavior.
+Conditional proposal tests also cover explicit unapproved output, absence of
+executable material, single-leg/refund losses and rejection of larger quantities.
+
+All 242 repository tests passed on 8 October 2026, including the strict preview,
+conditional analysis and paired-handler checks. A live GET-only conditional
+proposal also completed: matching structured rules, account checks and books
+passed, with one-share NO limits of 0.125 and 0.845. The ordinary-payout
+relationship remained missing. It produced analysis only and no execution
+material. Quotes were observed at about 00:01:22 UTC; they require refreshing
+before any later decision. Private account values were not saved in this guide.
 
 A separate live read-only check of the example Rhode Island pair completed the
 account read and blocked the preview because no active relationship verified

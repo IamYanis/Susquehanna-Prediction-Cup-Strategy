@@ -314,8 +314,21 @@ Readiness requires more than positive paper results:
 - Explicit user authorization for competition account orders after the concrete
   execution implementation and its validation can be reviewed.
 
-The current work authorizes the audit and paper-only improvements. It does not
-authorize implementing or submitting account orders.
+The audit and paper scanner do not authorize account orders. A separate,
+supervised one-share mechanics tool is now described in the
+[account test guide](ACCOUNT_TEST.md). It requires approval of the exact saved
+request for a submission or cancellation. It does not establish a verified
+arbitrage pair or enable strategy execution. Offline tests use fake HTTP writes.
+A later separately authorized one-pair submission attempt left the first order
+`UNKNOWN` and the second unsubmitted; no successful pair is confirmed. The
+[paired guide](PAIRED_ACCOUNT_TEST.md) records that attempt and subsequent
+read-only reconciliation. The original local journals remain preserved.
+
+A separate [supervised paired handler](PAIRED_ACCOUNT_TEST.md) now reuses those
+single-order checks for one NO share per leg. Its default preparation and
+submission still require the existing engine settlement evidence. Partial fills,
+lost replies and failed legs remain explicit states; no order is automatically
+replayed or replaced, and held shares are not refunded by cancellation.
 
 ## Offline validation scope
 

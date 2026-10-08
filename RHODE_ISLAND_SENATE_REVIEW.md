@@ -1,6 +1,7 @@
 # Rhode Island Senate settlement review
 
-Review date: **7 October 2026**. This is a public-source review of Democratic
+Initial review: **7 October 2026**; focused refresh: **8 October 2026** (London).
+This is a public-source review of Democratic
 market **387** and Republican market **388**. It contains no private account
 information and does not authorize orders. **Neither pair is automatically
 approved by the current scanner.**
@@ -136,3 +137,111 @@ support only **profit conditional on ordinary settlement** until these cases
 are accounted for. Rules and resolution can change under the competition's
 published terms. Execution, account reconciliation, and order authorization
 remain separate requirements.
+
+## Focused refresh: 8 October 2026
+
+The scoped books were refreshed at approximately **00:10 BST** on 8 October
+(23:10 UTC on 7 October). These are dated observations, not current executable
+quotes. The research script validated both snapshots as fresh when calculating
+the prices.
+
+| NO-pair field | Refreshed observation |
+| --- | --- |
+| Democratic NO buy / rounded limit | 0.125 SUSQies |
+| Republican NO buy / rounded limit | 0.845 SUSQies |
+| Combined limit cost | 0.970 SUSQies |
+| Apparent gap relative to one-unit payout | 0.030 SUSQies per pair |
+| Democratic-side visible shares | 11,674 |
+| Republican-side visible shares | 3,874 |
+| Pair depth | 3,874 |
+| Research quantity cap | 100 pairs; not account-approved |
+| Democratic engine timestamp | 2026-10-07T23:10:21.7749527+00:00 |
+| Republican engine timestamp | 2026-10-07T23:10:22.5299131+00:00 |
+
+This passes the research price/depth policies. Both structured rule identities
+still match race 62978 / stage 98108 / General / Party Winner / 3 November 2026.
+There is still no active scoped relationship verifying the normal payout.
+The local ignored `research_pair_report.csv` records both pair types; the YES
+pair cost 1.040 and did not meet the price policy.
+
+### What the public rules support
+
+The official candidate list, retrieved again, still shows Reed as Democrat,
+McKay as Republican and Bahry as Independent. Its displayed data timestamp was
+6 October; retrieving it on 8 October does not make the underlying list newer.
+The Department's declaration guidance prohibits filings for the same office
+under different party labels. The party-affiliation statute additionally
+restricts membership in a different party before the declaration; the separate
+party/independent nomination statute prohibits filing both forms of candidacy.
+[Candidate list](https://vote.sos.ri.gov/Candidates/CandidateSearchSummary?Election=18144&OfficeType=620),
+[Declaration guidance](https://vote.sos.ri.gov/Candidates/DeclarationOfCadidacy),
+[R.I. Gen. Laws 17-14-1.1](https://webserver.rilegislature.gov/Statutes/TITLE17/17-14/17-14-1.1.htm),
+[R.I. Gen. Laws 17-14-2.1](https://webserver.rilegislature.gov/Statutes/TITLE17/17-14/17-14-2.1.htm).
+
+The published Party Winner component was downloaded again without credentials.
+Its affiliation and fusion wording was unchanged from the previous retrieval.
+The listed ballot does not show a Democratic/Republican fusion candidate;
+the generic fusion clause is not evidence that this particular ballot contains
+one. It remains important to distinguish that ballot observation from a complete
+statement of the platform's resolver mapping.
+
+**Conditional inference:** if the platform uses these official party labels and
+settles both contracts as ordinary binary outcomes, each listed winner produces
+the following NO-pair result. An independent winner benefits this NO pair.
+
+| Listed winner / assumed resolver classification | NO-pair payout | Payout minus 0.970 cost |
+| --- | ---: | ---: |
+| Reed / Democratic only | 1 | +0.030 |
+| McKay / Republican only | 1 | +0.030 |
+| Bahry / neither selected party | 2 | +1.030 |
+
+This supports a conditional ordinary-settlement price gap. It does not establish
+the resolver's behavior for every accepted exceptional result or change the
+scanner's engine-evidence gate. No independently confirmed dual-party result was
+found for the current listed candidates.
+
+### Refund cases at the observed cost
+
+Assuming each refunded leg returns its full acquisition cost, these are simple
+payoff scenarios derived from the official refund description. They are not
+predictions that the platform will refund a particular leg or refund them
+independently.
+
+| Settlement scenario | Pair payout/refund | Result after acquisition cost |
+| --- | ---: | ---: |
+| Both legs refund | 0.970 | 0 |
+| Democratic NO refunds; Republican NO loses | 0.125 | -0.845 |
+| Republican NO refunds; Democratic NO loses | 0.845 | -0.125 |
+| Both party markets resolve YES | 0 | -0.970 |
+
+The final row illustrates a failure of ordinary exclusivity, not an observed
+ballot outcome. The published guide does not promise coordinated refund or
+override behavior for these two separate contracts.
+[Settlement guide](https://sig.thesuper.market/docs/settlement-and-payouts).
+
+**Decision:** price and depth checks pass, and public ballot evidence supports
+the stated ordinary-payoff inference. Automatic settlement approval remains
+unverified. No approved order body was produced, no account risk or cash was
+substituted with paper values, and no orders were submitted or cancelled. A
+two-leg account preview still requires settlement evidence accepted by the
+existing checker, followed by fresh account/book and risk-limit checks.
+
+## One-pair conditional proposal, 8 October 2026
+
+The new read-only `order_preview.py --conditional-proposal` option completed
+scoped market, rule, account and book reads. At approximately 00:01:22 UTC
+(01:01:22 London time), one Democratic NO share had a 0.125 limit and depth
+2,857; one Republican NO share had a 0.845 limit and depth 150. The combined
+contract-cost cap was 0.970 SUSQies. Actual account cash, overlap and conservative
+exposure checks passed; private account values are deliberately omitted here.
+
+Under the ordinary settlement assumptions above, the conditional gain remains
+0.030 when exactly one selected party wins. If only the Democratic NO share
+fills and loses, its loss is 0.125; if only the Republican NO fills and loses,
+its loss is 0.845. The two-share contract-cost loss can reach 0.970 if both NO
+shares lose. These figures omit unverified fees and do not guarantee fills.
+
+The relationship evidence was still missing. The tool produced no order body,
+execution key, approval fingerprint or journal, and placed or cancelled no
+orders. The strict paired handler remains blocked. This dated numerical proposal
+does not authorize execution or relax the existing settlement policy.
