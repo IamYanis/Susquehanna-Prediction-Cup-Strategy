@@ -385,8 +385,8 @@ def read_order(session, intent):
     return order
 
 
-def check_test(session, intent, path):
-    """Read specific order and every fill page; a cancelled share remains held."""
+def observe_test(session, intent):
+    """Read specific order and every fill page without changing any journal."""
     validate_intent(intent)
     order = read_order(session, intent)
     body, order_id = intent["request"], intent["order_id"]
@@ -452,6 +452,12 @@ def check_test(session, intent, path):
                    "open": order["open"], "terminal_reason": order.get("terminalReasonCode")}
     # Preserve an uncertain cancel until GET explicitly reports the order closed.
     state = intent["state"] if order["open"] else "OBSERVED_TERMINAL"
+    return state, observation
+
+
+def check_test(session, intent, path):
+    """Persist a fresh observation; a cancelled filled share remains held."""
+    state, observation = observe_test(session, intent)
     commit_state(intent, path, state, observation=observation)
     return intent
 

@@ -23,7 +23,9 @@ class ScannerTests(unittest.TestCase):
     tournament_id = "550e8400-e29b-41d4-a716-446655440000"
 
     def race_markets(self):
-        return ({"Race": ({"id": "1", "status": "open"}, {"id": "2", "status": "open"})}, {"1", "2"})
+        from test_api_audit import party_market
+        return ({"Race": (party_market("Democratic", 1, 11),
+                          party_market("Republican", 2, 12))}, {"1", "2"})
 
     def setUp(self):
         isolate_quarantine(self)
@@ -32,6 +34,12 @@ class ScannerTests(unittest.TestCase):
         self.addCleanup(temporary_directory.cleanup)
         self.portfolio_path = Path(temporary_directory.name) / "paper_portfolio.json"
         self.trade_log_path = Path(temporary_directory.name) / "paper_trades.csv"
+        self.approval_path = Path(temporary_directory.name) / "approved_settlements.json"
+        from test_api_audit import approved_pair
+        self.write_approvals([approved_pair()])
+        patcher = patch.object(scanner, "APPROVED_SETTLEMENTS_PATH", self.approval_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for name, value in (("PORTFOLIO_PATH", self.portfolio_path),
                             ("TRADE_LOG_PATH", self.trade_log_path),
                             ("open_positions", []),
@@ -48,6 +56,9 @@ class ScannerTests(unittest.TestCase):
         self.redirect = contextlib.redirect_stdout(self.output)
         self.redirect.__enter__()
         self.addCleanup(self.redirect.__exit__, None, None, None)
+
+    def write_approvals(self, pairs):
+        self.approval_path.write_text(json.dumps({"version": 1, "allowed_mode": "paper-only", "pairs": pairs}))
 
     def opportunity(self, edge=0.1, quantity=100):
         return {"YES-PAIR": {"cost_per_pair": 1 - edge,
@@ -195,6 +206,12 @@ class ScannerTests(unittest.TestCase):
                 "description": paired.manual_rule_description(party), "contractType": "Freeform"})
             trees.append(tree)
         _, record = paired.read_manual_evidence(self.manual_session(markets + trees), self.tournament_id, "153", "154")
+        from test_api_audit import approved_pair
+        approval = approved_pair(self.tournament_id, ("153", "154"), ("842", "843"))
+        approval.update(pair_name="U.S. Senate", position_types=["NO-PAIR"], max_quantity=1,
+                        manual_approval={key: record[key] for key in (
+                            "evidence_hash", "proposition", "source_refs", "limitations")})
+        self.write_approvals([approval])
         versions = self.recorded_context()["book_versions"]
         books = [{"bid": bid, "ask": bid + .005, "bid_quantity": 50, "ask_quantity": 50,
                   "version": version} for bid, version in zip((.64, .37), versions)]
@@ -235,9 +252,12 @@ class ScannerTests(unittest.TestCase):
         self.assertFalse(trader.execute_paper_trade("U.S. Senate", "NO-PAIR", .99, .01, 2,
                                                    position["market_context"]))
 
-    def test_manual_paper_pair_is_not_approved_by_default_or_by_wrong_hash(self):
+    def test_manual_paper_pair_requires_configured_approval_and_matching_optional_hash(self):
         markets, trees, books, approval = self.manual_senate_fixture()
+        configured = json.loads(self.approval_path.read_text())["pairs"]
         for explicit in (None, "a" * 64):
+            # A CLI flag never substitutes for the persistent allowlist.
+            self.write_approvals([] if explicit is None else configured)
             with self.subTest(explicit=explicit), \
                     patch.object(scanner, "get_races", return_value=({"U.S. Senate": markets}, {"153", "154"})), \
                     patch.object(scanner, "fetch_pages", return_value=[]), \
@@ -253,6 +273,177 @@ class ScannerTests(unittest.TestCase):
                 patch.object(scanner.requests, "Session") as session:
             scanner.main()
         session.assert_not_called()
+
+    def manual_cycle_payloads(self, markets, trees, quote_time, sequence=1):
+        """Full authoritative GET fixtures, including new books for each cycle."""
+        from test_api_audit import exchange_book, page
+        books = [exchange_book(153, 842, .64, .645), exchange_book(154, 843, .37, .375)]
+        for book in books:
+            book["asOf"] = {"sequence": sequence,
+                            "at": datetime.fromtimestamp(quote_time, timezone.utc).isoformat()}
+        return [page(markets), page([])] + markets + trees + books
+
+    def run_manual_cycle(self, markets, trees, previous, quote_time, sequence=1, paper_trade=True):
+        session = self.manual_session(self.manual_cycle_payloads(markets, trees, quote_time, sequence))
+        with patch.object(scanner.time, "time", return_value=quote_time), \
+                patch.object(scanner.time, "monotonic", return_value=10):
+            scanner.scan_once(session, previous, self.tournament_id, paper_trade=paper_trade)
+        session.post.assert_not_called()
+        session.put.assert_not_called()
+        session.patch.assert_not_called()
+        session.delete.assert_not_called()
+        return session
+
+    def test_configured_manual_pair_is_eligible_each_cycle_and_after_restart_without_duplicates(self):
+        from test_api_audit import QUOTE_TIME
+        markets, trees, _, evidence_hash = self.manual_senate_fixture()
+        original_config = self.approval_path.read_bytes()
+        approved_at = json.loads(original_config)["pairs"][0]["approved_at"]
+        previous = {}
+        first = self.run_manual_cycle(markets, trees, previous, QUOTE_TIME)
+        saved_portfolio = self.portfolio_path.read_bytes()
+        saved_log = self.trade_log_path.read_bytes()
+        second = self.run_manual_cycle(markets, trees, previous, QUOTE_TIME + 15, 2)
+        # All evidence and books are fetched anew, even for an unchanged position.
+        self.assertEqual(first.get.call_count, 8)
+        self.assertEqual(second.get.call_count, 8)
+        self.assertEqual(len(trader.open_positions), 1)
+        self.assertEqual(trader.paper_balance, 4999.01)
+        self.assertIn(("U.S. Senate", "NO-PAIR"), previous)
+        self.assertEqual(self.output.getvalue().count("explicitly approved manual evidence"), 2)
+        self.assertEqual(self.portfolio_path.read_bytes(), saved_portfolio)
+        self.assertEqual(self.trade_log_path.read_bytes(), saved_log)
+        context = trader.open_positions[0]["market_context"]
+        self.assertEqual(context["manual_approval"]["approved_at"], approved_at)
+        self.assertEqual(context["settlement_fingerprint"], evidence_hash)
+        # A new run reloads the same approval and persisted duplicate protection.
+        trader.open_positions.clear()
+        trader.paper_balance = 5000
+        trader.load_portfolio()
+        self.run_manual_cycle(markets, trees, {}, QUOTE_TIME + 30, 3)
+        self.assertEqual(len(trader.open_positions), 1)
+        self.assertEqual(self.portfolio_path.read_bytes(), saved_portfolio)
+        self.assertEqual(self.trade_log_path.read_bytes(), saved_log)
+        self.assertEqual(self.approval_path.read_bytes(), original_config)
+        self.assertIn("PAPER TRADE SKIPPED", self.output.getvalue())
+
+    def test_continuous_main_uses_persistent_approval_without_the_one_shot_flag(self):
+        from test_api_audit import QUOTE_TIME
+        markets, trees, _, _ = self.manual_senate_fixture()
+        payloads = (self.manual_cycle_payloads(markets, trees, QUOTE_TIME)
+                    + self.manual_cycle_payloads(markets, trees, QUOTE_TIME, 2))
+        session = self.manual_session(payloads)
+        session.__enter__ = Mock(return_value=session)
+        session.__exit__ = Mock(return_value=False)
+        with patch("sys.argv", ["price_reader.py"]), \
+                patch.object(scanner, "load_dotenv"), \
+                patch.object(scanner.os, "getenv", return_value="offline-test-key"), \
+                patch.object(scanner.requests, "Session", return_value=session), \
+                patch.object(scanner, "READ_REQUEST_SPACING", 0), \
+                patch.object(scanner.time, "time", return_value=QUOTE_TIME), \
+                patch.object(scanner.time, "monotonic", return_value=10), \
+                patch.object(scanner.time, "sleep", side_effect=[None, KeyboardInterrupt]) as sleep:
+            self.assertEqual(scanner.main(), 0)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertEqual(session.get.call_count, 16)
+        self.assertEqual(self.output.getvalue().count("explicitly approved manual evidence"), 2)
+        self.assertEqual(len(trader.open_positions), 1)
+        self.assertEqual(trader.open_positions[0]["quantity"], 1)
+        session.post.assert_not_called()
+
+    def test_unlisted_pair_cannot_paper_trade_even_with_valid_machine_evidence(self):
+        from test_api_audit import page, pair_relationship, party_market
+        self.write_approvals([])
+        markets = [party_market("Democratic", 1, 11), party_market("Republican", 2, 12)]
+        session = self.manual_session([page(markets), page([pair_relationship()])])
+        with patch.object(scanner, "get_best_prices") as books, \
+                patch.object(scanner, "execute_paper_trade") as trade:
+            scanner.scan_once(session, {}, self.tournament_id)
+        trade.assert_not_called()
+        books.assert_not_called()
+        self.assertFalse(self.portfolio_path.exists())
+        self.assertIn("NOT APPROVED", self.output.getvalue())
+
+    def test_removed_approval_disables_pair_on_the_next_cycle(self):
+        from test_api_audit import QUOTE_TIME
+        markets, trees, _, _ = self.manual_senate_fixture()
+        previous = {}
+        self.run_manual_cycle(markets, trees, previous, QUOTE_TIME, paper_trade=False)
+        self.write_approvals([])
+        self.output.seek(0)
+        self.output.truncate()
+        with patch.object(scanner, "execute_paper_trade") as trade:
+            self.run_manual_cycle(markets, trees, previous, QUOTE_TIME + 15)
+        trade.assert_not_called()
+        self.assertIn("NOT APPROVED", self.output.getvalue())
+        self.assertFalse(self.portfolio_path.exists())
+
+    def test_changed_missing_or_unexpectedly_paired_ids_need_revalidation(self):
+        from test_api_audit import QUOTE_TIME
+        markets, trees, _, _ = self.manual_senate_fixture()
+        changed_exchange = copy.deepcopy(markets)
+        changed_exchange[0]["exchanges"][0]["id"] = "999"
+        changed_market = copy.deepcopy(markets)
+        changed_market[0]["id"] = "999"
+        renamed = copy.deepcopy(markets)
+        renamed[0]["title"] = "Unexpected contract title"
+        reversed_parties = copy.deepcopy(markets)
+        reversed_parties[0]["title"], reversed_parties[1]["title"] = (
+            reversed_parties[1]["title"], reversed_parties[0]["title"])
+        for listed in (changed_exchange, changed_market, markets[:1], renamed, reversed_parties):
+            self.output.seek(0)
+            self.output.truncate()
+            with self.subTest(listed=listed), patch.object(scanner, "execute_paper_trade") as trade, \
+                    patch.object(scanner, "get_best_prices") as books:
+                self.run_manual_cycle(listed, trees, {}, QUOTE_TIME)
+            trade.assert_not_called()
+            books.assert_not_called()
+            self.assertIn("INVALID / NEEDS REVALIDATION", self.output.getvalue())
+        self.assertFalse(self.portfolio_path.exists())
+
+    def test_rule_hash_or_approved_rationale_changes_need_revalidation(self):
+        from test_api_audit import QUOTE_TIME
+        markets, trees, _, _ = self.manual_senate_fixture()
+        original = json.loads(self.approval_path.read_text())["pairs"]
+        changed_rules = copy.deepcopy(trees)
+        changed_rules[0]["root"]["settlement_date"] = "2026-11-05T17:00:00Z"
+        cases = [(original, changed_rules)]
+        for key, value in (("evidence_hash", "a" * 64), ("proposition", "Different proposition"),
+                           ("source_refs", ["https://sig.thesuper.market/different-source"]),
+                           ("limitations", ["Different exceptions"])):
+            approvals = copy.deepcopy(original)
+            approvals[0]["manual_approval"][key] = value
+            cases.append((approvals, trees))
+        for approvals, current_trees in cases:
+            self.write_approvals(approvals)
+            self.output.seek(0)
+            self.output.truncate()
+            with self.subTest(approvals=approvals), patch.object(scanner, "execute_paper_trade") as trade, \
+                    patch.object(scanner, "get_best_prices") as books:
+                self.run_manual_cycle(markets, current_trees, {}, QUOTE_TIME)
+            trade.assert_not_called()
+            books.assert_not_called()
+            self.assertIn("INVALID / NEEDS REVALIDATION", self.output.getvalue())
+
+    def test_invalid_or_missing_configuration_blocks_trades_before_api_reads(self):
+        markets, trees, _, _ = self.manual_senate_fixture()
+        data = json.loads(self.approval_path.read_text())
+        excessive_quantity = copy.deepcopy(data)
+        excessive_quantity["pairs"][0]["max_quantity"] = 2
+        live_mode = copy.deepcopy(data)
+        live_mode["allowed_mode"] = "live"
+        for text in ("{unfinished", json.dumps(excessive_quantity), json.dumps(live_mode), None):
+            if text is None:
+                self.approval_path.unlink()
+            else:
+                self.approval_path.write_text(text)
+            session = Mock()
+            with self.subTest(text=text), patch.object(scanner, "execute_paper_trade") as trade:
+                scanner.scan_once(session, {}, self.tournament_id)
+            trade.assert_not_called()
+            session.get.assert_not_called()
+            self.assertIn("INVALID / NEEDS REVALIDATION", self.output.getvalue())
+        self.assertFalse(self.portfolio_path.exists())
 
     def test_new_paper_trade_keeps_the_quarantine_cash_reserve(self):
         import execution_quarantine as quarantine

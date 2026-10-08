@@ -9,9 +9,10 @@ import os
 import sys
 import time
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal, ROUND_CEILING
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from urllib.parse import urlparse
 from uuid import UUID
 
@@ -49,6 +50,7 @@ READ_REQUEST_SPACING = 0.75
 MAX_DISCOVERY_PAGES = 50
 _last_request_started = None
 _read_cooldown_until = 0
+APPROVED_SETTLEMENTS_PATH = Path(__file__).resolve().with_name("approved_settlements.json")
 
 
 class RateLimitError(requests.RequestException):
@@ -456,18 +458,93 @@ def api_error_reason(error):
     return "Malformed API data"
 
 
-def manual_paper_context(session, tournament_id, approval):
-    """Reuse the reviewed Senate evidence only after an explicit CLI approval.
+def load_approved_settlements():
+    """Read the explicit paper allowlist each cycle; never generate approvals.
 
-    This is paper metadata, never a live execution intent. The default scanner
-    still requires machine relationships, and this opt-in is one-shot only.
+    Missing or malformed configuration permits no new paper trades. Loading it
+    every cycle also makes removing an approval effective on the next scan.
     """
-    from paired_account_test import MANUAL_MARKETS, MANUAL_POLICY, read_manual_evidence
+    try:
+        data = json.loads(APPROVED_SETTLEMENTS_PATH.read_text())
+        if (not isinstance(data, dict) or set(data) != {"version", "allowed_mode", "pairs"}
+                or type(data["version"]) is not int or data["version"] != 1
+                or data["allowed_mode"] != "paper-only" or not isinstance(data["pairs"], list)):
+            raise ValueError
+        required = {"pair_name", "tournament_id", "market_ids", "exchange_ids", "relationship_type",
+                    "position_types", "max_quantity", "approved_at", "approval_note"}
+        seen = set()
+        for approval in data["pairs"]:
+            if (not isinstance(approval, dict) or not required.issubset(approval)
+                    or set(approval) - required - {"manual_approval"}
+                    or any(not isinstance(approval[key], str) or not approval[key].strip()
+                           for key in ("pair_name", "approval_note"))
+                    or approval["relationship_type"] != "mutually_exclusive"
+                    or not isinstance(approval["tournament_id"], str)
+                    or str(UUID(approval["tournament_id"])) != approval["tournament_id"]
+                    or type(approval["max_quantity"]) is not int
+                    or not 1 <= approval["max_quantity"] <= MAX_TRADE_QUANTITY):
+                raise ValueError
+            for key in ("market_ids", "exchange_ids"):
+                ids = approval[key]
+                if (not isinstance(ids, list) or len(ids) != 2 or len(set(ids)) != 2
+                        or any(not isinstance(item, str) or numeric_id(item) != item for item in ids)):
+                    raise ValueError
+            positions = approval["position_types"]
+            if (not isinstance(positions, list) or not positions or len(set(positions)) != len(positions)
+                    or not set(positions).issubset({"YES-PAIR", "NO-PAIR"})
+                    or parse_api_timestamp(approval["approved_at"]).tzinfo is None):
+                raise ValueError
+            identity = (approval["tournament_id"], tuple(sorted(approval["market_ids"])))
+            if identity in seen:
+                raise ValueError
+            seen.add(identity)
+            if "manual_approval" in approval:
+                manual = approval["manual_approval"]
+                if (approval["max_quantity"] != 1 or positions != ["NO-PAIR"]
+                        or not isinstance(manual, dict) or set(manual) != {
+                            "evidence_hash", "proposition", "source_refs", "limitations"}
+                        or not isinstance(manual["evidence_hash"], str)
+                        or not re.fullmatch(r"[0-9a-f]{64}", manual["evidence_hash"])
+                        or not isinstance(manual["proposition"], str) or not manual["proposition"].strip()
+                        or any(not isinstance(manual[key], list) or not manual[key]
+                               or any(not isinstance(item, str) or not item.strip() for item in manual[key])
+                               for key in ("source_refs", "limitations"))):
+                    raise ValueError
+        return data["pairs"]
+    except (OSError, ValueError, TypeError, KeyError, OverflowError) as error:
+        raise DataValidationError("Approved settlement configuration is missing or invalid") from error
 
-    _, record = read_manual_evidence(session, tournament_id, *MANUAL_MARKETS)
-    if approval != record["evidence_hash"]:
-        raise DataValidationError("Manual paper approval does not match current official evidence")
-    record["approved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def check_approved_pair(approval, markets, tournament_id):
+    """Bind approval to the discovered instruments, never to the displayed name."""
+    if ([numeric_id(market["id"]) for market in markets] != approval["market_ids"]
+            or [get_exchange_id(market) for market in markets] != approval["exchange_ids"]
+            or tournament_id != approval["tournament_id"]):
+        raise DataValidationError("Approved market/exchange identity changed")
+    for market in markets:
+        check_context(market["contexts"], tournament_id)
+
+
+def manual_paper_context(session, tournament_id, approval, explicit_hash=None):
+    """Recheck official evidence against persistent, previously approved facts.
+
+    The existing narrow evidence reader still enforces the reviewed Senate
+    wording. This function creates paper metadata, never an execution journal.
+    """
+    from paired_account_test import MANUAL_POLICY, read_manual_evidence
+
+    try:
+        _, record = read_manual_evidence(session, tournament_id, *approval["market_ids"])
+    except (ValueError, KeyError, TypeError, IndexError) as error:
+        raise DataValidationError("Approved official settlement evidence changed or is invalid") from error
+    expected = approval["manual_approval"]
+    if (record["market_ids"] != approval["market_ids"]
+            or record["exchange_ids"] != approval["exchange_ids"]
+            or any(record[key] != value for key, value in expected.items())
+            or (explicit_hash is not None and explicit_hash != expected["evidence_hash"])):
+        raise DataValidationError("Approved settlement evidence does not match the current official evidence")
+    # Retain the original human approval time rather than approving anew each scan.
+    record["approved_at"] = approval["approved_at"]
     return {"mode": MANUAL_POLICY, "paper_only": True, "tournament_id": tournament_id,
             "market_ids": record["market_ids"], "exchange_ids": record["exchange_ids"],
             "settlement_fingerprint": record["evidence_hash"], "manual_approval": record}
@@ -475,6 +552,11 @@ def manual_paper_context(session, tournament_id, approval):
 
 def scan_once(session, previous, tournament_id, paper_trade=True, manual_approval=None):
     """Failures mean unknown, rather than falsely reporting disappearance."""
+    try:
+        approvals = load_approved_settlements()
+    except DataValidationError as error:
+        print(f"INVALID / NEEDS REVALIDATION | {error} | no paper trades this cycle")
+        return
     try:
         races, listed_ids = get_races(session, tournament_id)
         relationships = fetch_pages(session, f"{API_BASE_URL}/relationships",
@@ -489,24 +571,53 @@ def scan_once(session, previous, tournament_id, paper_trade=True, manual_approva
     print(f"Matched {len(races)} title candidates in the selected competition.")
     import execution_quarantine as quarantine
 
+    # Titles remain discovery hints. Only the exact ordered market IDs from the
+    # explicit configuration can authorize analysis or a new paper position.
+    scoped = [approval for approval in approvals if approval["tournament_id"] == tournament_id]
+    discovered = {tuple(numeric_id(market["id"]) for market in markets) for markets in races.values()}
+    for approval in scoped:
+        if tuple(approval["market_ids"]) not in discovered:
+            reason = ("approved market ID missing" if not set(approval["market_ids"]).issubset(listed_ids)
+                      else "approved market IDs no longer form the expected party pair")
+            print(f"INVALID / NEEDS REVALIDATION | {approval['pair_name']} | {reason}")
+    approved_by_ids = {tuple(approval["market_ids"]): approval for approval in scoped}
     unavailable = {}
+    unapproved_count = 0
     for race, (democrat_market, republican_market) in races.items():
         try:
+            markets = (democrat_market, republican_market)
+            ids = [numeric_id(market["id"]) for market in markets]
+            approval = approved_by_ids.get(tuple(ids))
+            if approval is None:
+                unapproved_count += 1
+                continue
+            try:
+                check_approved_pair(approval, markets, tournament_id)
+            except API_ERRORS:
+                print(f"INVALID / NEEDS REVALIDATION | {approval['pair_name']} | market/exchange mapping changed")
+                continue
             if democrat_market["status"] != "open" or republican_market["status"] != "open":
                 report_race(race, {}, previous, paper_trade=paper_trade)
                 continue
-            ids = [numeric_id(market["id"]) for market in (democrat_market, republican_market)]
             quarantine.require_unblocked_markets(ids)
+            quarantine.require_unblocked_exchanges(approval["exchange_ids"])
             manual = False
+            machine_missing = False
             try:
                 allowed, context = get_pair_rules(session, democrat_market, republican_market,
                                                   tournament_id, relationships=relationships)
             except DataValidationError as error:
-                if (manual_approval is None or ids != ["153", "154"]
+                if ("manual_approval" not in approval
                         or str(error) != "No active relationship verifies this pair's normal payout"):
                     raise
-                context = manual_paper_context(session, tournament_id, manual_approval)
-                allowed, manual = {"NO-PAIR"}, True
+                machine_missing = True
+            if "manual_approval" in approval:
+                # Even if the graph now verifies this pair, a changed approved
+                # rule/hash cannot silently bypass the recorded manual review.
+                manual_context = manual_paper_context(session, tournament_id, approval, manual_approval)
+                if machine_missing:
+                    context, allowed, manual = manual_context, {"NO-PAIR"}, True
+            allowed = set(allowed).intersection(approval["position_types"])
             quarantine.require_unblocked_exchanges(context.get("exchange_ids", []))
             democrat = get_best_prices(session, democrat_market, tournament_id)
             republican = get_best_prices(session, republican_market, tournament_id)
@@ -520,17 +631,22 @@ def scan_once(session, previous, tournament_id, paper_trade=True, manual_approva
                     for price in [Decimal(str(book[side])) if side == "ask"
                                   else Decimal(1) - Decimal(str(book[side])) for book in (democrat, republican)]
                 ]
+                opportunity["quantity"] = min(opportunity["quantity"], approval["max_quantity"])
                 if manual:
-                    opportunity["quantity"] = 1
-                    print("SETTLEMENT | U.S. Senate | explicitly approved manual evidence | one paper pair")
+                    print(f"SETTLEMENT | {approval['pair_name']} | explicitly approved manual evidence | one paper pair")
         except RateLimitError:
             print("API read limit reached; pausing reads and retaining previous observations.")
             return
         except API_ERRORS as error:
             reason = api_error_reason(error)
+            if isinstance(error, DataValidationError) and reason.startswith("Approved "):
+                print(f"INVALID / NEEDS REVALIDATION | {approval['pair_name']} | {reason}")
+                continue
             unavailable[reason] = unavailable.get(reason, 0) + 1
             continue
         report_race(race, current, previous, paper_trade=paper_trade)
+    if unapproved_count:
+        print(f"NOT APPROVED | {unapproved_count} pairs | absent from approved_settlements.json | no paper trades")
     for reason, count in unavailable.items():
         print(f"UNVERIFIED / UNAVAILABLE | {count} pairs | {reason} | retaining previous observations")
     # A title rename or missing counterpart is unknown while either old market
@@ -551,7 +667,7 @@ def main():
     parser.add_argument("--audit-only", action="store_true", help="Inspect API data once without changing paper files")
     parser.add_argument("--tournament", default="midterm-elections", help="Competition slug (default: midterm-elections)")
     parser.add_argument("--manual-settlement-approval",
-                        help="One-shot paper only: explicitly approve the current 153/154 settlement evidence hash")
+                        help="Optional one-shot cross-check of the configured manual settlement evidence hash")
     args = parser.parse_args()
     if args.manual_settlement_approval is not None and not (args.once or args.audit_only):
         parser.error("Manual settlement approval requires a supervised --once or --audit-only paper scan")
@@ -591,6 +707,7 @@ def _run_scanner(args):
         print("Paper-only scanner started. Ctrl+C stops it. Paper positions are saved locally.")
     print("Paper levels: <0.5% IGNORE | 0.5% WATCH | 1.0% PAPER TRADE | 2.0% STRONG PAPER TRADE")
     print("Settlement verification is mandatory; projected profit assumes ordinary settlement.")
+    print("Only pairs listed in approved_settlements.json can open paper positions; evidence is rechecked each cycle.")
     try:
         with requests.Session() as session:
             session.headers.update({"Authorization": f"Bearer {api_key}"})

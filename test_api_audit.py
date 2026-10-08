@@ -79,9 +79,26 @@ def exchange_book(market_id=1, exchange_id=11, bid=.6, ask=.65):
             "spread": None if bid is None or ask is None else ask - bid}
 
 
+def approved_pair(tournament_id=TOURNAMENT_ID, market_ids=("1", "2"), exchange_ids=("11", "12")):
+    """An explicit synthetic allowlist entry; engine evidence is still required."""
+    return {"pair_name": "Test Senate race", "tournament_id": tournament_id,
+            "market_ids": list(market_ids), "exchange_ids": list(exchange_ids),
+            "relationship_type": "mutually_exclusive", "position_types": ["YES-PAIR", "NO-PAIR"],
+            "max_quantity": 100, "approved_at": "2026-10-07T12:00:00+00:00",
+            "approval_note": "Offline test only: require fresh machine relationship verification."}
+
+
 class ApiAuditTests(unittest.TestCase):
     def setUp(self):
         isolate_quarantine(self)
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        approval_path = Path(temporary.name) / "approved_settlements.json"
+        approval_path.write_text(json.dumps({"version": 1, "allowed_mode": "paper-only",
+                                             "pairs": [approved_pair()]}))
+        patcher = patch.object(scanner, "APPROVED_SETTLEMENTS_PATH", approval_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         for name, value in (("_last_request_started", None), ("_read_cooldown_until", 0)):
             patcher = patch.object(scanner, name, value)
             patcher.start()

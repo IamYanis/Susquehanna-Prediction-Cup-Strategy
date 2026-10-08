@@ -1,0 +1,41 @@
+{
+  "version": 1,
+  "allowed_mode": "paper-only",
+  "pairs": [
+    {
+      "pair_name": "U.S. Senate",
+      "tournament_id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "market_ids": [
+        "153",
+        "154"
+      ],
+      "exchange_ids": [
+        "842",
+        "843"
+      ],
+      "relationship_type": "mutually_exclusive",
+      "position_types": [
+        "NO-PAIR"
+      ],
+      "max_quantity": 1,
+      "approved_at": "2026-10-08T13:45:23+00:00",
+      "approval_note": "Existing explicit human approval of the ordinary-settlement interpretation for Senate markets 153/154. Reused for continuous paper simulation only; this configuration authorizes no live order.",
+      "manual_approval": {
+        "evidence_hash": "8d9a988d1ab1504f387edeed6c48cc54ef0e36b64842310d198a47187484b551",
+        "proposition": "Under ordinary binary settlement, Democratic and Republican majority control of the same U.S. Senate at the new-Congress reference time cannot both hold. One NO share in each market therefore pays at least 1 SUSQie.",
+        "source_refs": [
+          "https://sig.thesuper.market/api/v1/markets/153/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+          "https://sig.thesuper.market/api/v1/markets/154/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+          "https://sig.thesuper.market/docs/settlement-and-payouts"
+        ],
+        "limitations": [
+          "Both contracts must use the same reference time and interpretation of majority control.",
+          "Congress-seating and news-call timing, ties and caucus classification require human interpretation.",
+          "Cancelled/N/A outcomes refund refundable cost and do not preserve the ordinary payout floor.",
+          "Administrator rulings, overrides or corrections can depart from the reviewed interpretation.",
+          "Partial fills, UNKNOWN submissions and one-sided execution remain possible; no retries are authorized."
+        ]
+      }
+    }
+  ]
+}

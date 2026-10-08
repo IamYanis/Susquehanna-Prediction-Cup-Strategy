@@ -502,6 +502,9 @@ def reconcile_pair_account(session, pair, legs):
     single.require(cash_matches,
                    "Account cash disagrees with confirmed spend; inspect other activity or reporting")
     single.require(0 <= time.monotonic() - started <= 15, "Account reconciliation became stale")
+    # Read-only pilot accounting can reuse this exact validated snapshot instead
+    # of fetching a second account view that may describe a different moment.
+    return account
 
 
 def recheck_second_leg_settlement(session, pair):

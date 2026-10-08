@@ -1,5 +1,11 @@
 # Prediction Cup paper scanner
 
+The separate [disabled live-pilot checker](LIVE_PILOT.md) models a fixed
+5,000-SUSQie allocation with 50/trade, 100/race, 500 total exposure and one share
+per leg. It has no submission adapter and creates no order intents or runtime
+state. Run `.venv/bin/python live_pilot.py` for its local readiness report.
+Paper scanning and the existing live edge threshold remain unchanged.
+
 Run from this directory using the existing virtual environment:
 
 ```bash
@@ -218,20 +224,48 @@ exactly those two members. Freeform chamber markets and unresolved rules are
 withheld by default. Missing evidence retains prior observations rather than announcing
 that an opportunity disappeared.
 
-For the specifically reviewed U.S. Senate NO pair (153/154, exchanges 842/843),
-an explicit evidence hash can enable a supervised **one-shot paper scan**:
+New paper positions are restricted to the explicit entries in
+[`approved_settlements.json`](approved_settlements.json). The file is reread on
+every scan, so removing an entry disables it on the next cycle. Each entry binds
+the ordered Democratic/Republican market IDs, expected exchange IDs, tournament,
+permitted position types and quantity to a named approval and its original time.
+Names are labels; matching titles never approves a relationship.
+
+The configuration contains the previously explicitly approved U.S. Senate NO pair
+(153/154, exchanges 842/843), capped at **one paper pair**. Run continuous paper
+scanning with the normal command; no repeated CLI approval is needed:
 
 ```bash
-.venv/bin/python price_reader.py --once --manual-settlement-approval YOUR_EXPLICITLY_APPROVED_EVIDENCE_HASH
+.venv/bin/python price_reader.py
 ```
 
-This reuses the existing exact official-rule checks. A changed hash, rules,
-market or exchange invalidates the approval. It simulates at most one pair and
-records the evidence and approval time in the paper portfolio. The flag cannot
-enable repeated scanning; no live order, execution journal or API write is
-created. Add `--audit-only` to inspect classifications without paper writes.
-New paper trades cannot omit settlement evidence; older saved simulations still
-load. The separate live preparation/submission tools retain their 2% minimum.
+The machine relationship check remains first. If the graph has no active pair
+relationship, a listed manual approval must pass the existing narrow official
+Senate rule checks. Its evidence hash, proposition, sources and limitations must
+match current authoritative responses on every cycle. Even if the graph later
+verifies the pair, changed manually approved evidence blocks it. The original
+approval timestamp is reused; a scan never generates or updates an approval.
+The record explicitly includes reference-time/tie/caucus ambiguity,
+cancellation/N/A/refund and administrator-override limitations.
+
+Missing IDs, unexpected party pairing or exchange mapping, and changed evidence
+report `INVALID / NEEDS REVALIDATION` and permit no trade for that pair. Missing
+or malformed configuration blocks all new paper trades for that cycle. API
+failures retain observations and authorize no new trade from cached evidence.
+Do not edit a hash to bypass changed rules: review the official evidence and
+explicitly approve it first. The current manual reader supports only the already
+reviewed Senate pair; listing another pair does not infer settlement compatibility.
+An entry without `manual_approval` always requires machine verification.
+
+Freshness, at least 50 shares of top-of-book depth, quarantine/reserved capital,
+250-per-trade / 150-per-race risk caps, persisted cash and duplicate checks remain
+mandatory. Repeated unchanged scans never buy the same saved position again.
+Add `--once` for one scan or `--audit-only` for classifications without paper
+writes. The old `--manual-settlement-approval HASH` flag remains an optional
+one-shot cross-check against the configured hash; it cannot approve an unlisted
+pair. No live order, execution journal or API write is created. Older saved
+simulations still load. Live preparation/submission tools keep their 2% minimum
+and do not use this paper-only configuration.
 
 Books are requested from the SIG competition API with explicit tournament and
 exchange IDs. Bid-only books can support NO analysis; ask-only books can support
