@@ -43,7 +43,8 @@ remain explicit unavailable rows; they do not become zero-cost opportunities.
 | `apparent_price_gap` | One minus the combined rounded cost. This assumes a one-unit minimum paired payout that may **not** be proved. It is not expected or guaranteed profit. |
 | `dem_visible_shares`, `rep_visible_shares`, `available_pairs` | Top-of-book depth for each required side and the smaller depth. |
 | `research_quantity` | Whole pairs visible at those prices, capped at 100. This is not an account-risk-approved trade size. |
-| `meets_price_and_depth_thresholds` | Apparent gap at least 0.02 and at least 50 visible pairs. Threshold-sized gaps rank first, then other observed gaps; unavailable rows come last. |
+| `economic_classification` | Apparent gap below 0.5%: IGNORE; 0.5% to below 1%: WATCH; 1% to below 2%: PAPER TRADE; at least 2%: STRONG PAPER TRADE. This price label does not verify settlement or approve an entry. |
+| `meets_price_and_depth_thresholds` | Apparent gap at least 0.01 and at least 50 visible pairs. Threshold-sized gaps rank first, then other observed gaps; unavailable rows come last. |
 | `dem_book_at`, `rep_book_at`, `observed_at`, `quote_status` | Quote timestamps and whether a fresh pair observation could be calculated. An available leg is retained when its counterpart side is missing. |
 | `settlement_status`, `settlement_note` | The scanner's existing relationship/rule checks, or a fixed reason that evidence is missing or unavailable. |
 | `rules_review` | Rule identity inspection for the strongest observed race; other unreviewed rows say `NOT_INSPECTED`. |

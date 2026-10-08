@@ -74,13 +74,24 @@ class ResearchReportTests(unittest.TestCase):
             self.assertEqual(call.kwargs["params"], {"tournamentId": TOURNAMENT_ID, "depth": 1})
             self.assertFalse(call.kwargs["allow_redirects"])
 
-    def test_tick_rounding_can_remove_a_gap_that_raw_prices_suggest(self):
+    def test_tick_rounding_can_downgrade_strong_gap_to_paper_level(self):
         books = [exchange_book(1, 11, .4, .4901), exchange_book(2, 12, .4, .4899)]
         rows = research.pair_rows(self.session(books), "Race", self.markets, TOURNAMENT_ID, [])
         yes = rows[0]
         self.assertAlmostEqual(yes["raw_combined_cost"], .98)
         self.assertAlmostEqual(yes["combined_limit_cost"], .985)
-        self.assertFalse(yes["meets_price_and_depth_thresholds"])
+        self.assertTrue(yes["meets_price_and_depth_thresholds"])
+        self.assertEqual(yes["economic_classification"], "PAPER TRADE")
+        self.assertFalse(yes["execution_approved"])
+
+    def test_one_percent_research_level_does_not_approve_unverified_settlement(self):
+        rows, _ = self.rows(bid=.505, ask=.55, quantities=(50, 50))
+        no = rows[1]
+        self.assertEqual(no["combined_limit_cost"], .990)
+        self.assertEqual(no["economic_classification"], "PAPER TRADE")
+        self.assertTrue(no["meets_price_and_depth_thresholds"])
+        self.assertEqual(no["settlement_status"], "UNVERIFIED")
+        self.assertFalse(no["execution_approved"])
 
     def test_exact_threshold_and_fractional_depth_quantity_cap(self):
         rows, _ = self.rows(bid=.51, ask=.55, quantities=(120.8, 50.9))

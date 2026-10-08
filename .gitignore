@@ -2,6 +2,7 @@
 .venv/
 __pycache__/
 paper_portfolio.json
+.paper_scanner.lock
 .paper_portfolio.json.*.tmp
 paper_trades.csv
 .paper_trades.csv.*.tmp

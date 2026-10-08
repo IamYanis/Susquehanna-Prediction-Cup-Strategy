@@ -190,7 +190,20 @@ Older portfolios load normally. Positions created before logging was added have
 no recorded timestamp and are left out of the CSV. The CSV retains history if you
 start a fresh paper portfolio; move it to a backup too if you want a fresh log.
 
-Events require at least 2% edge and 50 available pairs; quantity is capped at 100.
+The paper scanner classifies tick-rounded ordinary-settlement edges as follows:
+
+| Edge / minimum ordinary payout | Classification | Action |
+|---|---|---|
+| Below 0.5% | IGNORE | No position |
+| 0.5% to below 1.0% | WATCH | Report only |
+| 1.0% to below 2.0% | PAPER TRADE | Simulate if every safety check passes |
+| At least 2.0% | STRONG PAPER TRADE | Simulate if every safety check passes |
+
+Settlement verification, fresh books, at least 50 available pairs, and the
+existing 250-per-trade / 150-per-race capital limits remain mandatory. Quantity
+is capped at 100. A 0.990 cost against a 1.000 ordinary payout has a 1.0% edge
+and is PAPER TRADE; its return on purchase cost is approximately 1.01%.
+Crossing a classification boundary also triggers a change report.
 A material change is at least one percentage point of edge or 10 executable
 pairs relative to the last report. Unchanged opportunities remain quiet. Failed
 requests retain prior observations until a successful scan confirms a change.
@@ -202,8 +215,23 @@ date, party and settlement date), and an active engine relationship linking
 the exact market/exchange IDs. Mutual exclusivity permits NO-pair analysis;
 YES-pair analysis additionally requires an exhaustive relationship containing
 exactly those two members. Freeform chamber markets and unresolved rules are
-withheld. Missing evidence retains prior observations rather than announcing
+withheld by default. Missing evidence retains prior observations rather than announcing
 that an opportunity disappeared.
+
+For the specifically reviewed U.S. Senate NO pair (153/154, exchanges 842/843),
+an explicit evidence hash can enable a supervised **one-shot paper scan**:
+
+```bash
+.venv/bin/python price_reader.py --once --manual-settlement-approval YOUR_EXPLICITLY_APPROVED_EVIDENCE_HASH
+```
+
+This reuses the existing exact official-rule checks. A changed hash, rules,
+market or exchange invalidates the approval. It simulates at most one pair and
+records the evidence and approval time in the paper portfolio. The flag cannot
+enable repeated scanning; no live order, execution journal or API write is
+created. Add `--audit-only` to inspect classifications without paper writes.
+New paper trades cannot omit settlement evidence; older saved simulations still
+load. The separate live preparation/submission tools retain their 2% minimum.
 
 Books are requested from the SIG competition API with explicit tournament and
 exchange IDs. Bid-only books can support NO analysis; ask-only books can support

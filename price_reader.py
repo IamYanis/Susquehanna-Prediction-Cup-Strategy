@@ -1,17 +1,22 @@
 """Repeated, paper-only scanner. Run with --once for a single scan."""
 import argparse
+import fcntl
 import hashlib
 import json
 import re
 import math
 import os
+import sys
 import time
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_CEILING
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlparse
 from uuid import UUID
 
 import requests
+import paper_trader
 from dotenv import load_dotenv
 from paper_trader import (
     PortfolioError,
@@ -21,7 +26,12 @@ from paper_trader import (
     print_portfolio_summary,
 )
 
+# Keep the separate supervised live-order policy unchanged. Paper scanning uses
+# the four levels below, rather than borrowing this live-order minimum.
 MIN_EDGE = 0.02
+WATCH_EDGE = Decimal("0.005")
+PAPER_TRADE_EDGE = Decimal("0.010")
+STRONG_PAPER_TRADE_EDGE = Decimal("0.020")
 MIN_LIQUIDITY = 50
 MAX_TRADE_QUANTITY = 100
 SCAN_INTERVAL = 15
@@ -47,6 +57,32 @@ class RateLimitError(requests.RequestException):
 
 class DataValidationError(ValueError):
     """A short, fixed explanation that is safe to show without request details."""
+
+
+class ScannerLockError(Exception):
+    """The scanner cannot safely obtain exclusive use of its paper portfolio."""
+
+
+@contextmanager
+def scanner_lock():
+    """Hold a non-blocking OS lock beside the shared paper portfolio."""
+    lock_path = paper_trader.PORTFOLIO_PATH.with_name(".paper_scanner.lock")
+    try:
+        lock_file = lock_path.open("a")
+    except OSError as error:
+        raise ScannerLockError("Cannot open the paper scanner lock; scanner did not start.") from error
+    # Closing this descriptor releases the OS lock on return, Ctrl+C or an
+    # exception. The OS also releases it if the process is forcibly stopped.
+    with lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ScannerLockError("Another paper scanner instance is already running; exiting.") from error
+        except OSError as error:
+            raise ScannerLockError("Cannot acquire the paper scanner lock; scanner did not start.") from error
+        # Leave the empty file in place after exit. Removing it could let another
+        # process lock a different file while a running scanner holds this one.
+        yield
 
 
 def fetch_json(session, url, params=None):
@@ -331,6 +367,22 @@ def get_best_prices(session, market, tournament_id):
     return result
 
 
+def classify_edge(edge):
+    """Classify profit / minimum ordinary payout, not return on purchase cost."""
+    if isinstance(edge, bool) or not isinstance(edge, (int, float, Decimal)):
+        raise DataValidationError("Invalid opportunity edge")
+    value = Decimal(str(edge))
+    if not value.is_finite():
+        raise DataValidationError("Invalid opportunity edge")
+    if value < WATCH_EDGE:
+        return "IGNORE"
+    if value < PAPER_TRADE_EDGE:
+        return "WATCH"
+    if value < STRONG_PAPER_TRADE_EDGE:
+        return "PAPER TRADE"
+    return "STRONG PAPER TRADE"
+
+
 def find_opportunities(democrat, republican, allowed_positions=()):
     """Calculate only the pair types supported by current relationship evidence."""
     if democrat is None or republican is None:
@@ -345,14 +397,22 @@ def find_opportunities(democrat, republican, allowed_positions=()):
     for position_type, side in (("YES-PAIR", "ask"), ("NO-PAIR", "bid")):
         if position_type not in allowed_positions or democrat[side] is None or republican[side] is None:
             continue
-        total = democrat[side] + republican[side]
-        cost = total if position_type == "YES-PAIR" else 2 - total
-        edge = 1 - cost
+        # Round each executable buy price upward to the venue's tick. Decimal
+        # keeps an exact 0.010 edge on the PAPER TRADE boundary.
+        quotes = [Decimal(str(book[side])) for book in (democrat, republican)]
+        if position_type == "NO-PAIR":
+            quotes = [Decimal(1) - quote for quote in quotes]
+        tick = Decimal("0.005")
+        prices = [(quote / tick).to_integral_value(rounding=ROUND_CEILING) * tick for quote in quotes]
+        cost = sum(prices)
+        edge = Decimal(1) - cost
+        classification = classify_edge(edge)
         available = min(democrat[side + "_quantity"], republican[side + "_quantity"])
-        if edge + 1e-12 >= MIN_EDGE and available >= MIN_LIQUIDITY:
+        if classification != "IGNORE" and available >= MIN_LIQUIDITY:
             opportunities[position_type] = {
-                "cost_per_pair": cost, "profit_per_pair": edge,
-                "quantity": min(available, MAX_TRADE_QUANTITY),
+                "cost_per_pair": float(cost), "profit_per_pair": float(edge),
+                "quantity": min(math.floor(available), MAX_TRADE_QUANTITY),
+                "classification": classification,
             }
     return opportunities
 
@@ -372,13 +432,15 @@ def report_race(race, current, previous, paper_trade=True):
             or abs(new["quantity"] - old["quantity"]) >= MATERIAL_QUANTITY_CHANGE
             or new.get("market_context", {}).get("settlement_fingerprint")
             != old.get("market_context", {}).get("settlement_fingerprint")
+            or classify_edge(new["profit_per_pair"]) != classify_edge(old["profit_per_pair"])
         )
         if old is None or changed:
             event = "APPEARED" if old is None else "CHANGED"
             print(f"{event} | {race} | {position_type} | "
+                  f"{classify_edge(new['profit_per_pair'])} | "
                   f"edge {new['profit_per_pair']:.2%} | quantity {new['quantity']:g}")
             previous[key] = new.copy()
-            if paper_trade:
+            if paper_trade and classify_edge(new["profit_per_pair"]) in {"PAPER TRADE", "STRONG PAPER TRADE"}:
                 execute_paper_trade(race=race, position_type=position_type, **new)
 
 
@@ -394,7 +456,24 @@ def api_error_reason(error):
     return "Malformed API data"
 
 
-def scan_once(session, previous, tournament_id, paper_trade=True):
+def manual_paper_context(session, tournament_id, approval):
+    """Reuse the reviewed Senate evidence only after an explicit CLI approval.
+
+    This is paper metadata, never a live execution intent. The default scanner
+    still requires machine relationships, and this opt-in is one-shot only.
+    """
+    from paired_account_test import MANUAL_MARKETS, MANUAL_POLICY, read_manual_evidence
+
+    _, record = read_manual_evidence(session, tournament_id, *MANUAL_MARKETS)
+    if approval != record["evidence_hash"]:
+        raise DataValidationError("Manual paper approval does not match current official evidence")
+    record["approved_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return {"mode": MANUAL_POLICY, "paper_only": True, "tournament_id": tournament_id,
+            "market_ids": record["market_ids"], "exchange_ids": record["exchange_ids"],
+            "settlement_fingerprint": record["evidence_hash"], "manual_approval": record}
+
+
+def scan_once(session, previous, tournament_id, paper_trade=True, manual_approval=None):
     """Failures mean unknown, rather than falsely reporting disappearance."""
     try:
         races, listed_ids = get_races(session, tournament_id)
@@ -408,14 +487,27 @@ def scan_once(session, previous, tournament_id, paper_trade=True):
         print("Market list unavailable or invalid; retaining previous observations.")
         return
     print(f"Matched {len(races)} title candidates in the selected competition.")
+    import execution_quarantine as quarantine
+
     unavailable = {}
     for race, (democrat_market, republican_market) in races.items():
         try:
             if democrat_market["status"] != "open" or republican_market["status"] != "open":
                 report_race(race, {}, previous, paper_trade=paper_trade)
                 continue
-            allowed, context = get_pair_rules(session, democrat_market, republican_market,
-                                              tournament_id, relationships=relationships)
+            ids = [numeric_id(market["id"]) for market in (democrat_market, republican_market)]
+            quarantine.require_unblocked_markets(ids)
+            manual = False
+            try:
+                allowed, context = get_pair_rules(session, democrat_market, republican_market,
+                                                  tournament_id, relationships=relationships)
+            except DataValidationError as error:
+                if (manual_approval is None or ids != ["153", "154"]
+                        or str(error) != "No active relationship verifies this pair's normal payout"):
+                    raise
+                context = manual_paper_context(session, tournament_id, manual_approval)
+                allowed, manual = {"NO-PAIR"}, True
+            quarantine.require_unblocked_exchanges(context.get("exchange_ids", []))
             democrat = get_best_prices(session, democrat_market, tournament_id)
             republican = get_best_prices(session, republican_market, tournament_id)
             current = find_opportunities(democrat, republican, allowed)
@@ -424,9 +516,13 @@ def scan_once(session, previous, tournament_id, paper_trade=True):
                 opportunity["market_context"]["book_versions"] = [democrat["version"], republican["version"]]
                 side = "ask" if position_type == "YES-PAIR" else "bid"
                 opportunity["market_context"]["leg_prices"] = [
-                    democrat[side] if side == "ask" else 1 - democrat[side],
-                    republican[side] if side == "ask" else 1 - republican[side],
+                    float((price / Decimal("0.005")).to_integral_value(rounding=ROUND_CEILING) * Decimal("0.005"))
+                    for price in [Decimal(str(book[side])) if side == "ask"
+                                  else Decimal(1) - Decimal(str(book[side])) for book in (democrat, republican)]
                 ]
+                if manual:
+                    opportunity["quantity"] = 1
+                    print("SETTLEMENT | U.S. Senate | explicitly approved manual evidence | one paper pair")
         except RateLimitError:
             print("API read limit reached; pausing reads and retaining previous observations.")
             return
@@ -454,7 +550,27 @@ def main():
     parser.add_argument("--once", action="store_true", help="Scan once, then exit")
     parser.add_argument("--audit-only", action="store_true", help="Inspect API data once without changing paper files")
     parser.add_argument("--tournament", default="midterm-elections", help="Competition slug (default: midterm-elections)")
+    parser.add_argument("--manual-settlement-approval",
+                        help="One-shot paper only: explicitly approve the current 153/154 settlement evidence hash")
     args = parser.parse_args()
+    if args.manual_settlement_approval is not None and not (args.once or args.audit_only):
+        parser.error("Manual settlement approval requires a supervised --once or --audit-only paper scan")
+    try:
+        # Acquire before loading cash/positions or repairing the paper CSV, and
+        # retain exclusive ownership until the complete scanner run returns.
+        with scanner_lock():
+            return _run_scanner(args)
+    except ScannerLockError as error:
+        print(f"Scanner stopped: {error}")
+        return 1
+    except KeyboardInterrupt:
+        # Also handle Ctrl+C during startup, before the scan loop's own handler.
+        print("\nScanner stopped.")
+        return 0
+
+
+def _run_scanner(args):
+    """Existing paper scanner behavior, called only while holding its lock."""
     load_dotenv()
     api_key = os.getenv("SIG_API_KEY")
     if not api_key:
@@ -473,7 +589,8 @@ def main():
         print("Read-only API audit started. No paper trades or portfolio/log writes.")
     else:
         print("Paper-only scanner started. Ctrl+C stops it. Paper positions are saved locally.")
-    print("Pair approvals require current competition relationships; profit is conditional on normal settlement.")
+    print("Paper levels: <0.5% IGNORE | 0.5% WATCH | 1.0% PAPER TRADE | 2.0% STRONG PAPER TRADE")
+    print("Settlement verification is mandatory; projected profit assumes ordinary settlement.")
     try:
         with requests.Session() as session:
             session.headers.update({"Authorization": f"Bearer {api_key}"})
@@ -486,7 +603,8 @@ def main():
             while True:
                 started = time.monotonic()
                 print(f"\nScan {datetime.now().astimezone().isoformat(timespec='seconds')}")
-                scan_once(session, previous, tournament_id, paper_trade=not args.audit_only)
+                scan_once(session, previous, tournament_id, paper_trade=not args.audit_only,
+                          manual_approval=args.manual_settlement_approval)
                 if not args.audit_only:
                     print_portfolio_summary()
                 if args.once or args.audit_only:
@@ -506,4 +624,7 @@ def main():
 
 
 if __name__ == "__main__":
+    # Lazy imports of the existing evidence tools must share this scanner's
+    # request-pacing state, rather than importing a second copy of this file.
+    sys.modules.setdefault("price_reader", sys.modules[__name__])
     raise SystemExit(main())

@@ -14,8 +14,8 @@ from dotenv import load_dotenv
 
 from order_preview import ceil_buy_limit
 from price_reader import (
-    API_BASE_URL, API_ERRORS, MAX_TRADE_QUANTITY, MIN_EDGE, MIN_LIQUIDITY,
-    DataValidationError, RateLimitError, api_error_reason, fetch_pages,
+    API_BASE_URL, API_ERRORS, MAX_TRADE_QUANTITY, PAPER_TRADE_EDGE, MIN_LIQUIDITY,
+    DataValidationError, RateLimitError, api_error_reason, classify_edge, fetch_pages,
     get_best_prices, get_election_rule, get_exchange_id, get_pair_rules,
     get_races, get_tournament, numeric_id,
 )
@@ -31,6 +31,7 @@ FIELDS = (
     "meets_price_and_depth_thresholds", "dem_book_at", "rep_book_at",
     "quote_status", "settlement_status", "settlement_note", "rules_review",
     "execution_approved",
+    "economic_classification",
 )
 
 
@@ -48,6 +49,7 @@ def pair_rows(session, race, markets, tournament_id, relationships, relationship
         "settlement_status": "UNVERIFIED", "settlement_note": relationship_error,
         "rules_review": "NOT_INSPECTED", "execution_approved": False,
         "meets_price_and_depth_thresholds": False,
+        "economic_classification": "UNAVAILABLE",
     }
     rows = [dict(base, position_type=kind) for kind in ("YES-PAIR", "NO-PAIR")]
     if any(market["status"] != "open" for market in markets):
@@ -102,8 +104,9 @@ def pair_rows(session, race, markets, tournament_id, relationships, relationship
             available = min(quantities)
             row.update(dem_limit=limits[0], rep_limit=limits[1], combined_limit_cost=float(total),
                        apparent_price_gap=float(gap), quote_status="OBSERVED",
+                       economic_classification=classify_edge(gap),
                        research_quantity=min(math.floor(available), MAX_TRADE_QUANTITY),
-                       meets_price_and_depth_thresholds=(gap >= Decimal(str(MIN_EDGE))
+                       meets_price_and_depth_thresholds=(gap >= PAPER_TRADE_EDGE
                                                           and available >= MIN_LIQUIDITY))
     except RateLimitError:
         raise
@@ -113,7 +116,8 @@ def pair_rows(session, race, markets, tournament_id, relationships, relationship
             for field in FIELDS[8:23]:
                 if field not in ("meets_price_and_depth_thresholds",):
                     row.pop(field, None)
-            row.update(quote_status=api_error_reason(error), meets_price_and_depth_thresholds=False)
+            row.update(quote_status=api_error_reason(error), meets_price_and_depth_thresholds=False,
+                       economic_classification="UNAVAILABLE")
 
     # Canonical evidence still goes through the scanner's original approval
     # checks. A missing graph is recorded, never replaced by a title assumption.
@@ -248,6 +252,7 @@ def print_report(rows, top):
             print(f"{row['race']} | {row['position_type']} | markets {row['dem_market_id']}/{row['rep_market_id']} | "
                   f"buys {row['dem_buy_price']:.3f} + {row['rep_buy_price']:.3f} | "
                   f"limit cost {row['combined_limit_cost']:.3f} | apparent gap {row['apparent_price_gap']:.2%} | "
+                  f"economic level {row['economic_classification']} | "
                   f"depth {row['available_pairs']:g} | {row['settlement_status']}")
         else:
             print(f"{row['race']} | {row['position_type']} | {row.get('quote_status', 'UNAVAILABLE')}")

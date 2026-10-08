@@ -140,6 +140,12 @@ def validate_market_context(position):
         raise ValueError("Saved relationship does not support the position type")
     if context.get("payout_condition") != "ordinary_binary_settlement; refunds are separate":
         raise ValueError("Invalid saved payout condition")
+    validate_quote_context(position)
+
+
+def validate_quote_context(position):
+    """Both settlement routes must retain the exact prices and book versions."""
+    context = position["market_context"]
     prices = context.get("leg_prices")
     if (not isinstance(prices, list) or len(prices) != 2
             or any(not is_finite_number(price) or not 0 <= price <= 1 for price in prices)
@@ -153,6 +159,23 @@ def validate_market_context(position):
                 or version["sequence"] < 0 or not isinstance(version.get("at"), str)):
             raise ValueError("Invalid saved book version")
         parse_api_timestamp(version["at"])
+
+
+def validate_paper_market_context(position):
+    """Manual evidence may support one paper pair, never machine/live approval."""
+    context = position.get("market_context")
+    if isinstance(context, dict) and "manual_approval" in context:
+        from paired_account_test import validate_manual_context
+
+        validate_manual_context(context)
+        if (context.get("paper_only") is not True or position["position_type"] != "NO-PAIR"
+                or type(position.get("quantity")) is not int or position["quantity"] != 1):
+            raise ValueError("Manual paper approval permits exactly one paper-only NO pair")
+        validate_quote_context(position)
+    else:
+        # Historical portfolios may lack provenance; new entries require it in
+        # execute_paper_trade. Live tools keep using this strict machine helper.
+        validate_market_context(position)
 
 
 def validate_portfolio(data):
@@ -212,7 +235,7 @@ def validate_portfolio(data):
         if race_exposure[race] > MAX_CAPITAL_PER_RACE:
             raise ValueError("Saved positions exceed the race capital limit")
         validate_trade_metadata(position)
-        validate_market_context(position)
+        validate_paper_market_context(position)
         context = position.get("market_context")
         if context is not None:
             pair = (context["tournament_id"], tuple(sorted(context["exchange_ids"])))
@@ -391,6 +414,7 @@ def execute_paper_trade(
     profit_per_pair,
     quantity,
     market_context=None,
+    classification=None,
 ):
     """
     Simulate an arbitrage trade without sending
@@ -408,13 +432,27 @@ def execute_paper_trade(
             or not 0 <= cost_per_pair < 1 or profit_per_pair <= 0 or quantity <= 0):
         print(f"PAPER TRADE REJECTED | {race} | Invalid trade values")
         return False
-    if market_context is not None:
-        try:
-            validate_market_context({"market_context": market_context,
-                                     "position_type": position_type, "cost_per_pair": cost_per_pair})
-        except (ValueError, KeyError, TypeError):
-            print(f"PAPER TRADE REJECTED | {race} | Invalid market provenance")
-            return False
+    # Old saved simulations can still be restored, but every NEW paper entry
+    # needs explicit settlement evidence. Numbers or titles alone never suffice.
+    if not isinstance(market_context, dict):
+        print(f"PAPER TRADE REJECTED | {race} | Settlement verification is mandatory")
+        return False
+    try:
+        validate_paper_market_context({"market_context": market_context, "position_type": position_type,
+                                       "cost_per_pair": cost_per_pair, "quantity": quantity})
+        from price_reader import classify_edge
+        level = classify_edge(profit_per_pair)
+        if (level not in {"PAPER TRADE", "STRONG PAPER TRADE"}
+                or (classification is not None and classification != level)
+                or not math.isclose(profit_per_pair, 1 - cost_per_pair, rel_tol=0, abs_tol=1e-9)):
+            raise ValueError("Paper trade edge or classification is invalid")
+        import execution_quarantine as quarantine
+        quarantine.require_unblocked_markets(market_context["market_ids"])
+        quarantine.require_unblocked_exchanges(market_context["exchange_ids"])
+        reserved = quarantine.reserved_cost(market_context["tournament_id"])
+    except (ValueError, KeyError, TypeError):
+        print(f"PAPER TRADE REJECTED | {race} | Invalid settlement, edge or quarantine evidence")
+        return False
 
     # A position stays open even if its market opportunity disappears.
     # Restored positions also block another copy after restarting the scanner.
@@ -470,6 +508,7 @@ def execute_paper_trade(
     new_race_exposure = (
         current_race_exposure
         + capital_used
+        + reserved
     )
 
     # Reject if this would exceed our race limit
@@ -502,7 +541,7 @@ def execute_paper_trade(
     # Check available paper balance
     # ---------------------------------------
 
-    if capital_used > paper_balance:
+    if capital_used > paper_balance - reserved:
         print()
         print("----- PAPER TRADE REJECTED -----")
         print("Race:", race)
@@ -531,6 +570,7 @@ def execute_paper_trade(
         "cost_per_pair": cost_per_pair,
         "capital_used": capital_used,
         "minimum_profit": minimum_profit,
+        "classification": level,
         # Persist log metadata with the trade so a missing CSV row can be retried.
         "trade_id": uuid4().hex,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),

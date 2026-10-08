@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import requests
 import paper_trader
 import price_reader as scanner
+from test_account_reader import isolate_quarantine
 
 TOURNAMENT_ID = "550e8400-e29b-41d4-a716-446655440000"
 OTHER_TOURNAMENT_ID = "550e8400-e29b-41d4-a716-446655440001"
@@ -80,6 +81,7 @@ def exchange_book(market_id=1, exchange_id=11, bid=.6, ask=.65):
 
 class ApiAuditTests(unittest.TestCase):
     def setUp(self):
+        isolate_quarantine(self)
         for name, value in (("_last_request_started", None), ("_read_cooldown_until", 0)):
             patcher = patch.object(scanner, name, value)
             patcher.start()
