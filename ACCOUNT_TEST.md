@@ -103,6 +103,19 @@ automatically nor explicitly repeats an uncertain POST. Preserve the body and
 key while inspecting the account and reconciling the outcome manually before any
 further account writes.
 
+Preparation and submission use the default `account_test.json` journal. An
+alternate `--state` path is accepted only for inspection, checks and cancellation
+of an existing journal. Submission also refuses to run while the default paired
+test directory exists. A per-journal `.operation.lock` serializes submissions;
+the saved journal must still match the caller's snapshot while that lock is held.
+After a process crash, preserve any remaining lock and confirm the process has
+stopped before manual recovery. Never remove an unresolved journal to bypass it.
+
+Journal saves flush both the JSON file and its parent directory metadata.
+Failure of either flush stops execution. A failed receipt save may leave the old
+intent or the new receipt on disk; discard in-memory state and restore the
+journal before reconciliation. Neither saved attempted state permits replay.
+
 GET order lists contain no stable client key with which to recover this receipt.
 Matching a nearby order by price or time does not prove that it is the saved
 request, or that a missing match never executed. Without a confirmed order ID,

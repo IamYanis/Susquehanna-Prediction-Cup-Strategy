@@ -615,6 +615,58 @@ class PairedAccountTests(unittest.TestCase):
         self.session.post.assert_not_called()
         self.session.delete.assert_not_called()
 
+    def test_pair_directory_creation_must_be_durable_before_leg_journals_are_saved(self):
+        with patch.object(paired, "read_account", return_value=self.account), \
+                patch.object(paired, "preview_pair", return_value=copy.deepcopy(self.preview)), \
+                patch.object(single, "sync_directory", side_effect=OSError('synthetic directory failure')) as flush, \
+                self.assertRaises(single.TestError):
+            paired.prepare_pair(self.session, self.directory, '1', '2')
+        flush.assert_called_once_with(self.directory.parent)
+        self.assertTrue(self.directory.exists())
+        self.assertFalse(paired.leg_path(self.directory, 0).exists())
+        with self.assertRaises(single.TestError):
+            self.prepare()
+        self.session.post.assert_not_called()
+
+    def test_failed_controller_directory_flush_prevents_any_post_or_retry(self):
+        pair, _ = self.prepare()
+        with patch.object(paired, "preflight_pair"), \
+                patch.object(single, "sync_directory", side_effect=OSError('synthetic directory failure')), \
+                self.assertRaises(single.TestError):
+            paired.submit_pair(self.session, self.directory, pair['approval'])
+        restored, legs = paired.load_pair(self.directory)
+        self.assertEqual(restored['state'], 'EXECUTING')
+        self.assertTrue(all(leg['state'] == 'PREPARED' for leg in legs))
+        with self.assertRaises(single.TestError):
+            paired.submit_pair(self.session, self.directory, pair['approval'])
+        self.session.post.assert_not_called()
+
+    def test_failed_receipt_directory_flush_stops_second_leg_and_recovers_known_fill(self):
+        pair, _ = self.prepare()
+        self.install_venue()
+        original_flush = single.sync_directory
+        failed = False
+        def flush(directory):
+            nonlocal failed
+            first = single.load_intent(paired.leg_path(self.directory, 0))
+            if not failed and first['state'] == 'ACCEPTED':
+                failed = True
+                raise OSError('synthetic receipt directory failure')
+            return original_flush(directory)
+        with patch.object(single, "sync_directory", side_effect=flush), self.assertRaises(single.TestError):
+            self.execute(pair)
+        self.assertTrue(failed)
+        restored, legs = paired.load_pair(self.directory)
+        self.assertEqual(restored['state'], 'UNKNOWN')
+        self.assertEqual(legs[1]['state'], 'PREPARED')
+        self.assertEqual(self.session.post.call_count, 1)
+        checked, legs = paired.check_pair(self.session, self.directory)
+        self.assertEqual(checked['state'], 'UNMATCHED')
+        self.assertEqual(paired.filled_quantity(legs[0]), 1)
+        with self.assertRaises(single.TestError):
+            paired.submit_pair(self.session, self.directory, pair['approval'])
+        self.assertEqual(self.session.post.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

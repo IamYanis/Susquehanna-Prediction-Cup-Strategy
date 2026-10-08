@@ -174,6 +174,36 @@ class ApiAuditTests(unittest.TestCase):
                     patch.object(scanner, "fetch_json", side_effect=responses), self.assertRaises(ValueError):
                 scanner.fetch_pages(Mock(), scanner.MARKETS_URL, {"tournamentId": TOURNAMENT_ID})
 
+    def test_incomplete_relationship_coverage_cannot_approve_or_remove_opportunities(self):
+        previous = {("Saved race", "NO-PAIR"): {"profit_per_pair": .1}}
+        graph = page([pair_relationship()])
+        graph["coverage"] = {"complete": False}
+        with patch.object(scanner, "get_races", return_value=({}, set())), \
+                patch.object(scanner, "fetch_json", return_value=graph), \
+                patch.object(scanner, "get_pair_rules") as rules, \
+                patch.object(scanner, "execute_paper_trade") as trade, \
+                contextlib.redirect_stdout(io.StringIO()):
+            scanner.scan_once(Mock(), previous, TOURNAMENT_ID)
+        rules.assert_not_called()
+        trade.assert_not_called()
+        self.assertIn(("Saved race", "NO-PAIR"), previous)
+
+    def test_conflicting_relationship_versions_across_pages_fail_closed(self):
+        active = pair_relationship()
+        inactive = copy.deepcopy(active)
+        inactive.update(version=2, status="stale")
+        with patch.object(scanner, "fetch_json", side_effect=[page([active], True, "next"), page([inactive])]), \
+                self.assertRaisesRegex(scanner.DataValidationError, "repeated identities"):
+            scanner.fetch_pages(Mock(), scanner.API_BASE_URL + '/relationships', {'tournamentId': TOURNAMENT_ID})
+
+    def test_discovery_with_endless_new_cursors_is_bounded_and_never_returns_partial_rows(self):
+        payloads = [page([{"id": str(index + 1)}], True, f"page-{index + 1}") for index in range(3)]
+        with patch.object(scanner, "MAX_DISCOVERY_PAGES", 3), \
+                patch.object(scanner, "fetch_json", side_effect=payloads) as fetch, \
+                self.assertRaisesRegex(scanner.DataValidationError, "page limit"):
+            scanner.fetch_pages(Mock(), scanner.MARKETS_URL, {"tournamentId": TOURNAMENT_ID})
+        self.assertEqual(fetch.call_count, 3)
+
     def test_failed_later_page_retains_previous_observations(self):
         previous = {("Saved race", "NO-PAIR"): {"profit_per_pair": .1}}
         with patch.object(scanner, "fetch_json", side_effect=[

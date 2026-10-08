@@ -5,6 +5,7 @@ import io
 import json
 import sys
 import tempfile
+import stat
 import unittest
 from datetime import timedelta
 from pathlib import Path
@@ -35,6 +36,7 @@ class AccountTestTests(unittest.TestCase):
         self.addCleanup(redirect.__exit__, None, None, None)
         # Freeze freshness and read pacing without sleeping or accessing an API.
         for target, name, value in (
+            (supervised, "STATE_PATH", self.path),
             (scanner, "_last_request_started", None),
             (scanner, "_read_cooldown_until", 0),
             (supervised.time, "monotonic", Mock(return_value=100)),
@@ -847,6 +849,103 @@ class AccountTestTests(unittest.TestCase):
         preflight.assert_called_once()
         self.session.post.assert_not_called()
         self.assertEqual(self.path.read_bytes(), before)
+
+    def test_stale_prepared_copy_cannot_overwrite_attempted_or_partially_filled_journal(self):
+        original = self.make_intent()
+        for state in ("SUBMITTING", "UNKNOWN", "ACCEPTED"):
+            saved = copy.deepcopy(original)
+            saved["state"] = state
+            if state == "ACCEPTED":
+                saved.update(order_id=101, observation={"placement_quantity": .5, "placement_cost": .325})
+            supervised.save_intent(saved, self.path)
+            before = self.path.read_bytes()
+            with self.subTest(state=state), patch.object(supervised, "read_test_inputs") as reads, \
+                    self.assertRaisesRegex(supervised.TestError, "Saved journal changed"):
+                supervised.submit_test(self.session, copy.deepcopy(original), self.path, original["approval"])
+            reads.assert_not_called()
+            self.assertEqual(self.path.read_bytes(), before)
+        self.session.post.assert_not_called()
+
+    def test_submission_lock_blocks_another_caller_before_any_api_reads(self):
+        intent = self.make_intent()
+        with supervised.submission_lock(self.path), patch.object(supervised, "read_test_inputs") as reads:
+            with self.assertRaisesRegex(supervised.TestError, "locked"):
+                supervised.submit_test(self.session, intent, self.path, intent["approval"])
+        reads.assert_not_called()
+        self.session.post.assert_not_called()
+        self.assertEqual(supervised.load_intent(self.path)["state"], "PREPARED")
+
+    def test_submission_through_symlink_updates_the_locked_original_journal(self):
+        intent = self.make_intent()
+        alias = self.path.with_name('alias.json')
+        alias.symlink_to(self.path)
+        self.session.post.return_value = self.response(self.receipt(intent))
+        with patch.object(supervised, "read_test_inputs", return_value=self.inputs()):
+            supervised.submit_test(self.session, intent, alias, intent["approval"])
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(supervised.load_intent(self.path)["state"], "ACCEPTED")
+        self.assertEqual(self.session.post.call_count, 1)
+
+    def test_alternate_cli_path_cannot_prepare_or_submit_around_an_unknown_default(self):
+        intent = self.make_intent()
+        supervised.commit_state(intent, self.path, "UNKNOWN")
+        alternate = self.path.with_name('replacement.json')
+        before = self.path.read_bytes()
+        for action, extra in (("prepare", ["--market", "1", "--side", "no"]),
+                              ("submit", ["--approve", intent["approval"]])):
+            with self.subTest(action=action), patch.object(sys, "argv", [
+                    "account_test.py", action, "--state", str(alternate)] + extra), \
+                    patch.object(supervised, "load_dotenv") as dotenv, \
+                    patch.object(supervised.requests, "Session") as factory:
+                self.assertEqual(supervised.main(), 1)
+            dotenv.assert_not_called()
+            factory.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertFalse(alternate.exists())
+
+    def test_single_cli_submission_cannot_bypass_existing_pair_journals(self):
+        intent = self.make_intent()
+        self.path.with_name('paired_account_test').mkdir()
+        with patch.object(sys, "argv", ['account_test.py', 'submit', '--approve', intent['approval']]), \
+                patch.object(supervised, "load_dotenv") as dotenv, \
+                patch.object(supervised.requests, "Session") as factory:
+            self.assertEqual(supervised.main(), 1)
+        dotenv.assert_not_called()
+        factory.assert_not_called()
+
+    def test_directory_sync_completes_before_post_and_failure_blocks_submission(self):
+        intent = self.make_intent()
+        original_fsync = supervised.os.fsync
+        directory_flushes = []
+        def fsync(descriptor):
+            if stat.S_ISDIR(supervised.os.fstat(descriptor).st_mode):
+                directory_flushes.append(supervised.load_intent(self.path)["state"])
+            return original_fsync(descriptor)
+        def post(url, **kwargs):
+            self.assertIn("SUBMITTING", directory_flushes)
+            return self.response(self.receipt(intent))
+        self.session.post.side_effect = post
+        with patch.object(supervised.os, "fsync", side_effect=fsync), \
+                patch.object(supervised, "read_test_inputs", return_value=self.inputs()):
+            supervised.submit_test(self.session, intent, self.path, intent["approval"])
+        self.assertEqual(directory_flushes, ['SUBMITTING', 'ACCEPTED'])
+
+    def test_failed_directory_sync_of_submitting_intent_prevents_post_and_stale_retry(self):
+        intent = self.make_intent()
+        with patch.object(supervised, "sync_directory", side_effect=OSError('synthetic directory failure')), \
+                patch.object(supervised, "read_test_inputs", return_value=self.inputs()), self.assertRaises(supervised.TestError):
+            supervised.submit_test(self.session, intent, self.path, intent["approval"])
+        self.session.post.assert_not_called()
+        self.assertEqual(supervised.load_intent(self.path)["state"], "SUBMITTING")
+        with self.assertRaisesRegex(supervised.TestError, "Saved journal changed"):
+            supervised.submit_test(self.session, intent, self.path, intent["approval"])
+        self.session.post.assert_not_called()
+
+    def test_exclusive_new_journal_creation_flushes_its_parent_directory(self):
+        intent = self.make_intent(save=False)
+        with patch.object(supervised, "sync_directory") as flush:
+            supervised.save_intent(intent, self.path, new=True)
+        flush.assert_called_once_with(self.path.parent)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,9 @@ MARKETS_URL = f"{API_BASE_URL}/markets"
 # The documented ordinary-account budget is 100 reads/minute across all keys.
 # 0.75 seconds between starts uses at most about 80/minute in this process.
 READ_REQUEST_SPACING = 0.75
+# A broken server can return endlessly changing cursors. Never approve from a
+# partial walk or spend the whole run on an unbounded discovery request.
+MAX_DISCOVERY_PAGES = 50
 _last_request_started = None
 _read_cooldown_until = 0
 
@@ -107,13 +110,33 @@ def get_tournament(session, slug="midterm-elections"):
 def fetch_pages(session, url, params):
     """Read all cursor pages; an incomplete or looping response is unknown."""
     items = []
-    seen_cursors = set()
+    seen_cursors, seen_ids = set(), set()
     params = params.copy()
-    while True:
+    for _ in range(MAX_DISCOVERY_PAGES):
         payload = fetch_json(session, url, params=params)
+        if not isinstance(payload, dict):
+            raise DataValidationError("Invalid paginated API response")
+        # Some engine-backed listings declare projection coverage. If they say
+        # it is incomplete, even a final cursor page is not usable evidence.
+        if "coverage" in payload:
+            coverage = payload["coverage"]
+            if not isinstance(coverage, dict) or coverage.get("complete") is not True:
+                raise DataValidationError("Discovery coverage is incomplete")
         data, pagination = payload["data"], payload["pagination"]
         if not isinstance(data, list) or type(pagination["hasMore"]) is not bool:
             raise DataValidationError("Invalid paginated API response")
+        for item in data:
+            if not isinstance(item, dict):
+                raise DataValidationError("Invalid discovery item")
+            identity = item.get("id")
+            if type(identity) not in (str, int) or not str(identity):
+                raise DataValidationError("Discovery item has no valid identity")
+            identity = str(identity).lower()
+            if identity in seen_ids:
+                # Conflicting active/inactive versions must not let the first
+                # copy approve settlement from an inconsistent graph snapshot.
+                raise DataValidationError("Discovery contains repeated identities")
+            seen_ids.add(identity)
         items.extend(data)
         if not pagination["hasMore"]:
             return items
@@ -122,6 +145,7 @@ def fetch_pages(session, url, params):
             raise DataValidationError("Missing or repeated API cursor")
         seen_cursors.add(cursor)
         params["cursor"] = cursor
+    raise DataValidationError("Discovery page limit reached; coverage is incomplete")
 
 
 def check_context(contexts, tournament_id):

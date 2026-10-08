@@ -158,6 +158,7 @@ def save_pair(pair, directory):
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, directory / "pair.json")
+        single.sync_directory(directory)
     except (OSError, ValueError, TypeError, KeyError, OverflowError) as error:
         raise single.TestError("Cannot save pair journal; stop without further account writes") from error
     finally:
@@ -252,6 +253,7 @@ def prepare_pair(session, directory, democrat_id, republican_id, slug="midterm-e
     # during preparation. An incomplete directory must never become a new test.
     try:
         Path(directory).mkdir(mode=0o700)
+        single.sync_directory(Path(directory).parent)
     except OSError as error:
         raise single.TestError("Cannot create a new pair directory; nothing submitted") from error
     for index, leg in enumerate(legs):

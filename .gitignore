@@ -11,6 +11,7 @@ execution_state.json
 simulated_venue.json
 .simulated_venue.json.*.tmp
 account_test.json
+.account_test.json.operation.lock
 .account_test.json.*.tmp
 research_report.csv
 .research_report.csv.*.tmp

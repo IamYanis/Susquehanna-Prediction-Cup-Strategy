@@ -8,6 +8,7 @@ import os
 import re
 import tempfile
 import time
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -120,6 +121,42 @@ def validate_intent(intent):
             require(observation["placement_quantity"] == observation["placement_cost"] == 0, "A no-op contains fills")
 
 
+def sync_directory(directory):
+    """Flush file creation/rename metadata so a crash cannot undo saved intent.
+
+    Flushing the JSON file alone does not persist its directory entry. A failed
+    directory flush is a failed save; callers must stop before any account write.
+    """
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def submission_lock(path):
+    """Serialize submissions using this journal; a leftover lock blocks reuse."""
+    path = Path(path).resolve()
+    lock = path.with_name(f".{path.name}.operation.lock")
+    try:
+        descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except OSError as error:
+        raise TestError("Order journal is locked or unavailable; inspect it before submission") from error
+    try:
+        with os.fdopen(descriptor, "w") as stream:
+            stream.write(str(os.getpid()))
+            stream.flush()
+            os.fsync(stream.fileno())
+        yield
+    finally:
+        try:
+            lock.unlink()
+        except OSError:
+            # Do not guess whether an existing lock is stale on the next run.
+            pass
+
+
 def save_intent(intent, path, new=False):
     """New files are exclusive; updates replace atomically after flushing to disk."""
     temporary = None
@@ -142,6 +179,7 @@ def save_intent(intent, path, new=False):
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, path)
+        sync_directory(path.parent)
     except (OSError, ValueError, TypeError, KeyError, OverflowError) as error:
         raise TestError("Cannot save test journal; stop without further orders") from error
     finally:
@@ -268,51 +306,60 @@ def submit_test(session, intent, path, approval, recover=False):
     """
     require_approval(intent, approval)
     require(not recover, "Receipt replay is disabled; an unknown placement needs manual reconciliation")
-    require(intent["state"] == "PREPARED", "This test was already attempted; never submit a replacement")
-    body = intent["request"]
-    if not recover:
+    # Resolve aliases once so the lock, restore and atomic replacement all
+    # protect the same file rather than replacing a symlink beside the journal.
+    path = Path(path).resolve()
+    with submission_lock(path):
+        # The caller may have loaded PREPARED before another process saved an
+        # attempted/unknown state. Disk is authoritative while we hold the lock.
+        saved = load_intent(path)
+        require(saved == intent, "Saved journal changed; reload it before any submission")
+        require(intent["state"] == "PREPARED", "This test was already attempted; never submit a replacement")
+        body = intent["request"]
+        if not recover:
+            require(parse_api_timestamp(body["expirationDate"]).timestamp() > time.time(), "The prepared order has expired")
+            account, exchange_id, current_price, risk = read_test_inputs(
+                session, intent["market_id"], body["side"], intent["tournament_slug"])
+            require(account["tournament"]["id"] == body["tournamentId"] and exchange_id == body["exchangeId"],
+                    "The prepared market or competition identity changed")
+            require(current_price <= body["price"] + 1e-12, "The current quote exceeds the approved limit; no order sent")
+            check_risk(risk, body["price"])
+        # Check again after the GET preflight; the approved expiry must not pass
+        # during those reads. The request body itself is never refreshed or changed.
         require(parse_api_timestamp(body["expirationDate"]).timestamp() > time.time(), "The prepared order has expired")
-        account, exchange_id, current_price, risk = read_test_inputs(
-            session, intent["market_id"], body["side"], intent["tournament_slug"])
-        require(account["tournament"]["id"] == body["tournamentId"] and exchange_id == body["exchangeId"],
-                "The prepared market or competition identity changed")
-        require(current_price <= body["price"] + 1e-12, "The current quote exceeds the approved limit; no order sent")
-        check_risk(risk, body["price"])
-    # Check again after the GET preflight; the approved expiry must not pass
-    # during those reads. The request body itself is never refreshed or changed.
-    require(parse_api_timestamp(body["expirationDate"]).timestamp() > time.time(), "The prepared order has expired")
-    commit_state(intent, path, "SUBMITTING")
-    response = None
-    try:
-        response = session.post(f"{API_BASE_URL}/orders", json=copy.deepcopy(body),
-                                timeout=REQUEST_TIMEOUT, allow_redirects=False)
-        require(response.status_code == 200, "The placement reply is unconfirmed")
-        result = response.json()
-        require(numeric_id(result["exchangeId"]) == body["exchangeId"]
-                and result["action"] == "buy" and result["side"] == body["side"]
-                and type(result["quantity"]) is int and result["quantity"] == 1
-                and result["price"] == body["price"] and type(result["open"]) is bool,
-                "The placement receipt conflicts with the approved intent")
-        traded, cost, remaining = result["quantityTraded"], result["totalCost"], result["remainingQuantity"]
-        require(all(is_finite_number(value) for value in (traded, cost, remaining))
-                and 0 <= traded <= 1 and 0 <= remaining <= 1 and traded + remaining <= 1 + 1e-9
-                and 0 <= cost <= traded * body["price"] + 1e-9, "Invalid placement quantities or cost")
-        require((remaining > 0 and math.isclose(traded + remaining, 1, rel_tol=0, abs_tol=1e-9))
-                if result["open"] else remaining == 0, "Placement open state conflicts with its remainder")
-        fill_price = result["fillPrice"]
-        require(fill_price is None if traded == 0 else is_finite_number(fill_price) and 0 <= fill_price <= body["price"],
-                "Placement fill price conflicts with the limit")
-        order_id = result["orderId"]
-        require(order_id is None or (type(order_id) is int and order_id > 0), "Invalid placement order ID")
-        require(order_id is not None or (not result["open"] and traded == cost == remaining == 0),
-                "An unidentified order may have filled")
-    except (requests.RequestException, ValueError, KeyError, TypeError, OverflowError) as error:
-        commit_state(intent, path, "UNKNOWN", placement_diagnostic=safe_placement_diagnostic(response, error))
-        raise TestError("Order outcome is UNKNOWN; do not create another test or key") from error
-    # If this save fails, SUBMITTING remains on disk and blocks a fresh order.
-    commit_state(intent, path, "NOOP" if order_id is None else "ACCEPTED", order_id=order_id,
-                 observation={"placement_quantity": traded, "placement_cost": cost})
-    return intent
+        commit_state(intent, path, "SUBMITTING")
+        response = None
+        try:
+            response = session.post(f"{API_BASE_URL}/orders", json=copy.deepcopy(body),
+                                    timeout=REQUEST_TIMEOUT, allow_redirects=False)
+            require(response.status_code == 200, "The placement reply is unconfirmed")
+            result = response.json()
+            require(numeric_id(result["exchangeId"]) == body["exchangeId"]
+                    and result["action"] == "buy" and result["side"] == body["side"]
+                    and type(result["quantity"]) is int and result["quantity"] == 1
+                    and result["price"] == body["price"] and type(result["open"]) is bool,
+                    "The placement receipt conflicts with the approved intent")
+            traded, cost, remaining = result["quantityTraded"], result["totalCost"], result["remainingQuantity"]
+            require(all(is_finite_number(value) for value in (traded, cost, remaining))
+                    and 0 <= traded <= 1 and 0 <= remaining <= 1 and traded + remaining <= 1 + 1e-9
+                    and 0 <= cost <= traded * body["price"] + 1e-9, "Invalid placement quantities or cost")
+            require((remaining > 0 and math.isclose(traded + remaining, 1, rel_tol=0, abs_tol=1e-9))
+                    if result["open"] else remaining == 0, "Placement open state conflicts with its remainder")
+            fill_price = result["fillPrice"]
+            require(fill_price is None if traded == 0 else is_finite_number(fill_price) and 0 <= fill_price <= body["price"],
+                    "Placement fill price conflicts with the limit")
+            order_id = result["orderId"]
+            require(order_id is None or (type(order_id) is int and order_id > 0), "Invalid placement order ID")
+            require(order_id is not None or (not result["open"] and traded == cost == remaining == 0),
+                    "An unidentified order may have filled")
+        except (requests.RequestException, ValueError, KeyError, TypeError, OverflowError) as error:
+            commit_state(intent, path, "UNKNOWN", placement_diagnostic=safe_placement_diagnostic(response, error))
+            raise TestError("Order outcome is UNKNOWN; do not create another test or key") from error
+        # A failed flush can leave either SUBMITTING or the new receipt on disk.
+        # Discard memory and restore; neither state permits another placement.
+        commit_state(intent, path, "NOOP" if order_id is None else "ACCEPTED", order_id=order_id,
+                     observation={"placement_quantity": traded, "placement_cost": cost})
+        return intent
 
 
 def read_order(session, intent):
@@ -446,6 +493,15 @@ def main():
     if args.action == "prepare" and (args.market is None or args.side is None):
         parser.error("Preparation requires --market and --side")
     try:
+        if args.action in {"prepare", "submit"}:
+            # Alternative paths are still useful for inspecting/cancelling old
+            # journals, but must not hide an unresolved default attempt.
+            require(args.state.resolve() == STATE_PATH.resolve(),
+                    "Preparation and submission must use the default journal; alternate paths are recovery-only")
+            args.state = STATE_PATH.resolve()
+        if args.action == "submit":
+            require(not STATE_PATH.with_name("paired_account_test").exists(),
+                    "A paired test journal exists; do not submit an independent account test")
         if args.action == "prepare":
             require(not args.state.exists(), "A test journal already exists; do not overwrite or reset it")
             require(not STATE_PATH.with_name("paired_account_test").exists(),
