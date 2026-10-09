@@ -124,8 +124,10 @@ def get_open_orders(session, tournament_id):
     raise DataValidationError("Orders page limit reached; the account read is incomplete")
 
 
-def read_account(session, slug="midterm-elections"):
+def read_account(session, slug="midterm-elections", allow_inactive=False):
     """Read the cash, holdings and orders; return a result only when all succeed."""
+    # Read-only holding/settlement management can continue after a tournament
+    # ends. Entry callers retain the default requirement for an active account.
     if not isinstance(slug, str) or not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", slug):
         raise DataValidationError("Invalid tournament slug")
     tournament = fetch_json(session, f"{API_BASE_URL}/tournaments/{slug}")
@@ -133,7 +135,8 @@ def read_account(session, slug="midterm-elections"):
         raise DataValidationError("Invalid tournament metadata")
     tournament_id = str(UUID(tournament["id"]))
     if (tournament_id != tournament["id"] or tournament["slug"] != slug
-            or tournament["status"] != "active"
+            or not isinstance(tournament["status"], str) or not tournament["status"]
+            or (not allow_inactive and tournament["status"] != "active")
             or tournament["currencyName"] not in ("SUSQie", "SUSQies")
             or not isinstance(tournament["name"], str)
             or type(tournament["isPendingEnrolment"]) is not bool):

@@ -160,7 +160,25 @@ def validate_request_body(body):
                     "The two preview legs must share scope, side and quantity")
 
 
-def executable_limits(position_type, books, account_started, quantity=None):
+def executable_buy_limit(position_type, book, minimum_depth=MIN_LIQUIDITY):
+    """Validate ONE authoritative executable book for either pair leg."""
+    require_preview(position_type in ("YES-PAIR", "NO-PAIR") and isinstance(book, dict), "Unknown pair/book type")
+    require_preview(is_finite_number(book["received_at"]) and is_finite_number(book["quoted_at"])
+                    and 0 <= time.monotonic() - book["received_at"] <= 5
+                    and -5 <= time.time() - book["quoted_at"] <= 5,
+                    "A selected book is stale or has no authoritative timestamp")
+    book_side = "ask" if position_type == "YES-PAIR" else "bid"
+    quote, depth = book[book_side], book[book_side + "_quantity"]
+    require_preview(is_finite_number(quote) and 0 < quote < 1
+                    and is_finite_number(depth) and depth >= minimum_depth,
+                    "The selected book side has insufficient depth or no positive limit quote")
+    own_side_price = quote if position_type == "YES-PAIR" else float(Decimal(1) - Decimal(str(quote)))
+    require_preview(abs(parse_api_timestamp(book["version"]["at"]).timestamp() - book["quoted_at"]) < 1e-6,
+                    "Book version and quote timestamps disagree")
+    return ceil_buy_limit(own_side_price)
+
+
+def executable_limits(position_type, books, account_started, quantity=None, minimum_depth=MIN_LIQUIDITY):
     """Validate quotes and size, then price tick-rounded limits with Decimal.
 
     This helper does not authorize a trade or choose an edge policy. The normal
@@ -175,20 +193,7 @@ def executable_limits(position_type, books, account_started, quantity=None):
                     and all(isinstance(book, dict) for book in books),
                     "Both selected books need executable depth")
     book_side = "ask" if position_type == "YES-PAIR" else "bid"
-    prices = []
-    for book in books:
-        require_preview(is_finite_number(book["received_at"]) and is_finite_number(book["quoted_at"])
-                        and 0 <= time.monotonic() - book["received_at"] <= 5
-                        and -5 <= time.time() - book["quoted_at"] <= 5,
-                        "A selected book is stale or has no authoritative timestamp")
-        quote, depth = book[book_side], book[book_side + "_quantity"]
-        require_preview(is_finite_number(quote) and 0 < quote < 1
-                        and is_finite_number(depth) and depth >= MIN_LIQUIDITY,
-                        "The selected book side needs at least 50 shares and a positive limit quote")
-        # Books report YES prices. Buying NO at the complement of a YES bid
-        # uses the NO-side price in OrderInput, not the original YES bid.
-        own_side_price = quote if position_type == "YES-PAIR" else float(Decimal(1) - Decimal(str(quote)))
-        prices.append(ceil_buy_limit(own_side_price))
+    prices = [executable_buy_limit(position_type, book, minimum_depth) for book in books]
     available = min(book[book_side + "_quantity"] for book in books)
     if quantity is None:
         quantity = min(math.floor(available), MAX_TRADE_QUANTITY)
@@ -196,9 +201,6 @@ def executable_limits(position_type, books, account_started, quantity=None):
                     and quantity <= available, "Requested quantity is invalid or exceeds observed depth")
     pair_cost = sum(Decimal(str(price)) for price in prices)
     edge = Decimal("1.000") - pair_cost
-    for book in books:
-        require_preview(abs(parse_api_timestamp(book["version"]["at"]).timestamp() - book["quoted_at"]) < 1e-6,
-                        "Book version and quote timestamps disagree")
     return prices, quantity, pair_cost, edge
 
 

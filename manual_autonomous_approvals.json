@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "allowed_mode": "LIVE_PILOT",
+  "authorization_tier": "MANUAL_AUTONOMOUS_APPROVAL",
+  "pairs": []
+}

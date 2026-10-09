@@ -30,6 +30,10 @@ STALE = "STALE_ACCOUNT_DATA"
 INCONSISTENT = "ACCOUNT_STATE_INCONSISTENT"
 INSUFFICIENT_BALANCE = "INSUFFICIENT_ACCOUNT_BALANCE"
 ACCOUNTING_UNVERIFIED = "ACCOUNTING_MODEL_UNVERIFIED"
+HISTORICAL_POLICY = "HISTORICALLY_RECONCILED_ZERO_EXTRA_FEE_ASSUMPTION"
+# Same conservative delta bound as the supervised review: up to one cent of
+# error in each two-decimal balance reading. This is NOT proof of zero fees.
+BALANCE_DELTA_TOLERANCE = Decimal(".02")
 MAX_HISTORY_PAGES = 50
 MAX_RECENT_ORDERS = 50
 API_REFERENCE = "https://sig.thesuper.market/api/v1/docs"
@@ -54,7 +58,7 @@ def check_fresh(started):
             "Account read exceeded the existing 15-second freshness window")
 
 
-def read_current_account(session, slug="midterm-elections"):
+def read_current_account(session, slug="midterm-elections", allow_inactive=False):
     """Reuse the existing validators, retaining which essential read failed."""
     class Reads:
         stage = BALANCE_UNAVAILABLE
@@ -66,7 +70,7 @@ def read_current_account(session, slug="midterm-elections"):
 
     reads = Reads()
     try:
-        return account_reader.read_account(reads, slug)
+        return account_reader.read_account(reads, slug, allow_inactive=allow_inactive)
     except scanner.API_ERRORS as error:
         raise AccountReadinessBlocked(reads.stage, "Required account response unavailable or invalid") from error
 
@@ -236,7 +240,8 @@ def read_order_activity(session, order_id, recent_fills, account, started):
     return {"order": order, "fills": fills, "fill_notional": str(notional)}
 
 
-def read_snapshot(session, slug="midterm-elections", checkpoint=None, initial_account=None, started=None):
+def read_snapshot(session, slug="midterm-elections", checkpoint=None, initial_account=None, started=None,
+                  order_ids=None, allow_inactive=False):
     """Bracket history reads with account/head rereads; return only complete data.
 
     This is a checked sequential observation, not a transactional API snapshot.
@@ -249,7 +254,7 @@ def read_snapshot(session, slug="midterm-elections", checkpoint=None, initial_ac
     if checkpoint is not None:
         since = min(since, parse_api_timestamp(checkpoint["created_at"]))
     try:
-        account = read_current_account(session, slug) if initial_account is None else copy.deepcopy(initial_account)
+        account = read_current_account(session, slug, allow_inactive) if initial_account is None else copy.deepcopy(initial_account)
         require(account["tournament"]["slug"] == slug, INCONSISTENT, "Account slug changed")
         base = f"/tournaments/{slug}/portfolio"
         def recent_fill(row):
@@ -269,11 +274,15 @@ def read_snapshot(session, slug="midterm-elections", checkpoint=None, initial_ac
             session, base + "/transactions", started, recent_transaction, lambda row: row["event_id"], since)
         # Omit the type=trade filter deliberately: fees, deposits, settlement
         # and collateral events can change account cash even without new fills.
-        order_ids = sorted({r["orderId"] for r in fills} | {r["id"] for r in account["orders"]})
+        # Autonomous v0.1 only needs lifecycle receipts for the order it just
+        # placed. Inspecting every historical receipt on every cycle eventually
+        # exceeds both the freshness window and the read budget. Other callers
+        # retain the original full-history behavior by leaving this as None.
+        order_ids = sorted({r["orderId"] for r in fills} | {r["id"] for r in account["orders"]}) if order_ids is None else list(order_ids)
         require(len(order_ids) <= MAX_RECENT_ORDERS, RECONCILIATION_UNAVAILABLE,
                 "Too many recent receipts for a fresh complete read")
         activity = [read_order_activity(session, oid, fills, account, started) for oid in order_ids]
-        final_account = read_current_account(session, slug)
+        final_account = read_current_account(session, slug, allow_inactive)
         require(final_account == account, INCONSISTENT, "Balance, holdings, orders or quarantine changed during the read")
         for path, old_head in ((base + "/fills", fill_head), (base + "/transactions", transaction_head)):
             latest = get_data(session, path, {"limit": 200}, started)
@@ -358,6 +367,25 @@ def require_verified_accounting():
     """Reconciliation must not label a notional charge an exact cash debit."""
     model = accounting_model()
     require(model["verified"] is True, model["status"], model["reason"])
+
+
+def assess_autonomous_snapshot(snapshot, checkpoint, exchange_ids, capital, quantity=1):
+    """Separate assumption-based policy; never change the ordinary verified gate.
+
+    Only the named historical model can replace ACCOUNTING_MODEL_UNVERIFIED
+    in this assessment. The coordinator must reconcile every leg and cumulative
+    balance immediately, and permanently halt on the first discrepancy.
+    """
+    result = assess_snapshot(snapshot, checkpoint, exchange_ids, capital, quantity)
+    result["failures"] = [row for row in result["failures"] if row["code"] != ACCOUNTING_UNVERIFIED]
+    if result["accounting"]["observed_fee_events"]:
+        result["failures"].append({"code": "ACCOUNTING_MODEL_MISMATCH", "reason": "Fee events contradict the pilot assumption"})
+    result["accounting"] = {**result["accounting"], "policy": HISTORICAL_POLICY,
+                            "formally_verified": False, "balance_delta_tolerance": str(BALANCE_DELTA_TOLERANCE),
+                            "requires_immediate_reconciliation": True, "mismatch_action": "HALTED_MANUAL_REVIEW"}
+    result["ready"] = not result["failures"]
+    # Passing this local assessment never enables submission.
+    return result
 
 
 def require_ready(assessment):

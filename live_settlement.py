@@ -1,7 +1,7 @@
 """Explicit LIVE_PILOT settlement permission and fresh read-only verification.
 
 Paper approvals are never read here. This module cannot approve a new pair,
-change either approval file, create an order intent, or submit an order.
+change any approval file, create an order intent, or submit an order.
 """
 import json
 import re
@@ -15,12 +15,16 @@ import price_reader as scanner
 from paper_trader import parse_api_timestamp
 
 APPROVAL_PATH = Path(__file__).resolve().with_name("live_approved_settlements.json")
+MANUAL_AUTONOMOUS_PATH = Path(__file__).resolve().with_name("manual_autonomous_approvals.json")
 VERIFIED = "LIVE_SETTLEMENT_VERIFIED"
 NOT_AUTHORIZED = "LIVE_SETTLEMENT_NOT_AUTHORIZED"
 NEEDS_REVALIDATION = "LIVE_SETTLEMENT_NEEDS_REVALIDATION"
 MACHINE = "machine-verified"
 MANUAL = "manual-supervised"
 SUPERVISED_MODE = "supervised-one-contract"
+AUTONOMOUS_MODE = "autonomous-one-contract"
+MACHINE_AUTONOMOUS = "MACHINE_VERIFIED_AUTONOMOUS"
+MANUAL_AUTONOMOUS = "MANUAL_AUTONOMOUS_APPROVAL"
 
 
 class LiveSettlementBlocked(ValueError):
@@ -38,6 +42,15 @@ def require(condition, reason):
 def evidence_sources(approval):
     """Bind source references to the exact scoped official reads we revalidate."""
     tournament_id = approval["tournament_id"]
+    if approval["verification_route"] == MANUAL_AUTONOMOUS:
+        # The new tier pins market mapping/status and actual policy content,
+        # as well as the full resolution roots. No title implies permission.
+        return ([f"{scanner.API_BASE_URL}/tournaments/{approval['tournament_slug']}"]
+                + [f"{scanner.API_BASE_URL}/markets/{mid}?tournamentId={tournament_id}"
+                   for mid in approval["market_ids"]]
+                + [f"{scanner.API_BASE_URL}/markets/{mid}/nodes?tournamentId={tournament_id}"
+                   for mid in approval["market_ids"]]
+                + ["https://sig.thesuper.market/docs/settlement-and-payouts"])
     sources = [f"{scanner.API_BASE_URL}/markets/{market_id}/nodes?tournamentId={tournament_id}"
                for market_id in approval["market_ids"]]
     if approval["verification_route"] == MACHINE:
@@ -48,10 +61,14 @@ def evidence_sources(approval):
 
 def validate_authorization(approval):
     """Reject incomplete/broad permissions; IDs are ordered Democratic/Republican."""
-    require(isinstance(approval, dict) and set(approval) == {
+    manual_autonomous = isinstance(approval, dict) and approval.get("verification_route") == MANUAL_AUTONOMOUS
+    fields = {
         "approval_version", "pair_name", "tournament_id", "tournament_slug", "market_ids", "exchange_ids",
         "relationship_type", "position_types", "max_quantity", "execution_mode", "verification_route",
-        "settlement_rationale", "evidence_hash", "source_refs", "limitations", "approved_at"},
+        "settlement_rationale", "evidence_hash", "source_refs", "limitations", "approved_at"}
+    if manual_autonomous:
+        fields.add("evidence_version")
+    require(isinstance(approval, dict) and set(approval) == fields,
         "Live settlement authorization is incomplete or invalid")
     require(type(approval["approval_version"]) is int and approval["approval_version"] >= 1,
             "Live approval must have a positive version")
@@ -68,9 +85,18 @@ def validate_authorization(approval):
     require(approval["relationship_type"] == "mutually_exclusive" and approval["position_types"] == ["NO-PAIR"],
             "Live pilot authorization requires the reviewed mutually-exclusive NO pair")
     require(type(approval["max_quantity"]) is int and approval["max_quantity"] == 1
-            and approval["execution_mode"] == SUPERVISED_MODE,
-            "Live settlement permission is limited to one supervised contract per leg")
-    require(approval["verification_route"] in {MACHINE, MANUAL}, "Invalid live verification route")
+            and approval["execution_mode"] in {SUPERVISED_MODE, AUTONOMOUS_MODE},
+            "Live settlement permission must name an explicit one-contract execution mode")
+    require(approval["verification_route"] in {MACHINE, MANUAL, MANUAL_AUTONOMOUS}, "Invalid live verification route")
+    require(approval["execution_mode"] != AUTONOMOUS_MODE or approval["verification_route"] in {MACHINE, MANUAL_AUTONOMOUS},
+            "Autonomous execution requires machine-readable verification or a distinct manual autonomous approval")
+    if manual_autonomous:
+        from manual_autonomous_settlement import REQUIRED_LIMITATIONS
+        require(approval["execution_mode"] == AUTONOMOUS_MODE and type(approval["evidence_version"]) is int
+                and approval["evidence_version"] == 1, "Manual autonomous permission has invalid evidence version/mode")
+        require(isinstance(approval["limitations"], list)
+                and all(value in approval["limitations"] for value in REQUIRED_LIMITATIONS),
+                "Manual autonomous approval must explicitly acknowledge all settlement/execution limitations")
     require(isinstance(approval["evidence_hash"], str) and re.fullmatch(r"[0-9a-f]{64}", approval["evidence_hash"]),
             "Missing exact approved live evidence hash")
     for key in ("source_refs", "limitations"):
@@ -78,11 +104,11 @@ def validate_authorization(approval):
                 and all(isinstance(value, str) and value.strip() for value in approval[key]),
                 "Live approval must record official sources and limitations")
     require(approval["source_refs"] == evidence_sources(approval), "Live evidence sources do not match the authorized IDs/route")
-    parse_api_timestamp(approval["approved_at"])
+    require(parse_api_timestamp(approval["approved_at"]).tzinfo is not None, "Approval time must include a timezone")
 
 
-def load_authorizations():
-    """Reread explicit permissions every time; an empty file approves nothing."""
+def _load_authorizations(path, tier=None):
+    """Strict shared JSON reader; the separate tier cannot enter the old file."""
     def unique_fields(fields):
         result = {}
         for key, value in fields:
@@ -91,14 +117,18 @@ def load_authorizations():
         return result
 
     try:
-        data = json.loads(APPROVAL_PATH.read_text(), object_pairs_hook=unique_fields)
-        require(isinstance(data, dict) and set(data) == {"version", "allowed_mode", "pairs"}
+        data = json.loads(path.read_text(), object_pairs_hook=unique_fields)
+        fields = {"version", "allowed_mode", "pairs"} | ({"authorization_tier"} if tier else set())
+        require(isinstance(data, dict) and set(data) == fields
                 and type(data["version"]) is int and data["version"] == 1
                 and data["allowed_mode"] == config.LIVE_PILOT and isinstance(data["pairs"], list),
                 "Live authorization configuration has invalid version/mode")
+        require(tier is None or data["authorization_tier"] == tier, "Wrong settlement authorization tier")
         seen = set()
         for approval in data["pairs"]:
             validate_authorization(approval)
+            require((approval["verification_route"] == MANUAL_AUTONOMOUS) == (tier == MANUAL_AUTONOMOUS),
+                    "Manual autonomous approval must be in its own explicit configuration")
             identity = (approval["tournament_id"], tuple(sorted(approval["market_ids"])))
             require(identity not in seen, "Duplicate live settlement authorization")
             seen.add(identity)
@@ -107,8 +137,36 @@ def load_authorizations():
         raise LiveSettlementBlocked("Live authorization configuration is missing or invalid; manual review required") from error
 
 
-def configured_authorization(market_ids, tournament_id=None, slug="midterm-elections"):
-    authorizations = load_authorizations()
+def load_authorizations():
+    """Existing supervised/machine permissions; no paper or new-tier permission."""
+    return _load_authorizations(APPROVAL_PATH)
+
+
+def load_manual_autonomous_authorizations():
+    return _load_authorizations(MANUAL_AUTONOMOUS_PATH, MANUAL_AUTONOMOUS)
+
+
+def autonomous_authorizations():
+    """Prefer an explicitly configured machine tier; never downgrade its failure.
+
+    The two files are independently strict. A malformed approval blocks use,
+    rather than disappearing into a fallback. No permission is synthesized.
+    """
+    machine = [entry for entry in load_authorizations() if entry["execution_mode"] == AUTONOMOUS_MODE]
+    identities = {(entry["tournament_id"], tuple(sorted(entry["market_ids"]))) for entry in machine}
+    manual = [entry for entry in load_manual_autonomous_authorizations()
+              if (entry["tournament_id"], tuple(sorted(entry["market_ids"]))) not in identities]
+    return machine + manual
+
+
+def authorization_tier(approval):
+    if approval["execution_mode"] == AUTONOMOUS_MODE:
+        return MACHINE_AUTONOMOUS if approval["verification_route"] == MACHINE else MANUAL_AUTONOMOUS
+    return approval["verification_route"]
+
+
+def configured_authorization(market_ids, tournament_id=None, slug="midterm-elections", execution_mode=SUPERVISED_MODE):
+    authorizations = autonomous_authorizations() if execution_mode == AUTONOMOUS_MODE else load_authorizations()
     matches = [entry for entry in authorizations if set(entry["market_ids"]) == set(market_ids)
                and (tournament_id is None or entry["tournament_id"] == tournament_id)]
     if not matches:
@@ -119,13 +177,15 @@ def configured_authorization(market_ids, tournament_id=None, slug="midterm-elect
         raise LiveSettlementBlocked("Pair is not explicitly live-approved", NOT_AUTHORIZED)
     require(len(matches) == 1 and matches[0]["market_ids"] == market_ids and matches[0]["tournament_slug"] == slug,
             "Authorized pair ID order or tournament slug changed")
+    require(matches[0]["execution_mode"] == execution_mode, "Authorized execution mode differs from the requested mode")
     return matches[0]
 
 
 def revalidate_authorization(approval):
     """Revocation or edits during a check need review, even if now unlisted."""
     try:
-        current = configured_authorization(approval["market_ids"], approval["tournament_id"], approval["tournament_slug"])
+        current = configured_authorization(approval["market_ids"], approval["tournament_id"], approval["tournament_slug"],
+                                           execution_mode=approval["execution_mode"])
         require(current == approval, "Live authorization changed during readiness checks")
     except LiveSettlementBlocked as error:
         raise LiveSettlementBlocked("Previously selected live authorization was removed, changed or is invalid") from error
@@ -141,6 +201,16 @@ def verify_settlement(session, markets, tournament_id, approval):
         quarantine.require_unblocked_exchanges(approval["exchange_ids"])
         if approval["verification_route"] == MACHINE:
             allowed, context = scanner.get_pair_rules(session, *markets, tournament_id)
+        elif approval["verification_route"] == MANUAL_AUTONOMOUS:
+            from manual_autonomous_settlement import read_evidence
+            evidence = read_evidence(session, markets, approval)
+            require(evidence["evidence_hash"] == approval["evidence_hash"],
+                    "Manual autonomous IDs, mapping, rules, sources or policy content changed")
+            context = {"mode": MANUAL_AUTONOMOUS, "tournament_id": tournament_id,
+                       "market_ids": approval["market_ids"], "exchange_ids": approval["exchange_ids"],
+                       "settlement_fingerprint": evidence["evidence_hash"], "manual_evidence": evidence,
+                       "authorization_tier": MANUAL_AUTONOMOUS, "machine_verified": False}
+            allowed = {"NO-PAIR"}
         else:
             # The existing reader supports only the reviewed official 153/154
             # wording. Reusing it neither infers compatibility nor prepares orders.

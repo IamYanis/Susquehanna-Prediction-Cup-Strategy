@@ -1,8 +1,9 @@
-"""Disabled pilot diagnostics and accounting. No order preparation or submission.
+"""Disabled pilot diagnostics and shared durable allocation/execution state.
 
 This module reads existing account/journal data and saves pilot accounting.
-It never saves an execution intent, allocates an idempotency key, or calls an
-exchange write endpoint. Even selecting LIVE_PILOT cannot enable submission.
+Its diagnostic commands never build requests or call exchange write endpoints.
+The separate disabled autonomous coordinator can embed its execution journal in
+the SAME atomic allocation write. Selecting LIVE_PILOT here cannot submit.
 """
 import argparse
 import copy
@@ -38,6 +39,11 @@ ALLOCATION_PATH = Path(__file__).resolve().with_name("live_pilot_allocation.json
 UNCERTAIN_STATES = {"SUBMITTING", "UNKNOWN", "CANCEL_REQUESTED", "CANCEL_UNKNOWN", "EXECUTING", "CANCELLING"}
 DISABLED, READY, EXECUTING, HALTED = "DISABLED", "READY", "EXECUTING", "HALTED_MANUAL_REVIEW"
 PILOT_STATES = {DISABLED, READY, EXECUTING, HALTED}
+LEG1_SUBMITTING, LEG1_RECONCILING, LEG2_RECHECK = "LEG1_SUBMITTING", "LEG1_RECONCILING", "LEG2_RECHECK"
+LEG2_SUBMITTING, FINAL_RECONCILING = "LEG2_SUBMITTING", "FINAL_RECONCILING"
+EXECUTION_STATES = {EXECUTING, LEG1_SUBMITTING, LEG1_RECONCILING, LEG2_RECHECK,
+                    LEG2_SUBMITTING, FINAL_RECONCILING}
+PILOT_STATES |= EXECUTION_STATES
 # Reentry is allowed only for the same process/thread already holding this lock.
 # Independent processes/threads still have to acquire the OS lock themselves.
 _state_lock_owners = {}
@@ -104,10 +110,14 @@ def refresh_totals(checkpoint):
     """Calculate derived fields before saving; loading never repairs bad totals."""
     debits = sum((amount(cost) for cost in checkpoint["accounted_pair_costs"].values()), Decimal(0))
     confirmed = reserved = Decimal(0)
-    for exposure in checkpoint["live_exposures"].values():
-        confirmed += sum((amount(cost) for cost in exposure["confirmed_costs"]), Decimal(0))
+    for key, exposure in checkpoint["live_exposures"].items():
+        position = checkpoint.get("autonomous_positions", {}).get(key)
+        basis = sum((amount(cost) * amount(q) for cost, q in zip(exposure["confirmed_costs"],
+                    position["remaining_quantities"])), Decimal(0)) if position else sum(map(amount, exposure["confirmed_costs"]))
+        confirmed += basis if position else max(basis, amount(exposure.get("capital_charge", 0)))
         reserved += sum((amount(quantity) * amount(price) for quantity, price in
                          zip(exposure["possible_additional_quantities"], exposure["limit_prices"])), Decimal(0))
+        reserved += amount(exposure.get("accounting_buffer", 0))
     checkpoint["confirmed_cumulative_debits"] = str(debits)
     checkpoint["reserved_unconfirmed_capital"] = str(reserved)
     checkpoint["total_live_exposure"] = str(confirmed + reserved + amount(checkpoint["quarantine_reserve"]))
@@ -143,8 +153,10 @@ def validate_checkpoint(checkpoint):
         "manual_review_required", "review_reason", "configured_allocation", "confirmed_cumulative_debits",
         "live_exposures", "quarantine_reserve", "reserved_unconfirmed_capital", "total_live_exposure",
         "calculated_remaining_allocation", "state", "revision", "created_at", "updated_at"}
-    require(isinstance(checkpoint, dict) and set(checkpoint) in
-            (fields, fields | {"baseline_snapshot", "baseline_snapshot_hash"}),
+    optional = {"baseline_snapshot", "baseline_snapshot_hash", "autonomous_execution", "autonomous_positions"}
+    require(isinstance(checkpoint, dict) and fields.issubset(checkpoint)
+            and not set(checkpoint) - fields - optional
+            and ("baseline_snapshot" in checkpoint) == ("baseline_snapshot_hash" in checkpoint),
         "Invalid pilot allocation checkpoint")
     require(type(checkpoint["version"]) is int and checkpoint["version"] == 2
             and isinstance(checkpoint["tournament_id"], str)
@@ -154,6 +166,8 @@ def validate_checkpoint(checkpoint):
             "Configured pilot allocation must remain 5000")
     require(checkpoint["state"] in PILOT_STATES and type(checkpoint["revision"]) is int
             and checkpoint["revision"] >= 0, "Invalid pilot state/revision")
+    require(checkpoint["state"] not in EXECUTION_STATES - {EXECUTING} or "autonomous_execution" in checkpoint,
+            "Autonomous execution state is missing its durable journal")
     created, updated = (parse_api_timestamp(checkpoint[key]) for key in ("created_at", "updated_at"))
     require(created.tzinfo is not None and updated.tzinfo is not None and updated >= created,
             "Invalid pilot timestamp metadata")
@@ -167,7 +181,8 @@ def validate_checkpoint(checkpoint):
         require(isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
                 and amount(cost) <= config.MAX_LIVE_CAPITAL_PER_TRADE, "Invalid pilot accounted trade")
     spent = sum((amount(cost) for cost in costs.values()), Decimal(0))
-    require(amount(checkpoint["allocated_cash_remaining"]) == allocated - spent,
+    credits = sum((amount(p["allocation_credit"]) for p in checkpoint.get("autonomous_positions", {}).values()), Decimal(0))
+    require(amount(checkpoint["allocated_cash_remaining"]) == min(allocated, allocated - spent + credits),
             "Pilot allocation does not match confirmed debits")
     amount(checkpoint["last_reconciled_account_cash"])
     require(type(checkpoint["manual_review_required"]) is bool
@@ -183,15 +198,18 @@ def validate_checkpoint(checkpoint):
                     "possible_additional_quantities", "limit_prices", "execution_status"}
         require(isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
                 and isinstance(exposure, dict) and set(exposure) in
-                (exposure_fields, exposure_fields | {"observed_cash_debit"}), "Invalid saved pilot exposure")
+                (exposure_fields, exposure_fields | {"observed_cash_debit"},
+                 exposure_fields | {"capital_charge", "accounting_buffer"}), "Invalid saved pilot exposure")
         require(exposure["position_type"] == "NO-PAIR", "Unsupported pilot exposure direction")
         for key in ("market_ids", "exchange_ids"):
             ids = exposure[key]
             require(isinstance(ids, list) and len(ids) == 2 and len(set(ids)) == 2
                     and all(isinstance(value, str) and scanner.numeric_id(value) == value for value in ids),
                     "Invalid saved pilot instrument IDs")
-        require(not seen_exchanges.intersection(exposure["exchange_ids"]), "Duplicate saved pilot exchange exposure")
-        seen_exchanges.update(exposure["exchange_ids"])
+        position = checkpoint.get("autonomous_positions", {}).get(fingerprint)
+        if position is None or position["status"] != "CLOSED":
+            require(not seen_exchanges.intersection(exposure["exchange_ids"]), "Duplicate saved pilot exchange exposure")
+            seen_exchanges.update(exposure["exchange_ids"])
         for key in ("confirmed_quantities", "confirmed_costs", "possible_additional_quantities", "limit_prices"):
             require(isinstance(exposure[key], list) and len(exposure[key]) == 2, "Incomplete saved pilot exposure")
         for quantity, cost, pending, price in zip(exposure["confirmed_quantities"], exposure["confirmed_costs"],
@@ -203,7 +221,14 @@ def validate_checkpoint(checkpoint):
         # The supervised accounting probe observes cash separately from position
         # cost. None means the debit could not be attributed: keep the exposure,
         # charge nothing as confirmed, and retain the mandatory review halt.
-        if "observed_cash_debit" in exposure:
+        if "capital_charge" in exposure:
+            require("autonomous_execution" in checkpoint, "Assumption-based charge lacks its execution evidence")
+            known_debit = amount(exposure["capital_charge"])
+            require(known_debit >= known_cost and known_debit <=
+                    sum(map(amount, exposure["limit_prices"])) + Decimal(".04")
+                    and amount(exposure["accounting_buffer"]) in {Decimal(0), Decimal(".04")},
+                    "Invalid conservative autonomous charge/buffer")
+        elif "observed_cash_debit" in exposure:
             require(checkpoint["state"] == HALTED and exposure["execution_status"] == "MANUAL_REVIEW",
                     "Observed probe cash accounting requires a persistent review halt")
             debit = exposure["observed_cash_debit"]
@@ -218,7 +243,7 @@ def validate_checkpoint(checkpoint):
                     and list(map(amount, exposure["possible_additional_quantities"])) == [0, 0],
                     "Reconciled saved pair is incomplete")
         else:
-            require(checkpoint["state"] in {EXECUTING, HALTED}, "Unfinished exposure cannot be READY or DISABLED")
+            require(checkpoint["state"] in EXECUTION_STATES | {HALTED}, "Unfinished exposure cannot be READY or DISABLED")
     calculated = copy.deepcopy(checkpoint)
     refresh_totals(calculated)
     require(all(amount(checkpoint[key]) == amount(calculated[key]) for key in (
@@ -245,6 +270,13 @@ def validate_checkpoint(checkpoint):
                 and all(isinstance(snapshot[key], list) for key in
                         ("recent_fills", "recent_transactions", "order_activity")),
                 "Incomplete saved baseline reconciliation evidence")
+    if "autonomous_execution" in checkpoint:
+        # Import lazily: the coordinator itself reuses this state/risk module.
+        from autonomous_pilot import validate_journal
+        validate_journal(checkpoint)
+    if "autonomous_positions" in checkpoint:
+        from autonomous_pilot import validate_positions as validate_autonomous_positions
+        validate_autonomous_positions(checkpoint)
 
 
 def snapshot_hash(snapshot):
@@ -304,8 +336,14 @@ def _save_checkpoint_locked(checkpoint, path, new=False):
                         current["observed_cash_debit"] is not None and
                         amount(current["observed_cash_debit"]) >= amount(exposure["observed_cash_debit"])),
                         "Observed probe debit cannot be forgotten or decreased")
+            if "capital_charge" in exposure:
+                require("capital_charge" in current and amount(current["capital_charge"]) >= amount(exposure["capital_charge"]),
+                        "Conservative autonomous charges cannot disappear or decrease")
         require(amount(proposed["quarantine_reserve"]) >= amount(previous["quarantine_reserve"]),
                 "Saved quarantine reserve cannot disappear")
+        if "autonomous_execution" in previous:
+            from autonomous_pilot import validate_update
+            validate_update(previous, proposed)
     proposed["revision"] += 1
     proposed["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     validate_checkpoint(proposed)
@@ -333,7 +371,7 @@ def _save_checkpoint_locked(checkpoint, path, new=False):
 
 def _load_checkpoint_locked(path):
     checkpoint = _read_checkpoint_locked(path)
-    if checkpoint["state"] == EXECUTING:
+    if checkpoint["state"] in EXECUTION_STATES:
         checkpoint = halted_result(checkpoint, "Restart found unfinished execution; manual review required")["checkpoint"]
         checkpoint = _save_checkpoint_locked(checkpoint, path)
     return checkpoint
@@ -399,7 +437,12 @@ def require_execution_clear(checkpoint):
     """New uncertainty halts globally; the existing frozen quarantine is separate."""
     validate_checkpoint(checkpoint)
     require(not checkpoint["manual_review_required"], "Pilot halted for manual review; no further live trading")
-    require(checkpoint["state"] != EXECUTING, "Unfinished pilot execution requires manual review before another pair")
+    require(checkpoint["state"] not in EXECUTION_STATES, "Unfinished pilot execution requires manual review before another pair")
+    require_external_execution_clear()
+
+
+def require_external_execution_clear():
+    """Legacy/probe coordinators must not overlap an autonomous execution."""
     quarantined = quarantine.load_quarantine()  # Verifies frozen source journal hashes.
     if single.STATE_PATH.exists():
         single.load_intent(single.STATE_PATH)
@@ -430,11 +473,15 @@ def pilot_risk(account, exchange_ids, proposed_capital, quantity, checkpoint):
     require(cash >= reserve_floor, "Account cash is below the untouchable reserve; manual review required")
     positions = {scanner.numeric_id(row["exchangeId"]): row for row in account["positions"]}
     stored_holdings = Decimal(0)
-    for exposure in checkpoint["live_exposures"].values():
+    for key, exposure in checkpoint["live_exposures"].items():
+        position = checkpoint.get("autonomous_positions", {}).get(key)
+        if position is None:
+            stored_holdings += max(Decimal(0), amount(exposure.get("capital_charge", 0))
+                                   - sum(map(amount, exposure["confirmed_costs"])))
         for market_id, exchange_id, held_quantity, held_cost in zip(exposure["market_ids"], exposure["exchange_ids"],
-                                                         exposure["confirmed_quantities"], exposure["confirmed_costs"]):
+                    position["remaining_quantities"] if position else exposure["confirmed_quantities"], exposure["confirmed_costs"]):
             q, c = amount(held_quantity), amount(held_cost)
-            stored_holdings += c
+            stored_holdings += q * c if position else c
             if q:
                 row = positions.get(exchange_id)
                 require(row is not None and scanner.numeric_id(row["marketId"]) == market_id
@@ -563,6 +610,18 @@ def halted_result(checkpoint, reason, legs=None):
     updated = copy.deepcopy(checkpoint)
     updated["state"], updated["manual_review_required"] = HALTED, True
     updated["review_reason"] = updated["review_reason"] or reason
+    journal = updated.get("autonomous_execution")
+    if journal and journal["active_attempt"] is not None:
+        attempt = journal["attempts"][journal["active_attempt"]]
+        attempt["halted_from"] = attempt.get("halted_from") or attempt["state"]
+        attempt["state"], attempt["halt_reason"] = HALTED, updated["review_reason"]
+        exposure = updated["live_exposures"][journal["active_attempt"]]
+        exposure["execution_status"] = "MANUAL_REVIEW"
+        for index, leg in enumerate(attempt["legs"]):
+            # A leg with no write-ahead POST marker was never submitted. A
+            # marker without a receipt remains possible exposure indefinitely.
+            if not leg["post_attempted"]:
+                exposure["possible_additional_quantities"][index] = "0"
     refresh_totals(updated)
     return {"checkpoint": updated, "status": "MANUAL_REVIEW", "reason": updated["review_reason"],
             "observed_legs": legs, "live_eligible": False, "submission_enabled": False}

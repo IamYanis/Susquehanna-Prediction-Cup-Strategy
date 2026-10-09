@@ -35,7 +35,7 @@ import price_reader as scanner
 MODE = "SUPERVISED_ACCOUNTING_PROBE"
 QUANTITY_PER_LEG = 1
 MAX_PAIR_DEBIT = Decimal("1")
-# Diagnostic gross margin, separate from the unchanged 2% LIVE_PILOT policy.
+# Diagnostic gross margin; the autonomous coordinator now also requires 0.5%.
 # One 0.005 price tick is the smallest positive one-contract ordinary edge.
 PROBE_MIN_EDGE = Decimal("0.005")
 JOURNAL_PATH = Path(__file__).resolve().with_name("accounting_probe.json")

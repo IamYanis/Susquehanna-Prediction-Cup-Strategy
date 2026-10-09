@@ -1,11 +1,373 @@
-# Disabled live-pilot layer
+# Autonomous v0.1 — submission disabled
+
+## Current lifecycle
+
+The executable foreground strategy lives in `autonomous_pilot.py` and reuses the
+existing authorization, account reader, order/fill reconciliation, atomic pilot
+checkpoint and process flock. The paper scanner and supervised probe are separate.
+
+```text
+15-second loop, one exclusive process lock
+  -> reconcile existing positions and settlement ledger credits
+  -> scan exact autonomous allowlist; rank by entry edge, then executable depth
+  -> buy 1 NO share, reconcile, refresh, buy 1 NO share, reconcile
+  -> persist completed pair -> HOLD
+  -> backed early sells OR official settlement credits -> CLOSED + realized P&L
+  -> recycle confirmed principal within the fixed 5,000 allocation -> repeat
+Any ambiguous/partial submission or unexplained reconciliation -> persistent HALT
+```
+
+One candidate is entered per cycle. A cycle that executes an early exit does not
+also enter another pair. Completed positions remain in the same checkpoint as
+`autonomous_positions`; entry intents/receipts, gross debits and sale keys remain
+in history. Confirmed remaining quantities determine current exposure, so a closed
+trade frees exposure without erasing entry evidence. A still-open pair cannot be
+entered again. A previously closed pair may be entered again only while its
+markets remain open and every fresh entry gate passes.
+
+### Entry and completion
+
+Entry ordinary edge is `Decimal("1.000") - tick-rounded executable NO buy limits`.
+It must be >= **0.005**. Depth must cover exactly **one** share; autonomous v0.1
+does not require the older diagnostic tooling's arbitrary 50-share minimum.
+The probe and legacy preview retain their own existing depth policies.
+
+After the confirmed first fill, the second leg uses fresh limits and:
+
+```text
+completion edge >= max(0.000, initial quoted edge - 0.005)
+second buy limit <= original second limit + 0.005
+```
+
+The absolute completion floor is now **zero**, as requested for v0.1: a 0.5% entry
+can complete at break-even after one adverse tick. Negative completion fails.
+The relative deterioration and price limits remain unchanged. Partial/unknown
+leg one stops; no automatic retry or second leg occurs after restart.
+
+### HOLD, early exit and settlement
+
+Default action is HOLD. NO executable sell bids come from `1 - YES ask`, rounded
+down to the 0.005 tick. Both sell quotes must be fresh and cover the entire held
+quantity. Sell only if combined proceeds are at least **1.010**; trading above
+entry cost alone is insufficient. Every sell is backed by exactly one owned,
+unsettled NO share, preventing an oversized sell from becoming an opposite buy.
+The first sell is reconciled before the second, which must still complete at
+>=1.010 with no more than one tick of adverse price movement. Failure preserves
+the remaining holding and halts; the strategy never chases or retries.
+
+A market merely being `closed` means HOLD while awaiting settlement. A cleared
+holding must have a matching scoped official `settlement` transaction, with its
+`amount` treated as the cash payout/refund. Zero-payout events also count. Each
+leg can settle separately; its event is credited only once. Both settled legs
+close the pair and release the remaining exposure. Unexplained disappearing
+holdings or cash movements require review.
+Settlement reads continue after the tournament becomes inactive; new entries
+and early sales still require an active tournament account.
+
+Each position records the pair, exact market/exchange IDs, entry timestamp and
+actual prices/edge, quantity, remaining holdings, exit timestamp/reason
+(`EARLY_EXIT` or `SETTLEMENT`), proceeds, realized P&L and execution notes.
+P&L uses actual fill notionals or authoritative settlement amounts. The existing
+0.02 balance reconciliation tolerance remains an assumption about displayed
+rounding, not formal accounting proof. No manual trial is required.
+The probe's separate requirement to prove a <=1-SUSQie debit from rounded
+balances is not an autonomous blocker (for example a valid .990 + .005 pair).
+Actual fills, holdings, ledger/cash consistency, reserved capital and the live
+50-per-trade limit remain mandatory; the supervised probe is unchanged.
+After each known entry/sale receipt, a single 2.1-second wait lets the documented
+two-second tournament balance cache expire before reconciliation. No POST is
+repeated; state that still cannot be reconciled requires manual review.
+
+### Fixed allocation and enabling
+
+Limits remain **5,000 allocation, 50 per trade, 100 per race, 500 total exposure,
+one contract per leg**. Only confirmed returned principal replenishes allocation;
+profits and unrelated account cash cannot enlarge the budget. Losses remain
+charged after restart. Gross debits and closed-trade history cannot be deleted.
+Exact machine-authorized pairs remain preferred; exact
+`MANUAL_AUTONOMOUS_APPROVAL` records work without a relationship graph. No
+allowlist entries have been created by this implementation.
+
+The single autonomous submission switch is:
+
+```python
+# config.py — currently False
+AUTONOMOUS_LIVE_PILOT_ENABLED = True
+```
+
+After deliberately enabling it, the foreground command is:
+
+```bash
+.venv/bin/python autonomous_pilot.py
+```
+
+The older `LIVE_PILOT_SUBMISSION_ENABLED` switch is not required for v0.1 and
+remains False. With the autonomous switch False, this command exits before
+credentials, API reads, state writes or order preparation. The current autonomous
+allowlists are empty; an exact authorized pair is still required before entry.
+An unfinished buy or sale on restart remains halted. No automatic halt clearing,
+ambiguous POST retry, background startup or watcher restart exists.
+
+Official schema references: [API](https://sig.thesuper.market/api/v1/docs),
+[trading](https://sig.thesuper.market/docs/markets-and-trading),
+[settlement payouts](https://sig.thesuper.market/docs/settlement-and-payouts).
+
+### Implementation and validation
+
+Files changed for v0.1: `autonomous_pilot.py`, `config.py`, `live_pilot.py`,
+`pilot_account.py`, `account_reader.py`, `order_preview.py`,
+`test_autonomous_lifecycle.py`, `test_autonomous_pilot.py`,
+`test_manual_autonomous_settlement.py`, and this document.
+
+**116 focused tests and 605 full-suite tests passed.** The 17 new lifecycle
+tests include a full mocked .800 entry -> HOLD at .980 -> EARLY_EXIT at 1.010
+(P&L .210) -> re-entry -> settlement at 1.000 (P&L .200). They also cover ordinary
+market closure, staggered/zero payouts, inactive-tournament settlement, principal
+recycling, persistent losses, duplicate positions, backing/depth, ranking,
+partial/ambiguous sells, adverse second-sale quotes, cash mismatches, crash/restart,
+disabled startup, high-priced first legs and cached post-trade account balances.
+Production `.env`, approval files, paper state, allocation state and execution
+journals were fingerprinted and remained unchanged. Both submission flags remain
+False. No real order or commit was made.
+
+## Earlier implementation and audit history
+
+The current v0.1 policy above supersedes older descriptions below of the two
+enable switches, 50-share autonomous depth, completion floor, buy-only exposure
+accounting and disabled-only entry point. Historical audit results are retained.
+
+## Autonomous coordinator: implemented, submission disabled
+
+`autonomous_pilot.py` implements the bounded state machine below. Both
+`LIVE_PILOT_SUBMISSION_ENABLED` and `AUTONOMOUS_LIVE_PILOT_ENABLED` remain
+**False**. There is no CLI enable flag, no execution command connected to the
+paper scanner, and no new LIVE authorization. Running
+`.venv/bin/python autonomous_pilot.py` prints disabled policy information without
+loading credentials, making API calls, writing state or creating keys/intents.
+The execution coordinator and loop are exercised using fake HTTP and temporary
+state only. Do not enable these switches as part of running a readiness report.
+
+The current autonomous minimum ordinary edge is **0.5%**,
+`MIN_EDGE = Decimal("0.005")`, matching the supervised probe's separate fixed
+minimum. `observed_autonomous_limits` applies it at detection, repeated full
+preflight, after intent persistence, and immediately before leg-one submission.
+It reuses the shared freshness/depth/tick checks and computes
+`Decimal("1.000") - tick-rounded pair notional`; zero and negative edges fail.
+The legacy live preview retains its separate 2% policy. Historical 2% audit
+results later in this document describe the policy at the time of those audits.
+
+Threshold regression tests cover exact 0.005 acceptance, strict rejection of
+0.004999.../zero/negative edges, tick rounding before economics, all four entry
+checks, all three completion checks, both autonomous authorization tiers, and
+the retained deterioration limits. Validation: **171 focused tests passed;
+588 full-suite tests passed**. Only fake submissions and temporary state were
+used; submission switches, authorizations and runtime files remain unchanged.
+
+```text
+DISABLED -> READY -> LEG1_SUBMITTING -> LEG1_RECONCILING
+         -> LEG2_RECHECK -> LEG2_SUBMITTING -> FINAL_RECONCILING -> READY
+Any uncertainty, discrepancy or unacceptable completion -> HALTED_MANUAL_REVIEW
+Restart in ANY execution stage -> HALTED_MANUAL_REVIEW; never resume a POST
+```
+
+DISABLED is the configuration default. Under a future explicitly enabled run,
+READY is persisted only after complete preflight, and again only after complete
+two-leg reconciliation. The full autonomous loop holds the existing exclusive
+pilot flock for its lifetime. The per-candidate coordinator uses the same lock
+for its whole lifecycle. It never reads paper cash/positions for live recovery.
+
+Autonomous authorization has this explicit precedence:
+
+1. `MACHINE_VERIFIED_AUTONOMOUS`: a machine-verified, autonomous-one-contract
+   entry in `live_approved_settlements.json`.
+2. `MANUAL_AUTONOMOUS_APPROVAL`: a separately reviewed entry in
+   `manual_autonomous_approvals.json`, described below.
+3. Otherwise blocked. Paper and supervised-only approvals grant neither tier.
+
+An existing machine approval is preferred. If its graph/rules fail verification,
+execution halts rather than silently switching to a manual interpretation.
+Each tier requires its own explicit approval; neither file is populated or
+changed by a scanner. Both currently contain no autonomous authorization.
+Manual interpretation remains an assumption accepted by a human, not an
+engine-backed relationship guarantee. Submission switches remain **False**.
+
+### Separate manual autonomous approval
+
+`manual_autonomous_approvals.json` starts empty and contains only:
+
+```json
+{
+  "version": 1,
+  "allowed_mode": "LIVE_PILOT",
+  "authorization_tier": "MANUAL_AUTONOMOUS_APPROVAL",
+  "pairs": []
+}
+```
+
+Each future human-approved entry has the existing live record fields: approval
+version/time, pair label, tournament UUID/slug, ordered market/exchange IDs,
+`relationship_type: "mutually_exclusive"`, `position_types: ["NO-PAIR"]`,
+`max_quantity: 1`, `execution_mode: "autonomous-one-contract"`, reviewed
+settlement rationale, exact source URLs, evidence SHA-256 and limitations.
+Its distinct `verification_route` is `"MANUAL_AUTONOMOUS_APPROVAL"` and it also
+requires `evidence_version: 1`. Such records are rejected in the old live file;
+machine/supervised records are rejected in the new file. Duplicate entries,
+malformed JSON, missing files and mismatched IDs/scope fail closed.
+
+`manual_autonomous_settlement.read_evidence` is GET-only. It resolves the exact
+tournament UUID from its slug, checks the open scoped market/exchange IDs,
+reads both complete resolution roots and fetches actual official settlement
+policy HTML. The SHA-256 binds every approval field except the hash itself,
+including the human's rationale, limitations, timestamp/version and source
+URLs, plus stable open instrument metadata, full roots and the policy-content
+SHA-256. Indicative prices and account cash are not settlement evidence.
+The source list is fixed, in this order:
+
+- `/tournaments/{slug}`;
+- both `/markets/{id}?tournamentId={uuid}` URLs;
+- both `/markets/{id}/nodes?tournamentId={uuid}` URLs;
+- `https://sig.thesuper.market/docs/settlement-and-payouts`.
+
+The reader never infers compatibility from titles, matching race fields or an
+approval of another race. It does not create approval times or write approvals.
+A human must examine the exact evidence and explicitly accept that the two YES
+outcomes cannot both hold under the same ordinary settlement interpretation.
+The approval must acknowledge all four limitations in `REQUIRED_LIMITATIONS`,
+plus any pair-specific ambiguity: cancellation/N/A/refunds, administrator
+rulings, manual/independent settlement and partial/UNKNOWN/one-sided execution.
+Contradictory winner affiliations, different stages/dates/reference times,
+ties, joint candidacies and overrides need explicit review; the hash cannot
+prove the human interpretation correct. Exceptional settlements may lose money.
+
+Every preflight and leg-two settlement check refetches the evidence and compares
+the approved hash. Changed IDs/mapping/status, roots, sources or policy return
+`LIVE_SETTLEMENT_NEEDS_REVALIDATION`; the existing coordinator persists its
+manual-review halt and never clears it automatically. Full HTML hashing also
+blocks cosmetic/document deployments, conservatively requiring reapproval.
+Permission edits/revocation/tier changes are checked again before each POST and
+halt an existing attempt rather than changing its saved binding. Restart still
+halts unfinished executions and never submits another leg.
+
+This tier changes only settlement permission. All existing checks remain:
+quarantine, fresh official quotes/account data, depth >=50, tick-rounded
+ordinary edge >=0.005, one contract per leg, duplicates/open orders, fixed
+5000 allocation, 50/100/500 capital caps, durable state, immediate accounting
+reconciliation and persistent halts. No approval, submission enable switch or
+real order has been added by implementing this tier.
+
+### Detection, submission and recovery
+
+The coordinator reuses the existing market/relationship verifier, full scoped
+account/history reader, quarantine reserve, duplicate/exposure/risk checks,
+freshness/depth/tick helpers and one-share order/fill validator. Detection is
+GET-only. Every gate is repeated before creating an execution, and quotes and
+authorization are checked again after the final write-ahead fsync before each
+POST. Exactly one NO contract per leg is enforced. The hard limits remain 5000
+allocation, 50 per trade, 100 per race, 500 total exposure, quantity 1 and >=.005
+initial edge. A prospective rounding/completion reserve counts toward these
+limits too. Idle cycles use the existing 15-second cadence and API cooldown.
+
+The optional `autonomous_execution` section is stored **inside** the existing
+version-2 allocation checkpoint. Old checkpoints still load unchanged. This
+keeps allocation reserves, stage, exact intent and idempotency key in one
+fsync/replace/directory-fsync transaction, without a two-file commit gap. It
+records the explicit authorization, initial account/quotes, stage history,
+secret-redacted raw responses, both receipts, order/fill observations, full
+after-snapshots and accounting reviews. Completed attempts and their keys are
+retained; keys and request bodies cannot change or disappear after persistence.
+Duplicate generated keys halt; they are never regenerated to retry an order.
+The checkpoint and its temporary files remain ignored by Git.
+
+Each leg has a durable `post_attempted` marker written before its single POST.
+A timeout, HTTP error, missing/malformed receipt, partial/resting/rejected order,
+unavailable reporting or reporting disagreement halts the pilot. There is no
+POST retry, lookup that guesses a lost receipt ID, cancellation, automatic sale,
+hedging loop or automatic halt-clear command. The order has a 30-second expiry;
+expiry alone never releases possible exposure. All unfinished stages are
+latched HALTED on restart; no automatic second leg is submitted. Missing/corrupt
+state fails closed and is never reconstructed from paper state.
+
+### Leg-two completion rule
+
+Only a closed, fully reconciled first-leg receipt/order/fills/inventory/ledger
+and balance can advance to LEG2_RECHECK. Settlement, account inventory/history,
+quarantine, capital and duplicate checks are repeated, and leg two gets a fresh
+authoritative book. Both quantity and existing depth-of-50 policy remain intact.
+Using Decimal and the executable tick-rounded NO buy limit:
+
+```text
+completion edge = 1.000 - actual confirmed leg-one fill notional - leg-two limit
+required edge = max(0.005, initial executable edge - 0.005)
+leg-two limit <= original leg-two limit + 0.005
+```
+
+The absolute completion floor was lowered from 0.020 to 0.005 with the entry
+floor; otherwise an unchanged 0.5% entry could not complete. Both deterioration
+limits remain unchanged: at most 0.005 loss of initial edge and at most 0.005
+increase in leg-two price. Completion must still have strictly positive edge.
+The same completion checker runs on the fresh quote, after intent persistence,
+and immediately before the second POST.
+
+Both completion conditions must pass. Favorable first-leg fills count, but they
+never permit unlimited leg-two price chasing. Initial risk accounting reserves
+the original first limit and a second-limit ceiling one tick higher, plus the
+rounding buffer. A deteriorated/stale quote, changed account, revoked settlement
+permission or failed completion rule stops at one-sided exposure and HALTS.
+Known quantities/costs are saved immediately. Uncertain submitted remainders
+stay fully reserved; an unattempted second leg is recorded as unsubmitted and
+cannot resume automatically. Reconciliation, not price valuation or expiration,
+determines whether inventory/reserves can ever be resolved manually.
+
+### Historical accounting assumption and conservative capital charges
+
+The explicit policy is
+`HISTORICALLY_RECONCILED_ZERO_EXTRA_FEE_ASSUMPTION`. Historical evidence from
+49 closed orders, 388 fills and 50 transactions supports zero extra fees; this
+is **not formally verified**. Ordinary verified-accounting readiness remains
+closed. The separate autonomous assessment accepts this named policy only and
+still requires all structural account/risk checks; it exposes `verified=False`.
+
+Every leg reuses the probe's isolated order/fill/position/ledger/balance review.
+Recent activity must reconcile completely; unrelated inventory changes, fee or
+collateral events, unexplained debits or unavailable attribution halt. Only
+immediate full fills with supported isolated ledger evidence may continue;
+partial/open states or ambiguous split ledger accounting require manual review.
+The final review also rereads the first closed order and all current holdings,
+fills, transactions and scoped balance before returning READY.
+
+The existing conservative balance-delta tolerance is 0.02 SUSQies: two displayed
+balance readings may each carry up to one cent of rounding error. This covers
+the documented two-decimal display without assuming a particular rounding
+mode. It is a consistency bound, not proof of zero fees or an API fee cap.
+Per-leg, per-pair **and cumulative** balance-versus-fill-notional checks enforce
+this bound. Small tolerated discrepancies cannot accumulate indefinitely;
+the immutable autonomous reference balance and all retained fill notionals
+bound cumulative drift too. The first mismatch persistently halts execution,
+even if later books/evidence/account data recover.
+
+Before a possible order, 0.04 SUSQies of additional accounting capacity is
+reserved (0.02 model tolerance plus 0.02 possible error in the observed delta).
+After a reconciled pair, its conservative allocation charge is at least fill
+notional and at least observed pair debit plus 0.02. These charges never
+decrease or replenish after restart; precise fill cost, rounded observed debit
+and uncertainty are kept separately in the evidence. The existing cumulative
+debit counter now includes these conservative charges, not formally established
+fee-inclusive receipts. Account cash above the immutable reserve floor cannot
+increase the fixed 5000 allocation. One-sided or unknown exposure retains its
+possible quantities and accounting buffer and globally blocks further execution.
+
+An undocumented large fee could violate the assumption before it is observed;
+no participant endpoint currently supplies a verified all-in fee/debit cap.
+This implementation detects and halts that case; it does not claim an absolute
+exchange-side debit guarantee. Actual submission remains disabled.
 
 The paper scanner is unchanged. `config.py` names `PAPER`,
 `LIVE_PILOT_DISABLED`, and `LIVE_PILOT`, with `PAPER` as the default and
 `LIVE_PILOT_SUBMISSION_ENABLED = False`. `live_pilot.py` is a separate diagnostic
-and accounting module. It has **no order-submission adapter**, no request-body
-builder and no order queue. It writes only separate pilot accounting, never live
-execution journals. Selecting `LIVE_PILOT`
+and accounting module. Its legacy diagnostic entrypoint has no submission
+adapter, request-body builder or order queue. The allocation serializer now
+also preserves the separate autonomous coordinator's embedded journal.
+Selecting `LIVE_PILOT` in that legacy diagnostic entrypoint
 fails before credential or API access. Changing the enable flag alone still
 cannot submit an order.
 
@@ -71,8 +433,10 @@ Explicit initialization fixes the untouchable cash floor to
 - quarantine reserve, total saved exposure, manual-review status/reason;
 - state, schema version, increasing revision and UTC creation/update timestamps.
 
-The accounting file, its lock and temporary files are ignored by Git. It contains
-no executable order requests, idempotency keys or API credentials.
+The accounting file, its lock and temporary files are ignored by Git. Legacy
+diagnostics add no executable requests or keys. A future explicitly enabled
+autonomous execution embeds its intents/keys there atomically with allocation
+state as described above; no credentials or HTTP headers are saved.
 Missing/corrupt checkpoints block candidate assessment rather than resetting
 the budget. Decimal strings preserve exact monetary debits in JSON.
 
@@ -602,8 +966,8 @@ The gates are:
 5. Both authoritative books meet the existing five-second freshness, executable
    depth of 50 and the separate tick-rounded **0.5% probe edge**, even though
    only leg one can be submitted. Pair maximum notional remains at most one
-   SUSQie. The normal LIVE_PILOT threshold remains **2%**; paper behavior is
-   unchanged.
+   SUSQie. The autonomous LIVE_PILOT now also requires **0.5%** under its own
+   fixed checker; paper behavior is unchanged.
 6. Separate command plus exact TTY confirmation. After human input, repeat every
    fresh account/settlement/quote/risk check. Reject any changed limit or binding;
    never silently widen a price or accept old quotes.
@@ -631,9 +995,10 @@ The same probe checker is called during preview, again after interactive
 confirmation, and immediately before submission after the durable pre-order
 writes. No runtime threshold flag or normal LIVE threshold override was added.
 
-The normal `observed_limits` checker continues to require >= 0.020, including
-all LIVE_PILOT candidate and second-leg checks. Existing scanner eligibility
-checks remain in that normal checker. Settlement authorization, risk/allocation,
+The legacy `observed_limits` checker continues to require >= 0.020 for its
+preview and older supervised tooling. Autonomous entry and completion use the
+fixed >= 0.005 policy described above. Existing scanner eligibility checks
+remain in the legacy checker. Settlement authorization, risk/allocation,
 quarantine, manual confirmation, no retries, no automatic second leg and the
 persistent post-probe manual-review halt remain unchanged.
 
@@ -643,13 +1008,13 @@ positive limits; a 0% minimum would also admit break-even pairs. This margin is
 not a verified fee allowance or guaranteed profit on the actual first leg.
 Fees remain unverified, and the acquired single NO contract can lose its cost.
 
-| Tick-rounded pair notional | Ordinary edge | Probe quote gate | Normal LIVE quote gate |
-| --- | --- | --- | --- |
-| 1.005 | -0.005 | FAIL | FAIL |
-| 1.000 | 0.000 | FAIL | FAIL |
-| 0.995 | 0.005 | PASS | FAIL |
-| 0.990 | 0.010 | PASS | FAIL |
-| 0.980 | 0.020 | PASS | PASS |
+| Tick-rounded pair notional | Ordinary edge | Probe quote gate | Autonomous entry gate | Legacy preview gate |
+| --- | --- | --- | --- | --- |
+| 1.005 | -0.005 | FAIL | FAIL | FAIL |
+| 1.000 | 0.000 | FAIL | FAIL | FAIL |
+| 0.995 | 0.005 | PASS | PASS | FAIL |
+| 0.990 | 0.010 | PASS | PASS | FAIL |
+| 0.980 | 0.020 | PASS | PASS | PASS |
 
 These are quote-policy examples, not trade eligibility. The live authorization
 list is still empty and LIVE_PILOT remains disabled. No real probe was run.
@@ -673,7 +1038,8 @@ take longer; old or unavailable data never preserves READY status.
 passes at the displayed timestamp.** It does not grant LIVE authorization,
 enable LIVE_PILOT, prepare an order or run a probe. Explicit LIVE authorization,
 a separate manual probe command and exact interactive confirmation remain
-required. The normal LIVE_PILOT 2% edge/accounting gates are unchanged. The
+required. The legacy live-preview 2% gate and its accounting checks are unchanged.
+The autonomous coordinator uses the current 0.5% policy above. The
 existing probe-purpose `ACCOUNTING_MODEL_UNVERIFIED` exception remains explicit;
 the watcher does not verify fees or an all-in debit cap.
 
