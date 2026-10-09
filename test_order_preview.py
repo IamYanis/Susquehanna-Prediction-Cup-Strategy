@@ -5,6 +5,7 @@ import io
 import json
 import tempfile
 import unittest
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -135,6 +136,25 @@ class OrderPreviewTests(unittest.TestCase):
     def test_edge_exactly_two_percent_passes(self):
         self.books = [parsed_book(ask=.49, bid=.48), parsed_book(ask=.49, bid=.48)]
         self.assertEqual(self.build()["ordinary_edge"], .02)
+
+    def test_normal_live_checker_rejects_every_lower_tick_edge(self):
+        # Exhaust the permitted tick grid up to the 2% boundary. Prices with
+        # the same sum have the same ordinary edge, regardless of leg split.
+        first = Decimal(".360")
+        for ticks in range(1, 200):
+            second = ticks * preview.PRICE_TICK
+            edge = Decimal("1.000") - first - second
+            books = [parsed_book(bid=float(1 - price), ask=float(1 - price + preview.PRICE_TICK))
+                     for price in (first, second)]
+            with self.subTest(second=second, edge=edge):
+                if edge < Decimal(".020"):
+                    with self.assertRaises(preview.PreviewBlocked):
+                        preview.observed_limits("NO-PAIR", books, 100, quantity=1)
+                else:
+                    result = preview.observed_limits("NO-PAIR", books, 100, quantity=1)
+                    self.assertEqual(result[3], edge)
+        self.assertEqual(preview.MIN_EDGE, .020)
+        self.assertEqual(scanner.MIN_EDGE, .020)
 
     def test_automatic_quantity_floors_depth_and_caps_at_100(self):
         self.books[0]["ask_quantity"] = 75.9

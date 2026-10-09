@@ -160,8 +160,13 @@ def validate_request_body(body):
                     "The two preview legs must share scope, side and quantity")
 
 
-def observed_limits(position_type, books, account_started, quantity=None):
-    """Check fresh prices and depth. Price arithmetic alone never approves a trade."""
+def executable_limits(position_type, books, account_started, quantity=None):
+    """Validate quotes and size, then price tick-rounded limits with Decimal.
+
+    This helper does not authorize a trade or choose an edge policy. The normal
+    live checker and the separate supervised probe apply their own fixed gate.
+    Freshness, depth, quantity and quote-version checks are shared by both.
+    """
     require_preview(position_type in ("YES-PAIR", "NO-PAIR"), "Unknown pair type")
     require_preview(is_finite_number(account_started)
                     and 0 <= time.monotonic() - account_started <= MAX_ACCOUNT_READ_AGE,
@@ -189,17 +194,24 @@ def observed_limits(position_type, books, account_started, quantity=None):
         quantity = min(math.floor(available), MAX_TRADE_QUANTITY)
     require_preview(type(quantity) is int and 1 <= quantity <= MAX_TRADE_QUANTITY
                     and quantity <= available, "Requested quantity is invalid or exceeds observed depth")
-    # Keep the scanner's eligibility checks; recheck after tick rounding because
-    # upward rounding increases the maximum spend and can remove the 2% edge.
-    opportunities = find_opportunities(books[0], books[1], {position_type})
-    require_preview(position_type in opportunities, "The selected pair has no qualifying observed edge")
     pair_cost = sum(Decimal(str(price)) for price in prices)
-    edge = Decimal(1) - pair_cost
-    require_preview(edge >= Decimal(str(MIN_EDGE)), "Tick-rounded limits fall below the 2% edge requirement")
+    edge = Decimal("1.000") - pair_cost
     for book in books:
         require_preview(abs(parse_api_timestamp(book["version"]["at"]).timestamp() - book["quoted_at"]) < 1e-6,
                         "Book version and quote timestamps disagree")
     return prices, quantity, pair_cost, edge
+
+
+def observed_limits(position_type, books, account_started, quantity=None):
+    """Keep the existing live policy fixed at 2%; no lower-threshold override."""
+    result = executable_limits(position_type, books, account_started, quantity)
+    # Preserve the existing scanner eligibility check for normal live previews.
+    # The probe does not borrow the paper scanner's opportunity classification.
+    opportunities = find_opportunities(books[0], books[1], {position_type})
+    require_preview(position_type in opportunities, "The selected pair has no qualifying observed edge")
+    require_preview(result[3] >= Decimal(str(MIN_EDGE)),
+                    "Tick-rounded limits fall below the 2% edge requirement")
+    return result
 
 
 def build_preview(account, position_type, market_context, books, account_started, quantity=None):

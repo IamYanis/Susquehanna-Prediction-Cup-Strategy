@@ -230,7 +230,8 @@ def read_order_activity(session, order_id, recent_fills, account, started):
         if row["orderId"] == order_id:
             other = by_id.get(row["id"])
             require(scanner.numeric_id(row["exchangeId"]) == exchange_id and other is not None and
-                    all(row[k] == other[k] for k in ("side", "price", "quantity", "filledAt")),
+                    all(row[k] == other[k] for k in ("side", "quantity", "filledAt")) and
+                    abs(Decimal(str(row["price"])) - Decimal(str(other["price"]))) <= Decimal(".000000001"),
                     RECONCILIATION_UNAVAILABLE, "Portfolio and order fills disagree")
     return {"order": order, "fills": fills, "fill_notional": str(notional)}
 
@@ -305,6 +306,17 @@ def accounting_model(snapshot=None):
             "placement_totalCost": "fill notional, not guaranteed cash debit",
             "all_effectiveEntryCost": "authoritative ALL entry cash debit when present in the placement response",
             "confirmed_pilot_debit_field": None,
+            "idempotency": {"supported": True, "request_field": "idempotencyKey",
+                            "required": True, "same_resolved_payload": "replay stored response",
+                            "different_resolved_payload": "HTTP 409", "retention": "not documented",
+                            "get_lookup_by_key": "not documented", "automatic_post_retry": False},
+            "alternative_accounting_evidence": {
+                "admin_ledger": "/dmm/tournaments/{slug}/transactions (admin only)",
+                "admin_cash_fields": "MONEY amount and balanceAfter; COLLATERAL balanceAfter is advance, not cash",
+                "admin_order_link": "no order/client-key field documented",
+                "account_balance": "GET /account uses default tournament/global scope; exact precision unspecified",
+                "collateral": "GET /portfolio/collateral?tournamentId=... exposes advances, not per-order cash debits"},
+            "fee_policy_evidence": "Official docs exclude real-money fees; an exact SUSQie charge bound is not established",
             "observed_fee_events": sum(r["event_type"] == "fee" for r in transactions),
             "reason": "No documented receipt-linked all-in cash debit or guaranteed trading-fee bound; do not infer zero fees"}
 

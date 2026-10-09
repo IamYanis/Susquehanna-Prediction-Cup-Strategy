@@ -7,6 +7,7 @@ exchange write endpoint. Even selecting LIVE_PILOT cannot enable submission.
 import argparse
 import copy
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -29,7 +30,7 @@ import account_test as single
 import paired_account_test as paired
 import execution_quarantine as quarantine
 import price_reader as scanner
-from account_reader import read_account
+from account_reader import read_account, validate_positions
 from order_preview import account_risk, observed_limits, read_selected_pair
 from paper_trader import parse_api_timestamp, validate_market_context, validate_quote_context
 
@@ -136,12 +137,14 @@ def allocation_checkpoint(account):
 
 def validate_checkpoint(checkpoint):
     """Never let a corrupt/restarted checkpoint create new allocation capacity."""
-    require(isinstance(checkpoint, dict) and set(checkpoint) == {
+    fields = {
         "version", "tournament_id", "initial_account_cash", "untouchable_cash_reserve",
         "allocated_cash_remaining", "last_reconciled_account_cash", "accounted_pair_costs",
         "manual_review_required", "review_reason", "configured_allocation", "confirmed_cumulative_debits",
         "live_exposures", "quarantine_reserve", "reserved_unconfirmed_capital", "total_live_exposure",
-        "calculated_remaining_allocation", "state", "revision", "created_at", "updated_at"},
+        "calculated_remaining_allocation", "state", "revision", "created_at", "updated_at"}
+    require(isinstance(checkpoint, dict) and set(checkpoint) in
+            (fields, fields | {"baseline_snapshot", "baseline_snapshot_hash"}),
         "Invalid pilot allocation checkpoint")
     require(type(checkpoint["version"]) is int and checkpoint["version"] == 2
             and isinstance(checkpoint["tournament_id"], str)
@@ -175,10 +178,12 @@ def validate_checkpoint(checkpoint):
     require(isinstance(checkpoint["live_exposures"], dict), "Invalid saved pilot exposure")
     seen_exchanges = set()
     for fingerprint, exposure in checkpoint["live_exposures"].items():
-        require(isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
-                and isinstance(exposure, dict) and set(exposure) == {
+        exposure_fields = {
                     "market_ids", "exchange_ids", "position_type", "confirmed_quantities", "confirmed_costs",
-                    "possible_additional_quantities", "limit_prices", "execution_status"}, "Invalid saved pilot exposure")
+                    "possible_additional_quantities", "limit_prices", "execution_status"}
+        require(isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
+                and isinstance(exposure, dict) and set(exposure) in
+                (exposure_fields, exposure_fields | {"observed_cash_debit"}), "Invalid saved pilot exposure")
         require(exposure["position_type"] == "NO-PAIR", "Unsupported pilot exposure direction")
         for key in ("market_ids", "exchange_ids"):
             ids = exposure[key]
@@ -195,7 +200,17 @@ def validate_checkpoint(checkpoint):
             require(q + p <= 1 and Decimal(".005") <= limit <= Decimal(".995")
                     and c <= q * limit + Decimal(".000000001"), "Inconsistent saved pilot exposure quantities/costs")
         known_cost = sum((amount(cost) for cost in exposure["confirmed_costs"]), Decimal(0))
-        require(known_cost == amount(costs.get(fingerprint, 0)), "Saved pilot exposure and confirmed debit disagree")
+        # The supervised accounting probe observes cash separately from position
+        # cost. None means the debit could not be attributed: keep the exposure,
+        # charge nothing as confirmed, and retain the mandatory review halt.
+        if "observed_cash_debit" in exposure:
+            require(checkpoint["state"] == HALTED and exposure["execution_status"] == "MANUAL_REVIEW",
+                    "Observed probe cash accounting requires a persistent review halt")
+            debit = exposure["observed_cash_debit"]
+            known_debit = Decimal(0) if debit is None else amount(debit)
+        else:
+            known_debit = known_cost
+        require(known_debit == amount(costs.get(fingerprint, 0)), "Saved pilot exposure and confirmed debit disagree")
         require(exposure["execution_status"] in {EXECUTING, "RECONCILED_PAIR", "AWAITING_MANUAL_SECOND_LEG", "MANUAL_REVIEW"},
                 "Invalid saved execution status")
         if exposure["execution_status"] == "RECONCILED_PAIR":
@@ -209,6 +224,32 @@ def validate_checkpoint(checkpoint):
     require(all(amount(checkpoint[key]) == amount(calculated[key]) for key in (
         "confirmed_cumulative_debits", "reserved_unconfirmed_capital", "total_live_exposure",
         "calculated_remaining_allocation")), "Saved pilot totals are inconsistent")
+    if "baseline_snapshot" in checkpoint:
+        snapshot = checkpoint["baseline_snapshot"]
+        require(isinstance(snapshot, dict) and snapshot["data_complete"] is True
+                and checkpoint["baseline_snapshot_hash"] == snapshot_hash(snapshot),
+                "Invalid saved baseline snapshot/hash")
+        account = snapshot["account"]
+        require(account["tournament"]["id"] == checkpoint["tournament_id"]
+                and amount(account["tournament"]["myBalance"]) == initial
+                and isinstance(account["orders"], list), "Baseline snapshot identity/cash differs")
+        validate_positions(account)
+        # Archived monotonic readings document capture duration only. They are
+        # not fresh quotes/account data for a later process or trade.
+        freshness = snapshot["freshness"]
+        duration = freshness["completed_monotonic"] - freshness["started_monotonic"]
+        require(0 <= duration <= pilot_account.MAX_ACCOUNT_READ_AGE,
+                "Baseline snapshot capture was stale")
+        parse_api_timestamp(freshness["observed_at"])
+        require(all(snapshot["coverage"][key]["complete"] is True for key in ("fills", "transactions"))
+                and all(isinstance(snapshot[key], list) for key in
+                        ("recent_fills", "recent_transactions", "order_activity")),
+                "Incomplete saved baseline reconciliation evidence")
+
+
+def snapshot_hash(snapshot):
+    """Bind the initial GET observations without storing credentials/headers."""
+    return hashlib.sha256(json.dumps(snapshot, sort_keys=True, allow_nan=False).encode()).hexdigest()
 
 
 def _read_checkpoint_locked(path):
@@ -242,6 +283,9 @@ def _save_checkpoint_locked(checkpoint, path, new=False):
         require(proposed["revision"] == previous["revision"], "Stale pilot state revision; reload and review")
         for key in ("configured_allocation", "tournament_id", "initial_account_cash", "untouchable_cash_reserve", "created_at"):
             require(proposed[key] == previous[key], "Immutable pilot allocation baseline changed")
+        require(all(proposed.get(key) == previous.get(key) for key in
+                    ("baseline_snapshot", "baseline_snapshot_hash")),
+                "Immutable baseline account observations changed")
         require(not previous["manual_review_required"] or proposed["state"] == HALTED,
                 "A persistent manual-review halt cannot be cleared automatically")
         for fingerprint, cost in previous["accounted_pair_costs"].items():
@@ -255,6 +299,11 @@ def _save_checkpoint_locked(checkpoint, path, new=False):
                     "Saved live exposure identity changed")
             require(all(amount(after) >= amount(before) for key in ("confirmed_quantities", "confirmed_costs")
                         for before, after in zip(exposure[key], current[key])), "Confirmed pilot fills cannot decrease")
+            if "observed_cash_debit" in exposure:
+                require("observed_cash_debit" in current and (exposure["observed_cash_debit"] is None or
+                        current["observed_cash_debit"] is not None and
+                        amount(current["observed_cash_debit"]) >= amount(exposure["observed_cash_debit"])),
+                        "Observed probe debit cannot be forgotten or decreased")
         require(amount(proposed["quarantine_reserve"]) >= amount(previous["quarantine_reserve"]),
                 "Saved quarantine reserve cannot disappear")
     proposed["revision"] += 1
@@ -300,8 +349,43 @@ def initialize_checkpoint(account, path=None):
     """Explicit local initialization only. Never replace an existing baseline."""
     with pilot_lock(path) as state_path:
         require(not state_path.exists(), "Pilot state already exists; never reset its allocation")
+        require_initial_evidence_clear(state_path)
         checkpoint = allocation_checkpoint(account)
         require_execution_clear(checkpoint)
+        return _save_checkpoint_locked(checkpoint, state_path, new=True)
+
+
+def require_initial_evidence_clear(state_path):
+    """A missing budget is not permission to forget a previous probe/crash."""
+    require(not state_path.with_name("accounting_probe.json").exists(),
+            "Existing accounting-probe evidence prevents new baseline; manual review required")
+    require(not list(state_path.parent.glob(f".{state_path.name}.*.tmp"))
+            and not list(state_path.parent.glob(".accounting_probe.json.*.tmp")),
+            "Unfinished pilot state write prevents new baseline; manual review required")
+
+
+def initialize_from_account_reads(session, path=None, slug="midterm-elections"):
+    """Save one DISABLED baseline and its full checked GET snapshot atomically.
+
+    Historical personal trades do not become pilot debits. A prior pilot/probe
+    journal instead blocks initialization; it cannot be adopted or forgotten.
+    Fee verification remains a trading gate, not a permission to debit this
+    zero-execution baseline. The normal probe coordinator is unchanged.
+    """
+    with pilot_lock(path) as state_path:
+        require(not state_path.exists(), "Pilot state already exists; never reset its allocation")
+        require_initial_evidence_clear(state_path)
+        snapshot = pilot_account.read_snapshot(session, slug)
+        checkpoint = allocation_checkpoint(snapshot["account"])
+        require(amount(checkpoint["allocated_cash_remaining"]) == config.LIVE_ALLOCATION,
+                "Account cannot fund the fixed 5000 baseline; do not initialize")
+        require_execution_clear(checkpoint)
+        require_initial_evidence_clear(state_path)
+        # Copy the positions, open orders, quarantine reserve and complete
+        # reconciliation window into the SAME atomic write as the allocation.
+        checkpoint["baseline_snapshot"] = copy.deepcopy(snapshot)
+        checkpoint["baseline_snapshot_hash"] = snapshot_hash(snapshot)
+        pilot_account.check_fresh(snapshot["freshness"]["started_monotonic"])
         return _save_checkpoint_locked(checkpoint, state_path, new=True)
 
 
@@ -764,7 +848,7 @@ def main():
             with requests.Session() as session:
                 session.headers.update({"Authorization": f"Bearer {api_key}"})
                 if args.initialize_state:
-                    checkpoint = initialize_checkpoint(read_account(session, "midterm-elections"))
+                    checkpoint = initialize_from_account_reads(session)
                     print_checkpoint(checkpoint)
                 else:
                     try:

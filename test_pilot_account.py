@@ -190,6 +190,15 @@ class PilotAccountTests(unittest.TestCase):
             account.require_ready(result)
         self.assertEqual(caught.exception.code, account.ACCOUNTING_UNVERIFIED)
 
+    def test_portfolio_fill_price_float_noise_is_tolerated_but_changed_price_is_blocked(self):
+        self.add_activity()
+        self.fills[0]["price"] = .4000000000000001
+        self.snapshot()
+        self.fills[0]["price"] = .400001
+        with self.assertRaises(account.AccountReadinessBlocked) as caught:
+            self.snapshot()
+        self.assertEqual(caught.exception.code, account.RECONCILIATION_UNAVAILABLE)
+
     def test_fee_and_collateral_events_are_retained_without_guessing_cash_debit(self):
         self.transactions = [{"event_id": "fee-1", "event_type": "fee", "createdAt": self.stamp,
                               "tournamentId": self.checkpoint["tournament_id"], "amount": -.02, "quantity": 0},

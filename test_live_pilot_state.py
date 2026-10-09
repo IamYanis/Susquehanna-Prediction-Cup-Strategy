@@ -277,15 +277,22 @@ class PilotStateTests(unittest.TestCase):
 
     def test_explicit_cli_initialization_creates_only_a_disabled_accounting_baseline(self):
         self.path.unlink()  # This test has no prior pilot execution/debits.
+        snapshot = {"account": self.fixture.account, "data_complete": True,
+                    "recent_fills": [], "recent_transactions": [], "order_activity": [],
+                    "history_since": self.fixture.checkpoint["created_at"],
+                    "freshness": {"started_monotonic": 100, "completed_monotonic": 100,
+                                  "observed_at": self.fixture.checkpoint["created_at"]},
+                    "coverage": {"fills": {"complete": True}, "transactions": {"complete": True}}}
         with patch("sys.argv", ["live_pilot.py", "--initialize-state"]), \
                 patch.object(pilot, "load_dotenv"), patch.object(pilot.os, "getenv", return_value="offline-key"), \
                 patch.object(pilot.requests, "Session") as session_factory, \
-                patch.object(pilot, "read_account", return_value=self.fixture.account) as account_read, \
+                patch.object(pilot.pilot_account, "read_snapshot", return_value=snapshot) as account_read, \
                 contextlib.redirect_stdout(io.StringIO()):
             session_factory.return_value.__enter__.return_value = self.session
             self.assertEqual(pilot.main(), 0)
         account_read.assert_called_once_with(self.session, "midterm-elections")
         self.assertEqual(self.restored()["state"], pilot.DISABLED)
+        self.assertEqual(self.restored()["baseline_snapshot"], snapshot)
         self.assertEqual(pilot.amount(self.restored()["allocated_cash_remaining"]), 5000)
         self.fixture.assert_no_writes()
 

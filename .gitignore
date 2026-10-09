@@ -24,3 +24,5 @@ active_paired_account_test/
 live_pilot_allocation.json
 .live_pilot_allocation.json.lock
 .live_pilot_allocation.json.*.tmp
+accounting_probe.json
+.accounting_probe.json.*.tmp
