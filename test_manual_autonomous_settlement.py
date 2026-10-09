@@ -1,5 +1,6 @@
 """Distinct manual autonomous permission: fake HTTP and temporary state only."""
 import copy
+import ast
 import hashlib
 import json
 import unittest
@@ -72,11 +73,34 @@ class ManualAutonomousSettlementTests(unittest.TestCase):
         for method in ("post", "delete", "put", "patch"):
             getattr(self.session, method).assert_not_called()
 
-    def test_new_config_is_empty_and_real_submission_stays_disabled(self):
+    def test_initial_allowlist_is_narrow_and_disabled_switch_blocks_submission(self):
         root = Path(live.__file__).parent
-        self.assertEqual(json.loads((root / "manual_autonomous_approvals.json").read_text())["pairs"], [])
-        self.assertIn("AUTONOMOUS_LIVE_PILOT_ENABLED = False", (root / "config.py").read_text())
-        self.assertIn("LIVE_PILOT_SUBMISSION_ENABLED = False", (root / "config.py").read_text())
+        # Validate the actual configuration, independently of the fake fixture.
+        # Adding reviewed exact pairs must not enable submission or broad access.
+        approvals = live._load_authorizations(root / "manual_autonomous_approvals.json", live.MANUAL_AUTONOMOUS)
+        self.assertGreaterEqual(len(approvals), 1)
+        self.assertLessEqual(len(approvals), 3)
+        for approval in approvals:
+            self.assertEqual(approval["verification_route"], live.MANUAL_AUTONOMOUS)
+            self.assertEqual(approval["execution_mode"], live.AUTONOMOUS_MODE)
+            self.assertEqual(approval["position_types"], ["NO-PAIR"])
+            self.assertEqual(approval["max_quantity"], 1)
+            self.assertNotIn("387", approval["market_ids"])
+            self.assertNotIn("1076", approval["exchange_ids"])
+        # Deployment may explicitly enable the switch. It must stay a literal
+        # boolean, and disabling it must still block the submission guard.
+        source = (root / "config.py").read_text()
+        switches = [statement.value for statement in ast.parse(source).body
+                    if isinstance(statement, ast.Assign)
+                    and any(isinstance(target, ast.Name) and target.id == "AUTONOMOUS_LIVE_PILOT_ENABLED"
+                            for target in statement.targets)]
+        self.assertEqual(len(switches), 1)
+        self.assertIsInstance(switches[0], ast.Constant)
+        self.assertIs(type(switches[0].value), bool)
+        self.assertIn("LIVE_PILOT_SUBMISSION_ENABLED = False", source)
+        with patch.object(config, "AUTONOMOUS_LIVE_PILOT_ENABLED", False), self.assertRaises(pilot.PilotBlocked):
+            auto.require_submission()
+        self.assert_no_post()
 
     def test_explicit_manual_tier_passes_only_its_read_only_settlement_gate(self):
         before = self.fixture.path.read_bytes()

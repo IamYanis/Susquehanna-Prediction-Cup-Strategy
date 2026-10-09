@@ -2,5 +2,126 @@
   "version": 1,
   "allowed_mode": "LIVE_PILOT",
   "authorization_tier": "MANUAL_AUTONOMOUS_APPROVAL",
-  "pairs": []
+  "pairs": [
+    {
+      "approval_version": 1,
+      "pair_name": "Alaska Senate",
+      "tournament_id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "tournament_slug": "midterm-elections",
+      "market_ids": [
+        "377",
+        "378"
+      ],
+      "exchange_ids": [
+        "1066",
+        "1067"
+      ],
+      "relationship_type": "mutually_exclusive",
+      "position_types": [
+        "NO-PAIR"
+      ],
+      "max_quantity": 1,
+      "execution_mode": "autonomous-one-contract",
+      "verification_route": "MANUAL_AUTONOMOUS_APPROVAL",
+      "evidence_version": 1,
+      "settlement_rationale": "For this exact Alaska Senate pair, official Election Outcome contract roots identify the same raceId 62954, stageId 98084, General stage, electionDate 2026-11-03, Party Winner resolutionType and settlement date 2026-11-04T17:00:00.000Z; winnerName is Democratic Party on the first market and Republican Party on the second. Under the reviewed ordinary single-winner, single-party classification of this exact race/stage, those two YES propositions cannot both hold. One NO share in each market therefore pays at least 1 SUSQie under ordinary binary settlement. This exact manual interpretation is approved for autonomous v0.1 by the user's request to prepare and add the initial allowlist; it is not machine-readable relationship verification.",
+      "evidence_hash": "7551b62a920b24f6754736ebaa690b63e24b7d2d6d08913e92169017f527e9d3",
+      "source_refs": [
+        "https://sig.thesuper.market/api/v1/tournaments/midterm-elections",
+        "https://sig.thesuper.market/api/v1/markets/377?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/api/v1/markets/378?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/api/v1/markets/377/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/api/v1/markets/378/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/docs/settlement-and-payouts"
+      ],
+      "limitations": [
+        "Cancelled/N/A/refund outcomes can invalidate the ordinary 1-SUSQie payout floor.",
+        "Administrator rulings, overrides or corrections can depart from the reviewed interpretation.",
+        "Manual interpretation is not a machine relationship guarantee; independent or delayed settlement can cause losses.",
+        "Legs execute separately; partial, UNKNOWN or one-sided execution requires persistent manual review.",
+        "Approval is restricted to raceId 62954 / stageId 98084 on 2026-11-03. The configured wording does not fully specify dual-party affiliation/endorsement, tied or contested results, runoff timing, or party-classification corrections. The ordinary payout floor assumes one common single-party winner classification; these exceptional interpretations remain a risk."
+      ],
+      "approved_at": "2026-10-09T16:11:31+00:00"
+    },
+    {
+      "approval_version": 1,
+      "pair_name": "New Hampshire Senate",
+      "tournament_id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "tournament_slug": "midterm-elections",
+      "market_ids": [
+        "381",
+        "382"
+      ],
+      "exchange_ids": [
+        "1070",
+        "1071"
+      ],
+      "relationship_type": "mutually_exclusive",
+      "position_types": [
+        "NO-PAIR"
+      ],
+      "max_quantity": 1,
+      "execution_mode": "autonomous-one-contract",
+      "verification_route": "MANUAL_AUTONOMOUS_APPROVAL",
+      "evidence_version": 1,
+      "settlement_rationale": "For this exact New Hampshire Senate pair, official Election Outcome contract roots identify the same raceId 62972, stageId 98102, General stage, electionDate 2026-11-03, Party Winner resolutionType and settlement date 2026-11-04T17:00:00.000Z; winnerName is Democratic Party on the first market and Republican Party on the second. Under the reviewed ordinary single-winner, single-party classification of this exact race/stage, those two YES propositions cannot both hold. One NO share in each market therefore pays at least 1 SUSQie under ordinary binary settlement. This exact manual interpretation is approved for autonomous v0.1 by the user's request to prepare and add the initial allowlist; it is not machine-readable relationship verification.",
+      "evidence_hash": "7b2aa03e41e46d48fb5621450cf7e49db133ff8c0811f7d2cef422f06d67aafb",
+      "source_refs": [
+        "https://sig.thesuper.market/api/v1/tournaments/midterm-elections",
+        "https://sig.thesuper.market/api/v1/markets/381?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/api/v1/markets/382?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/api/v1/markets/381/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/api/v1/markets/382/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/docs/settlement-and-payouts"
+      ],
+      "limitations": [
+        "Cancelled/N/A/refund outcomes can invalidate the ordinary 1-SUSQie payout floor.",
+        "Administrator rulings, overrides or corrections can depart from the reviewed interpretation.",
+        "Manual interpretation is not a machine relationship guarantee; independent or delayed settlement can cause losses.",
+        "Legs execute separately; partial, UNKNOWN or one-sided execution requires persistent manual review.",
+        "Approval is restricted to raceId 62972 / stageId 98102 on 2026-11-03. The configured wording does not fully specify dual-party affiliation/endorsement, tied or contested results, runoff timing, or party-classification corrections. The ordinary payout floor assumes one common single-party winner classification; these exceptional interpretations remain a risk."
+      ],
+      "approved_at": "2026-10-09T16:11:47+00:00"
+    },
+    {
+      "approval_version": 1,
+      "pair_name": "Colorado Senate",
+      "tournament_id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "tournament_slug": "midterm-elections",
+      "market_ids": [
+        "256",
+        "257"
+      ],
+      "exchange_ids": [
+        "945",
+        "946"
+      ],
+      "relationship_type": "mutually_exclusive",
+      "position_types": [
+        "NO-PAIR"
+      ],
+      "max_quantity": 1,
+      "execution_mode": "autonomous-one-contract",
+      "verification_route": "MANUAL_AUTONOMOUS_APPROVAL",
+      "evidence_version": 1,
+      "settlement_rationale": "For this exact Colorado Senate pair, official Election Outcome contract roots identify the same raceId 62956, stageId 98086, General stage, electionDate 2026-11-03, Party Winner resolutionType and settlement date 2026-11-04T17:00:00.000Z; winnerName is Democratic Party on the first market and Republican Party on the second. Under the reviewed ordinary single-winner, single-party classification of this exact race/stage, those two YES propositions cannot both hold. One NO share in each market therefore pays at least 1 SUSQie under ordinary binary settlement. This exact manual interpretation is approved for autonomous v0.1 by the user's request to prepare and add the initial allowlist; it is not machine-readable relationship verification.",
+      "evidence_hash": "b81de7aac70e2b469a4d1c6f7d17c5525ff00252bde2f480e4927ced2edc131c",
+      "source_refs": [
+        "https://sig.thesuper.market/api/v1/tournaments/midterm-elections",
+        "https://sig.thesuper.market/api/v1/markets/256?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/api/v1/markets/257?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/api/v1/markets/256/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/api/v1/markets/257/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://sig.thesuper.market/docs/settlement-and-payouts"
+      ],
+      "limitations": [
+        "Cancelled/N/A/refund outcomes can invalidate the ordinary 1-SUSQie payout floor.",
+        "Administrator rulings, overrides or corrections can depart from the reviewed interpretation.",
+        "Manual interpretation is not a machine relationship guarantee; independent or delayed settlement can cause losses.",
+        "Legs execute separately; partial, UNKNOWN or one-sided execution requires persistent manual review.",
+        "Approval is restricted to raceId 62956 / stageId 98086 on 2026-11-03. The configured wording does not fully specify dual-party affiliation/endorsement, tied or contested results, runoff timing, or party-classification corrections. The ordinary payout floor assumes one common single-party winner classification; these exceptional interpretations remain a risk."
+      ],
+      "approved_at": "2026-10-09T16:12:02+00:00"
+    }
+  ]
 }

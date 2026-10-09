@@ -1,4 +1,11 @@
-# Autonomous v0.1 — submission disabled
+# Autonomous v0.1 — enabled, start manually
+
+Following the user's approval and a fresh GET-only preflight on 9 October 2026,
+`AUTONOMOUS_LIVE_PILOT_ENABLED` is **True**. All three exact authorized pairs
+passed the existing settlement, account, quote/depth, risk and persistent-state
+checks. The bot was not started and no order was submitted during enablement.
+Starting the command below runs live autonomous trading; every entry still
+repeats all existing checks. The legacy/probe submission switch remains False.
 
 ## Current lifecycle
 
@@ -86,16 +93,17 @@ profits and unrelated account cash cannot enlarge the budget. Losses remain
 charged after restart. Gross debits and closed-trade history cannot be deleted.
 Exact machine-authorized pairs remain preferred; exact
 `MANUAL_AUTONOMOUS_APPROVAL` records work without a relationship graph. No
-allowlist entries have been created by this implementation.
+allowlist entries were created by the lifecycle implementation. The initial
+allowlist subsequently approved by the user is documented below.
 
 The single autonomous submission switch is:
 
 ```python
-# config.py — currently False
+# config.py — currently True
 AUTONOMOUS_LIVE_PILOT_ENABLED = True
 ```
 
-After deliberately enabling it, the foreground command is:
+To start the enabled coordinator in the foreground:
 
 ```bash
 .venv/bin/python autonomous_pilot.py
@@ -104,9 +112,49 @@ After deliberately enabling it, the foreground command is:
 The older `LIVE_PILOT_SUBMISSION_ENABLED` switch is not required for v0.1 and
 remains False. With the autonomous switch False, this command exits before
 credentials, API reads, state writes or order preparation. The current autonomous
-allowlists are empty; an exact authorized pair is still required before entry.
+manual allowlist contains three exact reviewed pairs; each still requires fresh
+evidence/account/quote/risk checks before entry. The machine allowlist is empty.
 An unfinished buy or sale on restart remains halted. No automatic halt clearing,
 ambiguous POST retry, background startup or watcher restart exists.
+
+### Initial manual autonomous allowlist — 9 October 2026
+
+At the user's explicit request to select and add up to three exact pairs,
+`manual_autonomous_approvals.json` now authorizes **one NO share per leg** in:
+
+| Pair | Market IDs (D / R) | Exchange IDs (D / R) | Official raceId / stageId |
+|---|---|---|---|
+| Alaska Senate | 377 / 378 | 1066 / 1067 | 62954 / 98084 |
+| New Hampshire Senate | 381 / 382 | 1070 / 1071 | 62972 / 98102 |
+| Colorado Senate | 256 / 257 | 945 / 946 | 62956 / 98086 |
+
+Scope: `midterm-elections`, tournament UUID
+`bda92870-621e-47b0-bc3c-3602c5c26f55`. Official GET discovery examined 117 paired
+races; 47 passed the 0.005 tick-rounded edge/depth screen. These three led the
+screen by executable edge, then minimum available leg depth. Fresh individual
+market and resolution-root reads confirmed matching General/Party Winner
+rules, election date `2026-11-03`, and settlement date
+`2026-11-04T17:00:00.000Z`. Fresh account and existing pilot risk checks passed.
+
+The pair-specific rationale assumes one ordinary single-party winner for each
+exact race/stage, making the Democratic and Republican YES propositions mutually
+exclusive. This is explicitly manual interpretation, not machine proof. Refunds,
+administrator overrides, dual-party classification, disputed/runoff timing,
+independent settlement and one-sided execution remain disclosed limitations.
+Neither a matching title nor a different race grants authorization.
+
+Each full JSON record stores stable IDs, mode, quantity, timestamp, rationale,
+limitations, scoped official sources and its own evidence hash. That hash also
+binds the complete current resolution roots and official policy HTML SHA-256
+`ae4d6d3c25fefb3a232de629883071a60be818624be05d81467b888838e285f7`.
+Quotes are intentionally not pinned in the authorization: every scan and
+pre-submit check obtains fresh executable prices.
+
+The allocation remains 5,000 SUSQies, with 0.125 reserved for quarantined market
+387. Autonomous submission is enabled; the legacy/probe switch remains **False**.
+Read-only selection can call the existing GET-only
+`best_candidate` / `fresh_candidate` helpers under the existing read-only
+exclusive pilot lock, without execution intents or runtime-state writes.
 
 Official schema references: [API](https://sig.thesuper.market/api/v1/docs),
 [trading](https://sig.thesuper.market/docs/markets-and-trading),
@@ -187,13 +235,15 @@ Autonomous authorization has this explicit precedence:
 An existing machine approval is preferred. If its graph/rules fail verification,
 execution halts rather than silently switching to a manual interpretation.
 Each tier requires its own explicit approval; neither file is populated or
-changed by a scanner. Both currently contain no autonomous authorization.
+changed by a scanner. The machine list is empty; the manual list contains the
+three exact initial approvals documented above.
 Manual interpretation remains an assumption accepted by a human, not an
-engine-backed relationship guarantee. Submission switches remain **False**.
+engine-backed relationship guarantee. The autonomous switch is **True** and the
+legacy/probe switch remains **False**.
 
 ### Separate manual autonomous approval
 
-`manual_autonomous_approvals.json` starts empty and contains only:
+The original empty `manual_autonomous_approvals.json` schema was:
 
 ```json
 {
@@ -204,7 +254,7 @@ engine-backed relationship guarantee. Submission switches remain **False**.
 }
 ```
 
-Each future human-approved entry has the existing live record fields: approval
+Each reviewed entry has the existing live record fields: approval
 version/time, pair label, tournament UUID/slug, ordered market/exchange IDs,
 `relationship_type: "mutually_exclusive"`, `position_types: ["NO-PAIR"]`,
 `max_quantity: 1`, `execution_mode: "autonomous-one-contract"`, reviewed

@@ -40,6 +40,14 @@ class AutonomousPilotTests(unittest.TestCase):
         self.base = self.fixture.fixture
         self.path = pilot.ALLOCATION_PATH
         self.session = self.fixture.session
+        # Production permissions must never leak into the fake exchange's
+        # candidate scan. Each test starts with its own empty manual allowlist.
+        manual_path = self.base.root / "manual_autonomous_approvals.json"
+        manual_path.write_text(json.dumps({"version": 1, "allowed_mode": "LIVE_PILOT",
+            "authorization_tier": live.MANUAL_AUTONOMOUS, "pairs": []}))
+        manual_permissions = patch.object(live, "MANUAL_AUTONOMOUS_PATH", manual_path)
+        manual_permissions.start()
+        self.addCleanup(manual_permissions.stop)
         self.approval = live_fixtures.live_approval()
         self.approval["execution_mode"] = live.AUTONOMOUS_MODE
         self.write_authorizations([self.approval])

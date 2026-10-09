@@ -9,7 +9,7 @@ DEFAULT_MODE = PAPER
 LIVE_PILOT_SUBMISSION_ENABLED = False
 # This is the single switch for autonomous v0.1. Leave it off during development.
 # The older diagnostic/probe switch above does not enable this coordinator.
-AUTONOMOUS_LIVE_PILOT_ENABLED = False
+AUTONOMOUS_LIVE_PILOT_ENABLED = True
 
 LIVE_ALLOCATION = 5000
 MAX_LIVE_CAPITAL_PER_TRADE = 50
