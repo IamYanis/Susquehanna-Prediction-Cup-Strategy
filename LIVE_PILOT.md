@@ -1744,3 +1744,71 @@ use mocked HTTP and temporary files. The final official GET-only dry run passed
 with 22 GET responses and zero submissions/state writes. Protected-file hashes
 confirmed `.env`, enable/risk configuration, all approval files, the real pilot
 checkpoint, quarantine/execution journals and paper state remained unchanged.
+
+## Filled-pair zero-collateral reconciliation recovery (Colorado, 10 October 2026)
+
+The placement response can include an `all` object even for an ordinary cash
+purchase. Its presence alone no longer produces
+`COLLATERAL_CASH_EFFECT_UNVERIFIED`. The shared diagnostic requires the complete
+known object: savings, guaranteed payout floor, outstanding advance, repayment
+and redemption credit must all explicitly be zero; relationship IDs must be
+empty and component ID null. Full notional, effective entry cost and buying-power
+impact must each equal the actual fill notional. Missing, nonzero, linked,
+unexpected or contradictory fields still fail closed. Fill, ledger, holdings
+and balance reconciliation remain mandatory. This does not formally verify the
+historical zero-extra-fee accounting assumption.
+
+`recover_completed_pair.py` supports only the diagnosed Colorado final halt:
+orders 29229136/29294586, fills 122411192/122673772, markets 256/257, exchanges
+945/946, BUY one NO each at 0.075/0.900. It repeats fresh settlement, complete
+GET-only order/fill/account/history reads under the existing exclusive lock.
+Both orders must be closed and fully filled, the account must hold exactly the
+two known shares with no open orders, and no additional or contradictory
+order/fill/transaction/cash activity may exist. The archived receipts must pass
+the corrected zero-collateral diagnostic. Any other unresolved execution or
+inconsistent/failing/stale read keeps the halt. There is no POST/DELETE adapter.
+
+Preview only; no runtime write (also the default):
+
+```bash
+.venv/bin/python recover_completed_pair.py --attempt 7d4dcd813328d03afef241e8baba01e8117ccf0bf924d19885105a2f4c724623 --dry-run
+```
+
+After separate explicit approval, repeat those same checks and perform a single
+atomic local completion write:
+
+```bash
+.venv/bin/python recover_completed_pair.py --attempt 7d4dcd813328d03afef241e8baba01e8117ccf0bf924d19885105a2f4c724623 --apply
+```
+
+Expected state for the diagnosed account, if fresh checks pass:
+
+- Revision 64 -> 65; state `READY`, manual-review flag false, active attempt null.
+- Both original requests, keys, raw receipts, fills and stage/read histories
+  remain. The failed review and halt are archived in an immutable completion
+  recovery audit; the corrected review is recorded separately.
+- Normal `OPEN` position for Colorado: quantities `[1, 1]`, actual entry prices
+  `[0.075, 0.900]`, total entry cost `0.975`, actual entry edge `0.025`. Normal
+  HOLD/early-exit/settlement management resumes on a later explicit bot start.
+- Displayed balance `20572.37 -> 20571.39`: debit `0.980`, difference `0.005`
+  from fill notional, within the unchanged `0.020` tolerance.
+- The existing conservative allocation charge is
+  `max(0.975, 0.980 + 0.020) = 1.000`; this is not an asserted trading fee.
+  Gross pilot debit history becomes `1.000`, allocation cash remaining
+  `4999.000`, execution reservation/buffer `0`, quarantine reserve unchanged at
+  `0.125`, usable allocation `4998.875`. Real held-position notional stays
+  `0.975`; total live exposure including quarantine is `1.100`.
+- Fixed allocation remains 5000. The consumed `--resume-recovered-leg1` marker
+  stays consumed. Neither order can be replayed and no bot is started by recovery.
+
+Tests use mocked HTTP and disposable state for dry-run immutability, audited
+atomic completion, restart persistence, ordinary HOLD management, duplicate
+prevention, changed/missing fills and holdings, unrelated transactions, balance
+changes, collateral failures, and preserved one-use resume semantics.
+
+Validation: **66 focused tests passed; 658 full-suite tests passed**. The
+dedicated command's fresh official dry run passed with 22 GET responses, zero
+order submissions and zero runtime writes. Runtime state remains halted at
+revision 64; the READY/revision-65 values above are a preview only. File
+fingerprints confirmed that `.env`, runtime state/journals, allocation,
+authorization files and enable/risk configuration were unchanged.

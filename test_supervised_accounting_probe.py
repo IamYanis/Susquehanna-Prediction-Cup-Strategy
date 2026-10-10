@@ -27,6 +27,12 @@ def no_pair_books(first, second):
             for price in (first, second)]
 
 
+def zero_collateral(notional=.4):
+    return {"fullNotionalCost": notional, "effectiveEntryCost": notional, "netBuyingPowerImpact": notional,
+            "collateralSavings": 0, "guaranteedPayoutFloorAfter": 0, "outstandingAdvanceAfter": 0,
+            "collateralRepayment": 0, "redemptionCredit": 0, "relationshipIds": [], "componentId": None}
+
+
 class AccountingProbeTests(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.LivePilotTests()
@@ -218,6 +224,43 @@ class AccountingProbeTests(unittest.TestCase):
         result = self.review()
         self.assertEqual(result["observations"]["all_execution_economics"], self.receipt["all"])
         self.assertIn("COLLATERAL_CASH_EFFECT_UNVERIFIED", result["issues"])
+
+    def test_explicit_zero_collateral_receipt_passes_isolated_review(self):
+        self.receipt["all"] = zero_collateral()
+        self.after["recent_fills"] = [{**self.activity["fills"][0], "orderId": 101, "marketId": "1", "exchangeId": "11"}]
+        result = self.review()
+        self.assertNotIn("COLLATERAL_CASH_EFFECT_UNVERIFIED", result["issues"])
+        self.assertTrue(result["observations"]["isolated_execution_reconciled"])
+        self.assertEqual(result["observations"]["all_execution_economics"], self.receipt["all"])
+
+    def test_nonzero_or_linked_collateral_fails_closed(self):
+        for key, value in (("collateralSavings", .01), ("outstandingAdvanceAfter", .01),
+                           ("collateralRepayment", .01), ("redemptionCredit", .01),
+                           ("guaranteedPayoutFloorAfter", .01), ("relationshipIds", [9]), ("componentId", "linked")):
+            self.receipt["all"] = dict(zero_collateral(), **{key: value})
+            with self.subTest(field=key):
+                result = self.review()
+                self.assertIn("COLLATERAL_CASH_EFFECT_UNVERIFIED", result["issues"])
+                self.assertFalse(result["observations"]["isolated_execution_reconciled"])
+
+    def test_missing_or_inconsistent_cash_fields_fail_closed(self):
+        for key in zero_collateral():
+            self.receipt["all"] = zero_collateral()
+            del self.receipt["all"][key]
+            with self.subTest(missing=key):
+                self.assertIn("COLLATERAL_CASH_EFFECT_UNVERIFIED", self.review()["issues"])
+        for key in ("fullNotionalCost", "effectiveEntryCost", "netBuyingPowerImpact"):
+            self.receipt["all"] = dict(zero_collateral(), **{key: .395})
+            with self.subTest(inconsistent=key):
+                self.assertIn("COLLATERAL_CASH_EFFECT_UNVERIFIED", self.review()["issues"])
+        self.assertFalse(probe.ordinary_cash_receipt(dict(zero_collateral(), collateralSavings=False), Decimal(".4")))
+
+    def test_zero_collateral_receipt_cannot_hide_unexplained_balance_debit(self):
+        self.receipt["all"] = zero_collateral()
+        self.after["account"]["tournament"]["myBalance"] = 19999.5
+        result = self.review()
+        self.assertIn("BALANCE_CHANGE_NOT_EXPLAINED_BY_NOTIONAL", result["issues"])
+        self.assertFalse(result["observations"]["isolated_execution_reconciled"])
 
     def test_unknown_or_partial_receipt_halts_and_preserves_every_supplied_field(self):
         for receipt in (None, {**self.receipt, "quantityTraded": .5}, {**self.receipt, "open": True}):

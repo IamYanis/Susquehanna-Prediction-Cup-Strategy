@@ -314,7 +314,7 @@ def _read_checkpoint_locked(path):
         raise PilotBlocked("HALTED_MANUAL_REVIEW: pilot allocation checkpoint missing or invalid; manual review required") from error
 
 
-def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False, settlement_recovery=False, filled_recovery=False):
+def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False, settlement_recovery=False, filled_recovery=False, completed_recovery=False):
     """Validate then fsync/replace/fsync-directory while holding one stable lock."""
     require(_state_lock_owners.get(path) == (os.getpid(), threading.get_ident()),
             "Pilot state mutation requires the exclusive process lock")
@@ -335,7 +335,7 @@ def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False
             # permission rejection. Ordinary state saves cannot clear halts.
             from recover_rejected_attempt import validate_transition
             validate_transition(previous, proposed)
-        require(sum((bool(rejected_recovery), bool(settlement_recovery), bool(filled_recovery))) <= 1,
+        require(sum((bool(rejected_recovery), bool(settlement_recovery), bool(filled_recovery), bool(completed_recovery))) <= 1,
                 "Recovery types cannot be combined")
         if settlement_recovery:
             from recover_settlement_halt import validate_transition
@@ -346,7 +346,10 @@ def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False
         if filled_recovery:
             from recover_filled_leg1 import validate_transition
             validate_transition(previous, proposed)
-        require(rejected_recovery or settlement_recovery or filled_recovery or not previous["manual_review_required"] or proposed["state"] == HALTED,
+        if completed_recovery:
+            from recover_completed_pair import validate_transition
+            validate_transition(previous, proposed)
+        require(rejected_recovery or settlement_recovery or filled_recovery or completed_recovery or not previous["manual_review_required"] or proposed["state"] == HALTED,
                 "A persistent manual-review halt cannot be cleared automatically")
         for fingerprint, cost in previous["accounted_pair_costs"].items():
             require(fingerprint in proposed["accounted_pair_costs"]
@@ -371,7 +374,8 @@ def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False
                 "Saved quarantine reserve cannot disappear")
         if "autonomous_execution" in previous:
             from autonomous_pilot import validate_update
-            validate_update(previous, proposed, rejected_recovery=rejected_recovery, filled_recovery=filled_recovery)
+            validate_update(previous, proposed, rejected_recovery=rejected_recovery, filled_recovery=filled_recovery,
+                            completed_recovery=completed_recovery)
     proposed["revision"] += 1
     proposed["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     validate_checkpoint(proposed)

@@ -147,7 +147,8 @@ def validate_journal(checkpoint):
     for fingerprint, attempt in journal["attempts"].items():
         require(isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
                 and isinstance(attempt, dict) and set(attempt) in
-                (fields, fields | {"rejection_recovery"}, fields | {"filled_leg1_recovery"}),
+                (fields, fields | {"rejection_recovery"}, fields | {"filled_leg1_recovery"},
+                 fields | {"filled_leg1_recovery", "final_reconciliation_recovery"}),
                 "Invalid autonomous execution record")
         approval = attempt["authorization"]
         live.validate_authorization(approval)
@@ -215,6 +216,9 @@ def validate_journal(checkpoint):
         if "filled_leg1_recovery" in attempt:
             from recover_filled_leg1 import validate_recovered
             validate_recovered(checkpoint, fingerprint)
+        if "final_reconciliation_recovery" in attempt:
+            from recover_completed_pair import validate_completed
+            validate_completed(checkpoint, fingerprint)
         if attempt["state"] == pilot.READY:
             require(exposure["execution_status"] == "RECONCILED_PAIR" and pilot.amount(exposure["accounting_buffer"]) == 0
                     and all(leg["post_attempted"] and leg["intent"]["state"] == "OBSERVED_TERMINAL"
@@ -237,7 +241,7 @@ def validate_journal(checkpoint):
                 <= pilot_account.BALANCE_DELTA_TOLERANCE, "Completed autonomous accounting baseline is inconsistent")
 
 
-def validate_update(previous, proposed, rejected_recovery=False, filled_recovery=False):
+def validate_update(previous, proposed, rejected_recovery=False, filled_recovery=False, completed_recovery=False):
     """No deletion, key reuse, changed request or clearing a historical halt."""
     old, new = previous["autonomous_execution"], proposed.get("autonomous_execution")
     require(new is not None and old["policy"] == new["policy"] and old["reference_cash"] == new["reference_cash"],
@@ -250,7 +254,12 @@ def validate_update(previous, proposed, rejected_recovery=False, filled_recovery
                 "Completed/retired execution evidence changed")
         require(attempt["state"] != pilot.HALTED or current["state"] == pilot.HALTED
                 or rejected_recovery and current["state"] == pilot.REJECTED_RETIRED
-                or filled_recovery and current["state"] == pilot.LEG2_RECHECK, "Autonomous halt cannot clear")
+                or filled_recovery and current["state"] == pilot.LEG2_RECHECK
+                or completed_recovery and current["state"] == pilot.READY, "Autonomous halt cannot clear")
+        old_final, new_final = attempt.get("final_reconciliation_recovery"), current.get("final_reconciliation_recovery")
+        require((old_final is not None and new_final == old_final)
+                or (old_final is None and (new_final is None or completed_recovery)),
+                "Final reconciliation audit requires its dedicated recovery and cannot change")
         old_recovery, new_recovery = attempt.get("filled_leg1_recovery"), current.get("filled_leg1_recovery")
         if old_recovery is not None:
             require(new_recovery is not None, "Filled-leg recovery audit cannot disappear")
@@ -275,6 +284,7 @@ def validate_update(previous, proposed, rejected_recovery=False, filled_recovery
         require(position is not None, "Position/P&L history cannot disappear")
         for field in ("pair", "market_ids", "exchange_ids", "quantity", "entry_timestamp", "actual_entry_prices", "entry_edge"):
             require(position[field] == old_position[field], "Recorded entry changed")
+        require(position.get("total_entry_cost") == old_position.get("total_entry_cost"), "Recorded entry cost changed")
         require(old_position["status"] != "CLOSED" or position == old_position, "Closed P&L history changed")
         require(all(Decimal(q) <= Decimal(old_q) for q, old_q in zip(position["remaining_quantities"], old_position["remaining_quantities"]))
                 and Decimal(position["allocation_credit"]) >= Decimal(old_position["allocation_credit"]),
@@ -638,6 +648,7 @@ def record_position(checkpoint, key, snapshot):
         "pair": attempt["authorization"]["pair_name"],
         "market_ids": attempt["authorization"]["market_ids"], "exchange_ids": attempt["authorization"]["exchange_ids"],
         "quantity": 1, "entry_timestamp": attempt["created_at"], "actual_entry_prices": prices[:],
+        "total_entry_cost": str(sum(map(Decimal, prices))),
         "entry_edge": str(Decimal("1.000") - sum(map(Decimal, prices))),
         "status": "OPEN", "remaining_quantities": ["1", "1"], "leg_proceeds": ["0", "0"],
         "exit_timestamp": None, "exit_reason": None, "exit_proceeds": "0", "realized_pnl": None,
@@ -670,6 +681,8 @@ def validate_positions(checkpoint):
         prices = checkpoint["live_exposures"][key]["confirmed_costs"]
         require(p["actual_entry_prices"] == prices and Decimal(p["entry_edge"]) == Decimal("1.000") - sum(map(Decimal, prices)),
                 "Position entry economics changed")
+        require("total_entry_cost" not in p or Decimal(p["total_entry_cost"]) == sum(map(Decimal, prices)),
+                "Position total entry cost differs from actual fills")
         single.parse_api_timestamp(p["entry_timestamp"])
         if p["status"] == "CLOSED":
             require(all(Decimal(q) == 0 for q in p["remaining_quantities"]) and

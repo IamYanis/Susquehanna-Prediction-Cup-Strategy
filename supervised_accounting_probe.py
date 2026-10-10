@@ -116,6 +116,27 @@ def inventory(account, exclude_exchange):
                   for r in account["positions"] if scanner.numeric_id(r["exchangeId"]) != exclude_exchange)
 
 
+def ordinary_cash_receipt(economics, notional):
+    """An ALL object can describe an ordinary buy with zero collateral effect.
+
+    Require the full known schema and explicit zeros; absent/inconsistent
+    values or linkage must never be treated as an ordinary cash debit.
+    Balance/ledger reconciliation remains a separate mandatory check.
+    """
+    if economics is None:
+        return True  # Existing plain receipts do not contain ALL accounting.
+    zero_fields = {"collateralSavings", "guaranteedPayoutFloorAfter", "outstandingAdvanceAfter",
+                   "collateralRepayment", "redemptionCredit"}
+    cost_fields = {"fullNotionalCost", "effectiveEntryCost", "netBuyingPowerImpact"}
+    try:
+        return (isinstance(economics, dict) and set(economics) == zero_fields | cost_fields | {"relationshipIds", "componentId"}
+                and economics["relationshipIds"] == [] and economics["componentId"] is None
+                and all(money(economics[k]) == 0 for k in zero_fields)
+                and all(money(economics[k]) == notional for k in cost_fields))
+    except scanner.API_ERRORS:
+        return False
+
+
 def review_observation(before, after, receipt, activity, market_id, exchange_id):
     """Compare ONE completed leg using supplied full snapshots/actual receipt.
 
@@ -251,7 +272,8 @@ def review_observation(before, after, receipt, activity, market_id, exchange_id)
             result["issues"].append("TRADE_LEDGER_RECONCILIATION_UNAVAILABLE")
         if any(r["event_type"] != "trade" or scanner.numeric_id(r["exchangeId"]) != eid for r in new):
             result["issues"].append("LEDGER_ATTRIBUTION_UNVERIFIED")
-        if receipt["all"] is not None or any((r.get("transactionType") or "").startswith("ALL_") for r in new):
+        if not ordinary_cash_receipt(receipt["all"], notional) or any(
+                (r.get("transactionType") or "").startswith("ALL_") for r in new):
             result["issues"].append("COLLATERAL_CASH_EFFECT_UNVERIFIED")
         # An isolated probe must not silently attribute another fill/trade to
         # its receipt. Timestamp proximity alone is not a documented ledger join.
