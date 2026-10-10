@@ -38,6 +38,8 @@ from paper_trader import parse_api_timestamp, validate_market_context, validate_
 ALLOCATION_PATH = Path(__file__).resolve().with_name("live_pilot_allocation.json")
 UNCERTAIN_STATES = {"SUBMITTING", "UNKNOWN", "CANCEL_REQUESTED", "CANCEL_UNKNOWN", "EXECUTING", "CANCELLING"}
 DISABLED, READY, EXECUTING, HALTED = "DISABLED", "READY", "EXECUTING", "HALTED_MANUAL_REVIEW"
+# Historical terminal status, never an active execution state.
+REJECTED_RETIRED = "REJECTED_RETIRED"
 PILOT_STATES = {DISABLED, READY, EXECUTING, HALTED}
 LEG1_SUBMITTING, LEG1_RECONCILING, LEG2_RECHECK = "LEG1_SUBMITTING", "LEG1_RECONCILING", "LEG2_RECHECK"
 LEG2_SUBMITTING, FINAL_RECONCILING = "LEG2_SUBMITTING", "FINAL_RECONCILING"
@@ -153,7 +155,8 @@ def validate_checkpoint(checkpoint):
         "manual_review_required", "review_reason", "configured_allocation", "confirmed_cumulative_debits",
         "live_exposures", "quarantine_reserve", "reserved_unconfirmed_capital", "total_live_exposure",
         "calculated_remaining_allocation", "state", "revision", "created_at", "updated_at"}
-    optional = {"baseline_snapshot", "baseline_snapshot_hash", "autonomous_execution", "autonomous_positions"}
+    optional = {"baseline_snapshot", "baseline_snapshot_hash", "autonomous_execution", "autonomous_positions",
+                "settlement_halt_recoveries"}
     require(isinstance(checkpoint, dict) and fields.issubset(checkpoint)
             and not set(checkpoint) - fields - optional
             and ("baseline_snapshot" in checkpoint) == ("baseline_snapshot_hash" in checkpoint),
@@ -207,7 +210,7 @@ def validate_checkpoint(checkpoint):
                     and all(isinstance(value, str) and scanner.numeric_id(value) == value for value in ids),
                     "Invalid saved pilot instrument IDs")
         position = checkpoint.get("autonomous_positions", {}).get(fingerprint)
-        if position is None or position["status"] != "CLOSED":
+        if exposure["execution_status"] != REJECTED_RETIRED and (position is None or position["status"] != "CLOSED"):
             require(not seen_exchanges.intersection(exposure["exchange_ids"]), "Duplicate saved pilot exchange exposure")
             seen_exchanges.update(exposure["exchange_ids"])
         for key in ("confirmed_quantities", "confirmed_costs", "possible_additional_quantities", "limit_prices"):
@@ -236,9 +239,15 @@ def validate_checkpoint(checkpoint):
         else:
             known_debit = known_cost
         require(known_debit == amount(costs.get(fingerprint, 0)), "Saved pilot exposure and confirmed debit disagree")
-        require(exposure["execution_status"] in {EXECUTING, "RECONCILED_PAIR", "AWAITING_MANUAL_SECOND_LEG", "MANUAL_REVIEW"},
+        require(exposure["execution_status"] in {EXECUTING, "RECONCILED_PAIR", "AWAITING_MANUAL_SECOND_LEG", "MANUAL_REVIEW", REJECTED_RETIRED},
                 "Invalid saved execution status")
-        if exposure["execution_status"] == "RECONCILED_PAIR":
+        if exposure["execution_status"] == REJECTED_RETIRED:
+            require("capital_charge" in exposure and "autonomous_execution" in checkpoint
+                    and checkpoint["autonomous_execution"]["attempts"].get(fingerprint, {}).get("state") == REJECTED_RETIRED
+                    and all(amount(v) == 0 for key in ("confirmed_quantities", "confirmed_costs", "possible_additional_quantities")
+                            for v in exposure[key]) and amount(exposure["capital_charge"]) == amount(exposure["accounting_buffer"]) == 0,
+                    "Retired rejection has exposure or lacks its audit history")
+        elif exposure["execution_status"] == "RECONCILED_PAIR":
             require(list(map(amount, exposure["confirmed_quantities"])) == [1, 1]
                     and list(map(amount, exposure["possible_additional_quantities"])) == [0, 0],
                     "Reconciled saved pair is incomplete")
@@ -277,6 +286,9 @@ def validate_checkpoint(checkpoint):
     if "autonomous_positions" in checkpoint:
         from autonomous_pilot import validate_positions as validate_autonomous_positions
         validate_autonomous_positions(checkpoint)
+    if "settlement_halt_recoveries" in checkpoint:
+        from recover_settlement_halt import validate_history
+        validate_history(checkpoint["settlement_halt_recoveries"])
 
 
 def snapshot_hash(snapshot):
@@ -302,7 +314,7 @@ def _read_checkpoint_locked(path):
         raise PilotBlocked("HALTED_MANUAL_REVIEW: pilot allocation checkpoint missing or invalid; manual review required") from error
 
 
-def _save_checkpoint_locked(checkpoint, path, new=False):
+def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False, settlement_recovery=False, filled_recovery=False):
     """Validate then fsync/replace/fsync-directory while holding one stable lock."""
     require(_state_lock_owners.get(path) == (os.getpid(), threading.get_ident()),
             "Pilot state mutation requires the exclusive process lock")
@@ -318,7 +330,23 @@ def _save_checkpoint_locked(checkpoint, path, new=False):
         require(all(proposed.get(key) == previous.get(key) for key in
                     ("baseline_snapshot", "baseline_snapshot_hash")),
                 "Immutable baseline account observations changed")
-        require(not previous["manual_review_required"] or proposed["state"] == HALTED,
+        if rejected_recovery:
+            # Only the dedicated, GET-reconciled recovery may clear this one
+            # permission rejection. Ordinary state saves cannot clear halts.
+            from recover_rejected_attempt import validate_transition
+            validate_transition(previous, proposed)
+        require(sum((bool(rejected_recovery), bool(settlement_recovery), bool(filled_recovery))) <= 1,
+                "Recovery types cannot be combined")
+        if settlement_recovery:
+            from recover_settlement_halt import validate_transition
+            validate_transition(previous, proposed)
+        else:
+            require(proposed.get("settlement_halt_recoveries") == previous.get("settlement_halt_recoveries"),
+                    "Settlement recovery audit cannot change outside explicit recovery")
+        if filled_recovery:
+            from recover_filled_leg1 import validate_transition
+            validate_transition(previous, proposed)
+        require(rejected_recovery or settlement_recovery or filled_recovery or not previous["manual_review_required"] or proposed["state"] == HALTED,
                 "A persistent manual-review halt cannot be cleared automatically")
         for fingerprint, cost in previous["accounted_pair_costs"].items():
             require(fingerprint in proposed["accounted_pair_costs"]
@@ -343,7 +371,7 @@ def _save_checkpoint_locked(checkpoint, path, new=False):
                 "Saved quarantine reserve cannot disappear")
         if "autonomous_execution" in previous:
             from autonomous_pilot import validate_update
-            validate_update(previous, proposed)
+            validate_update(previous, proposed, rejected_recovery=rejected_recovery, filled_recovery=filled_recovery)
     proposed["revision"] += 1
     proposed["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     validate_checkpoint(proposed)
@@ -484,9 +512,18 @@ def pilot_risk(account, exchange_ids, proposed_capital, quantity, checkpoint):
             stored_holdings += q * c if position else c
             if q:
                 row = positions.get(exchange_id)
+                expected_basis = c
+                recovered = checkpoint.get("autonomous_execution", {}).get("attempts", {}).get(key, {}).get("filled_leg1_recovery")
+                if recovered and exchange_id == exposure["exchange_ids"][0]:
+                    # This exact recovery proved the API's rounded .08 basis
+                    # against the .075 fill. Keep comparing to that saved API
+                    # basis exactly; do not introduce a generic cost tolerance.
+                    saved_row = next(r for r in recovered["snapshot"]["account"]["positions"]
+                                     if scanner.numeric_id(r["exchangeId"]) == exchange_id)
+                    expected_basis = amount(saved_row["costBasis"])
                 require(row is not None and scanner.numeric_id(row["marketId"]) == market_id
                         and abs(Decimal(str(row["quantity"])) + q) <= Decimal(".000000001")
-                        and abs(amount(row["costBasis"]) - c) <= Decimal(".00000001")
+                        and abs(amount(row["costBasis"]) - expected_basis) <= Decimal(".00000001")
                         and row["settled"] is False, "Actual holdings disagree with persisted pilot exposure; manual review required")
     holdings = max(amount(risk["existing_holdings_cost_basis"]), stored_holdings)
     # Include external orders as well as saved possible pilot fills. They can

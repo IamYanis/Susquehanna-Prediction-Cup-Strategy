@@ -466,7 +466,7 @@ def execute_first_leg(session, market_ids, first_market, command_requested=False
         request = {"idempotencyKey": f"account-test-{uuid4().hex}", "exchangeId": approval["exchange_ids"][index],
                    "side": "no", "action": "buy", "quantity": 1, "price": fresh["prices"][index],
                    "tournamentId": approval["tournament_id"],
-                   "expirationDate": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()}
+                   "expirationDate": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(timespec="milliseconds")}
         fingerprint = hashlib.sha256(json.dumps(request, sort_keys=True).encode()).hexdigest()
         record = {"version": 1, "mode": MODE, "state": "PREPARED", "created_at": datetime.now(timezone.utc).isoformat(),
                   "fingerprint": fingerprint, "preview": fresh, "request": request, "reads": reads.reads,

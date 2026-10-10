@@ -153,6 +153,37 @@ class AutonomousLifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.posts), 2)
         self.assertEqual(len(self.fixture.checkpoint()["autonomous_positions"]), 1)
 
+    def test_normalized_api_expiry_passes_entry_and_sale(self):
+        original_post = self.post
+        def normalized(url, **kwargs):
+            response = original_post(url, **kwargs)
+            order = self.fixture.fixture.receipts[response.json()["orderId"]][0]
+            expiry = auto.single.parse_api_timestamp(order["expirationDate"])
+            order["expirationDate"] = expiry.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+            return response
+        self.session.post.side_effect = normalized
+        self.assertEqual(self.cycle()["state"], pilot.READY)
+        self.quote_exit(.495)
+        self.assertEqual(self.manage()["state"], pilot.READY)
+        self.assertEqual(len(self.posts), 4)
+        for body in self.posts:
+            self.assertRegex(body["expirationDate"], r"\.\d{3}\+00:00$")
+
+    def test_different_sale_expiry_millisecond_still_halts(self):
+        self.assertEqual(self.cycle()["state"], pilot.READY)
+        self.quote_exit(.495)
+        original_post = self.post
+        def changed(url, **kwargs):
+            response = original_post(url, **kwargs)
+            order = self.fixture.fixture.receipts[response.json()["orderId"]][0]
+            from datetime import timedelta
+            expiry = auto.single.parse_api_timestamp(order["expirationDate"]) + timedelta(milliseconds=1)
+            order["expirationDate"] = expiry.isoformat(timespec="milliseconds")
+            return response
+        self.session.post.side_effect = changed
+        self.assertEqual(self.manage()["state"], pilot.HALTED)
+        self.assertEqual(len(self.posts), 3)  # No second sale after the mismatch.
+
     def test_closed_market_without_settlement_event_remains_hold(self):
         self.cycle()
         for m in self.fixture.markets.values():

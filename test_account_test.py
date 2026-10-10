@@ -117,6 +117,35 @@ class AccountTestTests(unittest.TestCase):
                 "expirationDate": body["expirationDate"], "quantityFilled": filled,
                 "terminalReasonCode": None if opened else "cancelled"}
 
+    def test_expiry_comparison_discards_only_submillisecond_precision(self):
+        client = "2026-10-10T17:16:27.154575+00:00"
+        for reported in ("2026-10-10T17:16:27.154Z", "2026-10-10T17:16:27.154+00:00",
+                         "2026-10-10T18:16:27.154+01:00"):
+            with self.subTest(reported=reported):
+                self.assertTrue(supervised.same_order_expiry(client, reported))
+        self.assertFalse(supervised.same_order_expiry(client, "2026-10-10T17:16:27.155Z"))
+        for invalid in (None, "invalid", "2026-10-10T17:16:27.154"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                supervised.same_order_expiry(client, invalid)
+
+    def test_normalized_expiry_does_not_relax_other_order_parameters(self):
+        intent = self.accepted()
+        intent["request"]["expirationDate"] = "2026-10-10T17:16:27.154575+00:00"
+        intent["approval"] = supervised.approval_hash(intent)
+        order = self.detail(intent)
+        order["expirationDate"] = "2026-10-10T17:16:27.154Z"
+        self.session.get.side_effect = None
+        self.session.get.return_value = self.response(order)
+        self.assertEqual(supervised.read_order(self.session, intent), order)
+        for field, value in (("id", 102), ("exchangeId", "99"), ("tournamentId", OTHER_TOURNAMENT_ID),
+                             ("action", "sell"), ("side", "no"), ("priceLimit", .6), ("quantity", 2),
+                             ("expirationDate", "2026-10-10T17:16:27.155Z")):
+            bad = dict(order, **{field: value})
+            self.session.get.return_value = self.response(bad)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                supervised.read_order(self.session, intent)
+        self.session.post.assert_not_called()
+
     def fills(self, intent, filled=0, price=.35, rows=None, more=False, cursor=None):
         side = intent["request"]["side"]
         signed = filled if side == "yes" else -filled

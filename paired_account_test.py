@@ -369,12 +369,12 @@ def prepare_pair(session, directory, democrat_id, republican_id, slug="midterm-e
     else:
         preview = preview_pair(session, account, democrat_id, republican_id, "NO-PAIR", started, quantity=1)
     now = datetime.now(timezone.utc)
-    expiry = (now + timedelta(minutes=15)).isoformat(timespec="seconds")
+    expiry = (now + timedelta(minutes=15)).isoformat(timespec="milliseconds")
     legs = []
     for market_id, leg in zip(preview["market_context"]["market_ids"], preview["request"]["legs"]):
         body = dict(leg, idempotencyKey="account-test-" + uuid4().hex, expirationDate=expiry)
         intent = {"version": 1, "market_id": market_id, "tournament_slug": slug,
-                  "created_at": now.isoformat(timespec="seconds"), "request": body,
+                  "created_at": now.isoformat(timespec="milliseconds"), "request": body,
                   "state": "PREPARED", "order_id": None, "observation": None}
         intent["approval"] = single.approval_hash(intent)
         single.validate_intent(intent)

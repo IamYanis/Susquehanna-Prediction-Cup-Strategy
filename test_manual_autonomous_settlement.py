@@ -34,16 +34,21 @@ class ManualAutonomousSettlementTests(unittest.TestCase):
         patcher = patch.object(live, "MANUAL_AUTONOMOUS_PATH", self.path)
         patcher.start()
         self.addCleanup(patcher.stop)
-        self.policy = b"<html><main>Official synthetic ordinary settlement and refund policy.</main></html>"
+        self.policy = (b'<html><div class="markdown-content"><h1>Settlement &amp; Payouts</h1>'
+                       b'<p>Official synthetic ordinary settlement and refund policy.</p></div></html>')
         self.session.get.side_effect = self.get
         self.approval = copy.deepcopy(self.fixture.approval)
-        self.approval.update(verification_route=live.MANUAL_AUTONOMOUS, evidence_version=1,
+        self.approval.update(verification_route=live.MANUAL_AUTONOMOUS, evidence_version=2,
+            policy_content_format=manual.POLICY_CONTENT_FORMAT, policy_content_sha256="0" * 64, market_root_sha256="0" * 64,
             settlement_rationale="Human-reviewed interpretation: these exact two synthetic party-winner outcomes cannot both hold.",
             limitations=list(manual.REQUIRED_LIMITATIONS))
         self.approval["source_refs"] = live.evidence_sources(self.approval)
         self.fixture.write_authorizations([])
         self.write_manual([])
-        self.approval["evidence_hash"] = self.evidence()["evidence_hash"]
+        evidence = self.evidence()
+        self.approval.update(policy_content_sha256=evidence["settlement_policy_sha256"],
+                             market_root_sha256=evidence["market_root_sha256"])
+        self.approval["evidence_hash"] = manual.evidence_hash(evidence, self.approval)
         self.write_manual([self.approval])
         self.session.get.reset_mock()
         self.paper_before = self.fixture.base.approval_path.read_bytes()
@@ -108,7 +113,7 @@ class ManualAutonomousSettlementTests(unittest.TestCase):
         self.assertEqual(allowed, {"NO-PAIR"})
         self.assertEqual(context["authorization_tier"], live.MANUAL_AUTONOMOUS)
         self.assertFalse(context["machine_verified"])
-        self.assertEqual(context["manual_evidence"]["settlement_policy_sha256"], hashlib.sha256(self.policy).hexdigest())
+        self.assertEqual(context["manual_evidence"]["settlement_policy_sha256"], hashlib.sha256(manual.policy_content(self.policy)).hexdigest())
         self.assertEqual(self.fixture.path.read_bytes(), before)
         self.assertEqual(self.fixture.base.approval_path.read_bytes(), self.paper_before)
         self.assert_no_post()
@@ -209,7 +214,7 @@ class ManualAutonomousSettlementTests(unittest.TestCase):
     def test_quantity_relationship_mode_version_sources_and_limitations_are_strict(self):
         for key, value in (("max_quantity", 2), ("max_quantity", True), ("position_types", ["YES-PAIR"]),
                            ("relationship_type", "correlated"), ("execution_mode", live.SUPERVISED_MODE),
-                           ("evidence_version", True), ("evidence_version", 2), ("limitations", []),
+                           ("evidence_version", True), ("evidence_version", 3), ("limitations", []),
                            ("source_refs", ["https://example.org/settlement"]), ("approved_at", None)):
             changed = copy.deepcopy(self.approval)
             changed[key] = value
@@ -240,11 +245,42 @@ class ManualAutonomousSettlementTests(unittest.TestCase):
                 self.verify()
         self.assert_no_post()
 
-    def test_changed_policy_bytes_and_unchanged_url_require_revalidation(self):
-        self.policy += b" Different cancellation rule."
-        with self.assertRaisesRegex(live.LiveSettlementBlocked, "changed"):
+    def test_changed_policy_text_and_unchanged_url_require_revalidation(self):
+        self.policy = self.policy.replace(b"refund policy.", b"refund policy. Different cancellation rule.")
+        with self.assertRaisesRegex(live.LiveSettlementBlocked, "Policy content changed"):
             self.verify()
         self.assert_no_post()
+
+    def test_reordered_scripts_and_framework_updates_preserve_authorization(self):
+        original = self.approval["evidence_hash"]
+        for scripts in (b'<script src="a.js"></script><script src="b.js"></script>',
+                        b'<script src="b.js"></script><script src="a.js"></script>',
+                        b'<script>self.__next_f.push([999,"different runtime"])</script><style>body{color:red}</style>'):
+            with self.subTest(scripts=scripts):
+                self.policy = scripts + self.policy + b'<!-- unrelated deployment metadata -->'
+                self.verify()
+                self.assertEqual(self.evidence()["evidence_hash"], original)
+        self.assert_no_post()
+
+    def test_component_diagnostics_preserve_market_and_id_checks(self):
+        self.fixture.nodes["1"]["root"]["contract_details"]["winnerName"] = "Changed winner"
+        with self.assertRaisesRegex(live.LiveSettlementBlocked, "Market/root evidence changed"):
+            self.verify()
+        self.fixture.markets["1"]["exchanges"][0]["id"] = "99"
+        with self.assertRaisesRegex(live.LiveSettlementBlocked, "IDs/mappings"):
+            self.verify()
+        changed = copy.deepcopy(self.approval)
+        changed["source_refs"][1] += "&otherSource=true"
+        with self.assertRaisesRegex(live.LiveSettlementBlocked, "Sources"):
+            live.validate_authorization(changed)
+
+    def test_legacy_record_remains_readable_but_cannot_supply_new_eligibility(self):
+        old = {k: v for k, v in self.approval.items()
+               if k not in {"policy_content_format", "policy_content_sha256", "market_root_sha256"}}
+        old["evidence_version"] = 1
+        live.validate_authorization(old)  # Immutable historical intent/receipt records.
+        with self.assertRaisesRegex(live.LiveSettlementBlocked, "legacy raw-HTML approval"):
+            manual.require_matching_evidence(old, self.evidence())
 
     def test_approval_rationale_limitations_timestamp_version_and_sources_are_hash_bound(self):
         for key, value in (("settlement_rationale", "Different human assumption"), ("approval_version", 2),
@@ -329,7 +365,7 @@ class ManualAutonomousSettlementTests(unittest.TestCase):
     def test_policy_change_after_leg_one_halts_with_one_sided_exposure(self):
         def post_then_change(url, **kwargs):
             response = self.fixture.post(url, **kwargs)
-            self.policy += b" Changed after first fill."
+            self.policy = self.policy.replace(b"refund policy.", b"refund policy. Changed after first fill.")
             return response
         self.session.post.side_effect = post_then_change
         cp = self.fixture.assert_halted(1)

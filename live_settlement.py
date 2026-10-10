@@ -68,6 +68,8 @@ def validate_authorization(approval):
         "settlement_rationale", "evidence_hash", "source_refs", "limitations", "approved_at"}
     if manual_autonomous:
         fields.add("evidence_version")
+        if approval.get("evidence_version") == 2:
+            fields.update({"policy_content_format", "policy_content_sha256", "market_root_sha256"})
     require(isinstance(approval, dict) and set(approval) == fields,
         "Live settlement authorization is incomplete or invalid")
     require(type(approval["approval_version"]) is int and approval["approval_version"] >= 1,
@@ -91,9 +93,16 @@ def validate_authorization(approval):
     require(approval["execution_mode"] != AUTONOMOUS_MODE or approval["verification_route"] in {MACHINE, MANUAL_AUTONOMOUS},
             "Autonomous execution requires machine-readable verification or a distinct manual autonomous approval")
     if manual_autonomous:
-        from manual_autonomous_settlement import REQUIRED_LIMITATIONS
+        from manual_autonomous_settlement import REQUIRED_LIMITATIONS, POLICY_CONTENT_FORMAT
+        # Historical v1 approvals remain readable in immutable execution audit.
+        # Fresh manual eligibility below requires the migrated v2 binding.
         require(approval["execution_mode"] == AUTONOMOUS_MODE and type(approval["evidence_version"]) is int
-                and approval["evidence_version"] == 1, "Manual autonomous permission has invalid evidence version/mode")
+                and approval["evidence_version"] in {1, 2}, "Manual autonomous permission has invalid evidence version/mode")
+        if approval["evidence_version"] == 2:
+            require(approval["policy_content_format"] == POLICY_CONTENT_FORMAT
+                    and all(isinstance(approval[k], str) and re.fullmatch(r"[0-9a-f]{64}", approval[k])
+                            for k in ("policy_content_sha256", "market_root_sha256")),
+                    "Policy content/market-root fingerprints are missing or invalid")
         require(isinstance(approval["limitations"], list)
                 and all(value in approval["limitations"] for value in REQUIRED_LIMITATIONS),
                 "Manual autonomous approval must explicitly acknowledge all settlement/execution limitations")
@@ -103,7 +112,7 @@ def validate_authorization(approval):
         require(isinstance(approval[key], list) and approval[key]
                 and all(isinstance(value, str) and value.strip() for value in approval[key]),
                 "Live approval must record official sources and limitations")
-    require(approval["source_refs"] == evidence_sources(approval), "Live evidence sources do not match the authorized IDs/route")
+    require(approval["source_refs"] == evidence_sources(approval), "Sources: live references do not match authorized IDs/route")
     require(parse_api_timestamp(approval["approved_at"]).tzinfo is not None, "Approval time must include a timezone")
 
 
@@ -191,21 +200,27 @@ def revalidate_authorization(approval):
         raise LiveSettlementBlocked("Previously selected live authorization was removed, changed or is invalid") from error
 
 
+def check_pair_identity(approval, markets, tournament_id):
+    try:
+        scanner.check_approved_pair(approval, markets, tournament_id)
+    except scanner.API_ERRORS as error:
+        raise LiveSettlementBlocked("IDs/mappings: market IDs, exchanges or tournament scope changed") from error
+
+
 def verify_settlement(session, markets, tournament_id, approval):
     """Revalidate the explicitly chosen route; never fall back to paper approval."""
     try:
         validate_authorization(approval)
         revalidate_authorization(approval)
-        scanner.check_approved_pair(approval, markets, tournament_id)
+        check_pair_identity(approval, markets, tournament_id)
         quarantine.require_unblocked_markets(approval["market_ids"])
         quarantine.require_unblocked_exchanges(approval["exchange_ids"])
         if approval["verification_route"] == MACHINE:
             allowed, context = scanner.get_pair_rules(session, *markets, tournament_id)
         elif approval["verification_route"] == MANUAL_AUTONOMOUS:
-            from manual_autonomous_settlement import read_evidence
+            from manual_autonomous_settlement import read_evidence, require_matching_evidence
             evidence = read_evidence(session, markets, approval)
-            require(evidence["evidence_hash"] == approval["evidence_hash"],
-                    "Manual autonomous IDs, mapping, rules, sources or policy content changed")
+            require_matching_evidence(approval, evidence)
             context = {"mode": MANUAL_AUTONOMOUS, "tournament_id": tournament_id,
                        "market_ids": approval["market_ids"], "exchange_ids": approval["exchange_ids"],
                        "settlement_fingerprint": evidence["evidence_hash"], "manual_evidence": evidence,

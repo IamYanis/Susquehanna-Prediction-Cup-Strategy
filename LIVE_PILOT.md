@@ -7,6 +7,125 @@ checks. The bot was not started and no order was submitted during enablement.
 Starting the command below runs live autonomous trading; every entry still
 repeats all existing checks. The legacy/probe submission switch remains False.
 
+## Stable manual autonomous policy evidence — 10 October 2026
+
+The raw policy page can reorder identical framework scripts without changing
+its settlement article. Manual autonomous evidence version **2** now hashes the
+single rendered `div.markdown-content` article instead of the entire page.
+`settlement-article-html-v1` preserves article text, headings/lists/structure and
+semantic attributes such as link destinations. It excludes scripts, styles,
+templates, comments, surrounding navigation and presentation/runtime attributes.
+Missing, duplicate, incomplete or unexpected articles fail closed. Substantive
+article or complete resolution-root changes still require human revalidation.
+
+The revalidated article content hash is:
+`9d98f07bea2cc4a70275f963716ee9c8a3d843a0b89c6f17ac8c4513970ca76c`.
+
+The three existing approvals were migrated only after fresh official GETs
+confirmed unchanged instrument identities/status, complete roots and policy
+content against the reviewed evidence. Their identities, rationale, limitations,
+approval times, quantity and strategy/risk limits are unchanged. New explicit
+`policy_content_sha256` and `market_root_sha256` components permit diagnostics
+that identify policy content, market/root evidence, IDs/mappings or sources.
+The combined evidence hash also binds these components and all approval fields.
+Historical version-1 records remain readable in execution audit, but cannot
+supply new live eligibility.
+
+| Approval | Regenerated evidence SHA-256 |
+| --- | --- |
+| Alaska 377/378, exchanges 1066/1067 | `79e908a4eb136860492f23dc3b2fe2e021d317ba543b474d9faeb57334e14b0e` |
+| New Hampshire 381/382, exchanges 1070/1071 | `e5a2f1e6e651defdfb94e23c5726153a448f004e190e932ad98aa58d4dd8f1f8` |
+| Colorado 256/257, exchanges 945/946 | `1718b24e864de090f25253d0df51accaaf3e6d04d50f27ac0fb88532ec0f383d` |
+
+Approval migration does **not** clear the persisted settlement halt. The separate
+supported recovery for this diagnosed pre-entry, zero-debit false positive is:
+
+```bash
+.venv/bin/python recover_settlement_halt.py --dry-run
+```
+
+Only after explicitly choosing to clear it, run:
+
+```bash
+.venv/bin/python recover_settlement_halt.py --apply
+```
+
+Both commands take the existing exclusive lock, revalidate all three migrated
+approvals from official GETs, bracket a complete fresh account snapshot with
+all-status order-history reads, and require unchanged cash/inventory/fills/
+transactions, no holdings/open orders/new orders, no active execution, zero
+pilot debit/unconfirmed reservation, and unchanged quarantine. This narrowly
+supports the original generic settlement-hash halt; execution/partial/unknown
+halts cannot use it. `--apply` makes one atomic local write to READY and appends
+the original halt reason, checkpoint hash/revision/time, approvals, fresh
+evidence, account snapshot and redacted GET responses to immutable
+`settlement_halt_recoveries` history. Allocation, quarantined reserve, retired
+intents and execution history do not change. Ordinary saves cannot clear a halt
+or modify this audit. The command never starts the bot or submits/cancels/retries
+an order. Recovery has **not** been applied during this implementation.
+
+Validation: **81 focused tests passed; 634 full-suite tests passed**. Tests cover
+the same article with reordered 25-script renderings, unrelated framework and
+template changes, real text/structure/link changes, component diagnostics,
+market/root mismatches, all three migrated records against replayed official
+snapshots, and guarded audited recovery using disposable state. Fresh official
+GET validation passed for all three pairs. The supported recovery dry run also
+passed (30 GETs, zero orders, no state write): revision 14 remains
+HALTED_MANUAL_REVIEW, zero confirmed pilot debit/unconfirmed reservation,
+0.125 quarantined reserve, and 4,999.875 remaining allocation. Protected-file
+hashes confirm unchanged `.env`, runtime state, frozen journals, strategy code,
+trading configuration and paper portfolio. No commit was made.
+
+## Explicit recovery of a rejected first-leg submission
+
+The 10 October first submission received **HTTP 403 / INSUFFICIENT_SCOPES**,
+with `trade` listed as required and missing. It remains halted until an explicit
+local recovery is applied. Buy and sell permission rejections now report that
+specific cause; other ambiguous HTTP/transport failures still halt without retry.
+
+The fresh official API reference at `https://sig.thesuper.market/api/v1/docs`
+has no read-only API-key-scope endpoint. GET `/account` returns profile/balance,
+not permissions. Successful GETs cannot establish `trade` scope. Confirm that
+permission externally in the platform's API-key settings before restarting live
+trading. No undocumented scope endpoint or submission-based permission test is
+used. There is also no documented GET order lookup by idempotency key.
+
+Run the supported **GET-only dry run** (also the default):
+
+```bash
+.venv/bin/python recover_rejected_attempt.py --dry-run --attempt 20854ba7991d0fa57907b7ff444d131723042ff672e776c81f85e68e632084c2
+```
+
+Only after explicitly choosing to change local state, use the same command with
+`--apply` instead of `--dry-run`. It repeats all GET reconciliation; it never
+starts the bot, submits/cancels an order, or retries the rejected key.
+
+Recovery requires the preserved, specific missing-trade 403, leg one halted in
+`LEG1_SUBMITTING`, no accepted receipt/order ID/observed fill, and no leg-two
+intent or POST. It holds the existing exclusive flock without creating files or
+repairing state. Complete, scoped **all-status order history** is read before and
+after the existing full account snapshot. Recovery requires no new pair order,
+no open orders, no pair holding, unchanged inventory, complete unchanged fill
+and transaction history, exactly unchanged reported cash, unchanged quarantine,
+fresh data, and no other unfinished pilot/probe/legacy execution. Incomplete
+coverage, unknown outcomes or inconsistent state cannot use this recovery.
+
+One atomic checkpoint write changes the attempt to `REJECTED_RETIRED` and saves
+`RETIRED_NEVER_RETRY`, its original key, prior checkpoint hash, original exposure,
+timestamp, full reconciliation snapshot/order history and redacted raw GET
+evidence. Original intent, raw 403, before-snapshot, reads and halt reason remain
+in history. Retirement is immutable on subsequent saves/restarts, and the key
+continues to participate in duplicate-key checks. The zero-exposure history
+entry remains; it cannot become an active attempt or a completed position.
+
+For this attempt the proposed change is: halt -> READY, active attempt -> none,
+reservation **0.115 -> 0**, confirmed pilot debits **0 -> 0**, quarantine
+**0.125 -> 0.125**, available allocation **4999.760 -> 4999.875** SUSQies.
+The immutable 5000 allocation and all strategy/risk/authorization settings remain
+unchanged. Dry run writes nothing. Ordinary state saves still cannot clear a
+halt; this command supports only the definite first-leg missing-trade rejection,
+not market 387's UNKNOWN state or generic timeouts/rejections.
+
 ## Current lifecycle
 
 The executable foreground strategy lives in `autonomous_pilot.py` and reuses the
@@ -145,7 +264,7 @@ Neither a matching title nor a different race grants authorization.
 
 Each full JSON record stores stable IDs, mode, quantity, timestamp, rationale,
 limitations, scoped official sources and its own evidence hash. That hash also
-binds the complete current resolution roots and official policy HTML SHA-256
+binds the complete current resolution roots and official policy article SHA-256
 `ae4d6d3c25fefb3a232de629883071a60be818624be05d81467b888838e285f7`.
 Quotes are intentionally not pinned in the authorization: every scan and
 pre-submit check obtains fresh executable prices.
@@ -260,14 +379,15 @@ version/time, pair label, tournament UUID/slug, ordered market/exchange IDs,
 `max_quantity: 1`, `execution_mode: "autonomous-one-contract"`, reviewed
 settlement rationale, exact source URLs, evidence SHA-256 and limitations.
 Its distinct `verification_route` is `"MANUAL_AUTONOMOUS_APPROVAL"` and it also
-requires `evidence_version: 1`. Such records are rejected in the old live file;
+requires `evidence_version: 2` and separate policy-content/market-root hashes.
+Historical version-1 records are readable for audit only. Such records are rejected in the old live file;
 machine/supervised records are rejected in the new file. Duplicate entries,
 malformed JSON, missing files and mismatched IDs/scope fail closed.
 
 `manual_autonomous_settlement.read_evidence` is GET-only. It resolves the exact
 tournament UUID from its slug, checks the open scoped market/exchange IDs,
 reads both complete resolution roots and fetches actual official settlement
-policy HTML. The SHA-256 binds every approval field except the hash itself,
+policy article content. The SHA-256 binds every approval field except the hash itself,
 including the human's rationale, limitations, timestamp/version and source
 URLs, plus stable open instrument metadata, full roots and the policy-content
 SHA-256. Indicative prices and account cash are not settlement evidence.
@@ -292,8 +412,9 @@ prove the human interpretation correct. Exceptional settlements may lose money.
 Every preflight and leg-two settlement check refetches the evidence and compares
 the approved hash. Changed IDs/mapping/status, roots, sources or policy return
 `LIVE_SETTLEMENT_NEEDS_REVALIDATION`; the existing coordinator persists its
-manual-review halt and never clears it automatically. Full HTML hashing also
-blocks cosmetic/document deployments, conservatively requiring reapproval.
+manual-review halt and never clears it automatically. Reordered scripts and
+unrelated framework deployments do not change the article fingerprint; actual
+article content or root changes require reapproval.
 Permission edits/revocation/tier changes are checked again before each POST and
 halt an existing attempt rather than changing its saved binding. Restart still
 halts unfinished executions and never submits another leg.
@@ -446,7 +567,7 @@ When deliberately initializing the allocation for the first time, run:
 This explicit command reads the enrolled Midterm Elections account with GETs and
 saves a new **DISABLED** baseline. It refuses an existing state file, checks the
 existing execution/quarantine gates, and never prepares or submits an order.
-No reset, migration, or halt-clear command is provided. If state is lost or an old
+No reset, migration, or generic halt-clear command is provided. If state is lost or an old
 version is present, review/recover the original records; do not initialize a new
 budget over previously used allocation. This implementation task did not run
 initialization against the real account.
@@ -623,7 +744,7 @@ Readiness flows as follows:
 `LIVE_SETTLEMENT_NEEDS_REVALIDATION` is saved in the existing durable pilot halt
 reason under the exclusive pilot lock. It survives restart. Restoring old
 quotes/evidence or editing either approval file does not clear it automatically.
-A new human review is required; no halt-clear command is provided. Corrupt,
+A new human review is required; no settlement halt-clear command is provided. Corrupt,
 duplicate, wrong-mode or incomplete live configurations also fail closed and
 require review. The second-leg diagnostic rereads this separate permission and
 fresh official evidence; removal/change after leg one persists the same halt.
@@ -1554,3 +1675,72 @@ Validation: **132 focused tests passed; 465 full-suite tests passed**.
 Protected-file fingerprints confirmed that only the five requested files changed.
 The real live authorization list remains empty, the durable baseline is unchanged,
 and no accounting-probe journal was created.
+## Filled first-leg expiry normalization recovery (Colorado, 10 October 2026)
+
+`account_test.same_order_expiry` parses aware ISO timestamps, converts them to
+UTC and discards only precision finer than a millisecond. `Z` and `+00:00` are
+equivalent; a different millisecond still fails. Entry/probe/legacy order-intent
+verification and autonomous sale reconciliation share this helper. New order
+expiries use milliseconds. Identity, action, side, quantity and price checks
+retain their existing exact checks. Historical saved requests are never changed.
+
+`recover_filled_leg1.py` supports only the diagnosed Colorado attempt:
+market 256/exchange 945, BUY one NO at 0.075, order 29229136/fill 122411192.
+It uses the existing exclusive lock, fresh settlement revalidation, complete
+GET-only order/fill/holding/transaction reads and balance reconciliation.
+Any extra order/fill, missing holding, contradictory ledger/collateral effect,
+unexplained cash movement or unresolved other execution keeps the halt.
+
+Read-only preview (default; no state change or order adapter):
+
+```bash
+.venv/bin/python recover_filled_leg1.py --attempt 7d4dcd813328d03afef241e8baba01e8117ccf0bf924d19885105a2f4c724623 --dry-run
+```
+
+Only after explicitly approving recovery, this command repeats all GET checks
+and performs one atomic local reconciliation write; it never submits leg two:
+
+```bash
+.venv/bin/python recover_filled_leg1.py --attempt 7d4dcd813328d03afef241e8baba01e8117ccf0bf924d19885105a2f4c724623 --apply
+```
+
+Expected state from the fresh recovery preview:
+
+- State `LEG2_RECHECK`; same active attempt, leg-one key retired from submission.
+- Original request, raw receipt, halt reason and read/stage history retained in
+  the immutable recovery audit. Leg two remains without an intent or POST.
+- Confirmed quantities `[1, 0]`, precise fill costs `[0.075, 0]`; the one-sided
+  share is retained. No paper state is used.
+- Displayed cash 20,572.37 -> 20,572.29: a reported 0.08 debit, consistent with
+  the 0.075 notional within the existing 0.02 rounding bound. This is still the
+  historical zero-extra-fee assumption, not formal proof or a new fee charge.
+- Existing conservative allocation charge `max(notional, reported debit +
+  0.02)` = 0.10. Fixed allocation remains 5,000; cash allocation remaining 4,999.90.
+- Prospective leg-two reservation 0.905 plus existing 0.04 accounting buffer
+  = 0.945. Quarantine reserve remains 0.125; available allocation 4,998.830.
+- Risk checking for this recovered first leg compares the live rounded cost
+  basis to the recovery's verified saved 0.08 basis exactly. Precise fill cost
+  stays 0.075. No generic cost tolerance or quantity relaxation is introduced.
+
+Ordinary bot startup still halts an unfinished execution; it never automatically
+submits leg two after a restart. A separately authorized continuation is:
+
+```bash
+.venv/bin/python autonomous_pilot.py --resume-recovered-leg1 7d4dcd813328d03afef241e8baba01e8117ccf0bf924d19885105a2f4c724623
+```
+
+**That continuation can submit leg two.** It is not part of recovery or its dry
+run. It consumes a one-use resume marker before proceeding, skips leg-one
+submission entirely, and reuses the existing fresh settlement/account/quote,
+completion-edge, depth, allocation and risk checks. A changed account or failed
+completion rule halts with the first share retained. Interruption or ambiguity
+keeps the persistent halt and cannot replay either key. No command above has
+been applied or continued during implementation.
+
+Verification for this recovery: **302 focused tests passed**, including the
+expiry, entry/sale and existing recovery suites; **9 focused filled-leg recovery
+tests passed** after the final changes; **647 full-suite tests passed**. Tests
+use mocked HTTP and temporary files. The final official GET-only dry run passed
+with 22 GET responses and zero submissions/state writes. Protected-file hashes
+confirmed `.env`, enable/risk configuration, all approval files, the real pilot
+checkpoint, quarantine/execution journals and paper state remained unchanged.

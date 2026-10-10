@@ -40,6 +40,18 @@ class TestError(ValueError):
     """A fixed failure reason; stop and reload saved state before another action."""
 
 
+def same_order_expiry(first, second):
+    """Compare aware expiries in UTC at the API's observed millisecond precision.
+
+    The client can retain microseconds while order reporting drops the final
+    three digits. Only discard that finer precision; a different millisecond,
+    missing timestamp or timezone must still fail verification.
+    """
+    values = [parse_api_timestamp(value).astimezone(timezone.utc) for value in (first, second)]
+    return values[0].replace(microsecond=values[0].microsecond // 1000 * 1000) == \
+        values[1].replace(microsecond=values[1].microsecond // 1000 * 1000)
+
+
 def require(condition, reason):
     if not condition:
         raise TestError(reason)
@@ -253,9 +265,9 @@ def prepare_test(session, market_id, side, slug="midterm-elections"):
     body = {"idempotencyKey": "account-test-" + uuid4().hex, "exchangeId": exchange_id,
             "side": side, "action": "buy", "quantity": 1, "price": price,
             "tournamentId": account["tournament"]["id"],
-            "expirationDate": (now + timedelta(minutes=15)).isoformat(timespec="seconds")}
+            "expirationDate": (now + timedelta(minutes=15)).isoformat(timespec="milliseconds")}
     intent = {"version": 1, "market_id": numeric_id(market_id), "tournament_slug": slug,
-              "created_at": now.isoformat(timespec="seconds"), "request": body,
+              "created_at": now.isoformat(timespec="milliseconds"), "request": body,
               "state": "PREPARED", "order_id": None, "observation": None}
     intent["approval"] = approval_hash(intent)
     validate_intent(intent)
@@ -368,10 +380,10 @@ def submit_test(session, intent, path, approval, recover=False):
         return intent
 
 
-def read_order(session, intent):
+def verify_order_intent(order, intent):
+    """Verify existing order data without fetching or changing saved state."""
     require(intent["order_id"] is not None, "No confirmed order ID; GET reads cannot recover the lost receipt")
     body, order_id = intent["request"], intent["order_id"]
-    order = fetch_json(session, f"{API_BASE_URL}/orders/{order_id}")
     require(type(order["id"]) is int and order["id"] == order_id
             and numeric_id(order["exchangeId"]) == body["exchangeId"]
             and order["tournamentId"] == body["tournamentId"]
@@ -380,9 +392,15 @@ def read_order(session, intent):
             "Order details conflict with the approved scope or identity")
     require(is_finite_number(order["quantity"]) and 0 <= order["quantity"] <= 1, "Invalid order quantity")
     require(not (intent["state"] == "OBSERVED_TERMINAL" and order["open"]), "A terminal order reopened in reporting")
-    require(parse_api_timestamp(order["expirationDate"]) == parse_api_timestamp(body["expirationDate"]),
+    require(same_order_expiry(order["expirationDate"], body["expirationDate"]),
             "Order expiry conflicts with the saved intent")
     return order
+
+
+def read_order(session, intent):
+    require(intent["order_id"] is not None, "No confirmed order ID; GET reads cannot recover the lost receipt")
+    order = fetch_json(session, f"{API_BASE_URL}/orders/{intent['order_id']}")
+    return verify_order_intent(order, intent)
 
 
 def observe_test(session, intent):

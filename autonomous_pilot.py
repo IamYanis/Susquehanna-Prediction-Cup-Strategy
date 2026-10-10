@@ -5,9 +5,11 @@ atomic write and exclusive lock. A crash never resumes a submission. Only fake
 HTTP is used by the tests. The single autonomous enable switch is off by default.
 """
 import copy
+import argparse
 import hashlib
 import os
 import re
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -49,6 +51,24 @@ TRANSITIONS = {
 
 def require(condition, reason):
     pilot.require(condition, reason)
+
+
+def missing_trade_scope(evidence):
+    """Recognize only the saved, definite permission rejection; no raw printing."""
+    try:
+        import json
+        error = json.loads(evidence["body"])["error"]
+        return (evidence["http_status"] == 403 and evidence["credential_redacted"] is False
+                and error["code"] == "INSUFFICIENT_SCOPES"
+                and "trade" in error["details"]["required"] and "trade" in error["details"]["missing"])
+    except (ValueError, TypeError, KeyError):
+        return False
+
+
+def require_trade_scope_response(evidence):
+    require(not missing_trade_scope(evidence),
+            "HTTP 403 INSUFFICIENT_SCOPES: API key missing required trade scope; "
+            "confirm permission in platform API-key settings; no submission retry")
 
 
 def require_submission(mode=config.LIVE_PILOT):
@@ -126,7 +146,9 @@ def validate_journal(checkpoint):
               "legs", "reads", "halt_reason", "halted_from", "completion", "stages"}
     for fingerprint, attempt in journal["attempts"].items():
         require(isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
-                and isinstance(attempt, dict) and set(attempt) == fields, "Invalid autonomous execution record")
+                and isinstance(attempt, dict) and set(attempt) in
+                (fields, fields | {"rejection_recovery"}, fields | {"filled_leg1_recovery"}),
+                "Invalid autonomous execution record")
         approval = attempt["authorization"]
         live.validate_authorization(approval)
         require(approval["execution_mode"] == live.AUTONOMOUS_MODE
@@ -184,7 +206,15 @@ def validate_journal(checkpoint):
             require(attempt["state"] == checkpoint["state"] and checkpoint["state"] in pilot.EXECUTION_STATES | {pilot.HALTED},
                     "Active execution/pilot stages disagree")
         else:
-            require(attempt["state"] == pilot.READY, "Unfinished execution was forgotten")
+            require(attempt["state"] in {pilot.READY, pilot.REJECTED_RETIRED}, "Unfinished execution was forgotten")
+        require(("rejection_recovery" in attempt) == (attempt["state"] == pilot.REJECTED_RETIRED),
+                "Recovery evidence requires a retired rejection")
+        if attempt["state"] == pilot.REJECTED_RETIRED:
+            from recover_rejected_attempt import validate_retired
+            validate_retired(checkpoint, fingerprint)
+        if "filled_leg1_recovery" in attempt:
+            from recover_filled_leg1 import validate_recovered
+            validate_recovered(checkpoint, fingerprint)
         if attempt["state"] == pilot.READY:
             require(exposure["execution_status"] == "RECONCILED_PAIR" and pilot.amount(exposure["accounting_buffer"]) == 0
                     and all(leg["post_attempted"] and leg["intent"]["state"] == "OBSERVED_TERMINAL"
@@ -207,7 +237,7 @@ def validate_journal(checkpoint):
                 <= pilot_account.BALANCE_DELTA_TOLERANCE, "Completed autonomous accounting baseline is inconsistent")
 
 
-def validate_update(previous, proposed):
+def validate_update(previous, proposed, rejected_recovery=False, filled_recovery=False):
     """No deletion, key reuse, changed request or clearing a historical halt."""
     old, new = previous["autonomous_execution"], proposed.get("autonomous_execution")
     require(new is not None and old["policy"] == new["policy"] and old["reference_cash"] == new["reference_cash"],
@@ -216,8 +246,22 @@ def validate_update(previous, proposed):
         current = new["attempts"].get(fingerprint)
         require(current is not None and all(current[k] == attempt[k] for k in
                 ("created_at", "authorization", "initial_prices", "initial_edge", "before")), "Execution binding/history changed")
-        require(attempt["state"] != pilot.READY or current == attempt, "Completed execution evidence changed")
-        require(attempt["state"] != pilot.HALTED or current["state"] == pilot.HALTED, "Autonomous halt cannot clear")
+        require(attempt["state"] not in {pilot.READY, pilot.REJECTED_RETIRED} or current == attempt,
+                "Completed/retired execution evidence changed")
+        require(attempt["state"] != pilot.HALTED or current["state"] == pilot.HALTED
+                or rejected_recovery and current["state"] == pilot.REJECTED_RETIRED
+                or filled_recovery and current["state"] == pilot.LEG2_RECHECK, "Autonomous halt cannot clear")
+        old_recovery, new_recovery = attempt.get("filled_leg1_recovery"), current.get("filled_leg1_recovery")
+        if old_recovery is not None:
+            require(new_recovery is not None, "Filled-leg recovery audit cannot disappear")
+            old_record, new_record = copy.deepcopy(old_recovery), copy.deepcopy(new_recovery)
+            old_consumed, new_consumed = old_record.pop("resume_consumed_at"), new_record.pop("resume_consumed_at")
+            require(old_record == new_record and (old_consumed == new_consumed or
+                    old_consumed is None and new_consumed is not None and
+                    previous["state"] == proposed["state"] == pilot.LEG2_RECHECK),
+                    "Filled-leg recovery evidence or consumed resume permission changed")
+        else:
+            require(new_recovery is None or filled_recovery, "Filled-leg recovery requires its dedicated verified transition")
         require(current["stages"][:len(attempt["stages"])] == attempt["stages"], "Execution stage history cannot be erased")
         for prior_leg, current_leg in zip(attempt["legs"], current["legs"]):
             require(not prior_leg["post_attempted"] or current_leg["post_attempted"], "A possible POST was forgotten")
@@ -293,7 +337,7 @@ def new_intent(checkpoint, approval, index, price):
     now = datetime.now(timezone.utc)
     body = {"idempotencyKey": key, "exchangeId": approval["exchange_ids"][index], "side": "no", "action": "buy",
             "quantity": 1, "price": price, "tournamentId": approval["tournament_id"],
-            "expirationDate": (now + timedelta(seconds=30)).isoformat()}
+            "expirationDate": (now + timedelta(seconds=30)).isoformat(timespec="milliseconds")}
     intent = {"version": 1, "market_id": approval["market_ids"][index], "tournament_slug": approval["tournament_slug"],
               "created_at": now.isoformat(), "request": body, "state": "PREPARED", "order_id": None, "observation": None}
     intent["approval"] = single.approval_hash(intent)
@@ -354,6 +398,7 @@ def submit_once(session, reads, state, index, quote_check):
     leg["placement_response"] = reads.response_evidence(response)
     persist(state)
     require(not leg["placement_response"]["credential_redacted"], "Unexpected credential reflection; review preserved evidence")
+    require_trade_scope_response(leg["placement_response"])
     response.raise_for_status()
     require(response.status_code == 200, "Ambiguous order response; never retry")
     receipt = response.json()
@@ -520,6 +565,25 @@ def prepare_second_leg(reads, state):
     return book, after["freshness"]["started_monotonic"]
 
 
+def finish_second_leg(session, state, reads):
+    """Shared continuation, reachable only after a reconciled first leg."""
+    book, account_started = prepare_second_leg(reads, state)
+    submit_once(session, reads, state, 1, lambda: completion_limits(active_attempt(state["checkpoint"]), book, account_started))
+    after = reconcile_leg(reads, state, 1)
+    single.observe_test(reads, copy.deepcopy(active_attempt(state["checkpoint"])["legs"][0]["intent"]))
+    pilot_account.check_fresh(after["freshness"]["started_monotonic"])
+    cp = state["checkpoint"]
+    fingerprint = cp["autonomous_execution"]["active_attempt"]
+    cp["live_exposures"][fingerprint].update(execution_status="RECONCILED_PAIR", accounting_buffer="0")
+    stage(state, pilot.READY)
+    cp["autonomous_execution"]["active_attempt"] = None
+    record_position(cp, fingerprint, after)
+    pilot.refresh_totals(cp)
+    persist(state)
+    return {"state": pilot.READY, "execution_id": fingerprint, "accounting_policy": POLICY,
+            "formally_verified": False, "capital_charge": cp["accounted_pair_costs"][fingerprint]}
+
+
 def _execute_locked(session, ids, checkpoint):
     state = {"checkpoint": checkpoint}
     reads = EvidenceReads(session, state)
@@ -535,23 +599,7 @@ def _execute_locked(session, ids, checkpoint):
         reconcile_leg(reads, state, 0)
         stage(state, pilot.LEG2_RECHECK)
         persist(state)
-        book, account_started = prepare_second_leg(reads, state)
-        submit_once(session, reads, state, 1, lambda: completion_limits(active_attempt(state["checkpoint"]), book, account_started))
-        after = reconcile_leg(reads, state, 1)
-        # Re-observe the first closed order at final reconciliation. It must
-        # never reopen or change its already-confirmed cumulative fills.
-        single.observe_test(reads, copy.deepcopy(active_attempt(state["checkpoint"])["legs"][0]["intent"]))
-        pilot_account.check_fresh(after["freshness"]["started_monotonic"])
-        cp = state["checkpoint"]
-        fingerprint = cp["autonomous_execution"]["active_attempt"]
-        cp["live_exposures"][fingerprint].update(execution_status="RECONCILED_PAIR", accounting_buffer="0")
-        stage(state, pilot.READY)
-        cp["autonomous_execution"]["active_attempt"] = None
-        record_position(cp, fingerprint, after)
-        pilot.refresh_totals(cp)
-        persist(state)
-        return {"state": pilot.READY, "execution_id": fingerprint, "accounting_policy": POLICY,
-                "formally_verified": False, "capital_charge": cp["accounted_pair_costs"][fingerprint]}
+        return finish_second_leg(session, state, reads)
     except (OSError, *scanner.API_ERRORS) as error:
         # Fixed local policy reasons are useful; raw HTTP errors/bodies/headers
         # must not be printed or copied into a halt reason.
@@ -791,7 +839,7 @@ def execute_exit_locked(session, state, key, before):
         require(new_key not in used, "Duplicate sale idempotency key; no retry")
         body = {"idempotencyKey": new_key, "exchangeId": eid, "side": "no", "action": "sell", "quantity": 1,
                 "price": float(prices[i]), "tournamentId": approval["tournament_id"],
-                "expirationDate": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()}
+                "expirationDate": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(timespec="milliseconds")}
         leg = p["exit_execution"]["legs"][i]
         leg["request"], leg["post_attempted"] = body, True
         persist(state)  # Key, exact body and possible POST survive a crash.
@@ -812,6 +860,7 @@ def execute_exit_locked(session, state, key, before):
         leg = state["checkpoint"]["autonomous_positions"][key]["exit_execution"]["legs"][i]
         leg["response"] = reads.response_evidence(response)
         persist(state)
+        require_trade_scope_response(leg["response"])
         response.raise_for_status()
         require(response.status_code == 200 and not leg["response"]["credential_redacted"], "Ambiguous sale response; no retry")
         receipt = response.json()
@@ -836,7 +885,7 @@ def execute_exit_locked(session, state, key, before):
                 receipt["remainingQuantity"] == 0 and activity["order"]["open"] is False and
                 activity["order"]["action"] == "sell" and activity["order"]["side"] == "no" and
                 activity["order"]["exchangeId"] == eid and activity["order"]["priceLimit"] == body["price"] and
-                activity["order"]["expirationDate"] == body["expirationDate"] and
+                single.same_order_expiry(activity["order"]["expirationDate"], body["expirationDate"]) and
                 all(Decimal(str(f["price"])) >= Decimal(str(body["price"])) for f in activity["fills"])
                 and abs(proceeds - probe.money(receipt["totalCost"])) <= Decimal(".000000001"),
                 "Partial, resting or inconsistent sale; manual review required")
@@ -986,7 +1035,46 @@ def run(session):
             time.sleep(max(0, scanner.SCAN_INTERVAL - (time.monotonic() - started)))
 
 
-def main():
+def resume_recovered_leg1(session, attempt_id):
+    """Explicit one-use continuation; ordinary restart still halts execution.
+
+    This command can submit ONLY a newly rechecked leg two. The first leg's
+    original key/request stays terminal and is never passed to submit_once.
+    """
+    import threading
+    from recover_filled_leg1 import require_resume
+    from senate_readiness_watcher import readonly_pilot_lock
+    require_submission()
+    with readonly_pilot_lock() as path:
+        cp = pilot._read_checkpoint_locked(path)  # No automatic restart mutation.
+        require_resume(cp, attempt_id)
+        pilot.require_external_execution_clear()
+        pilot.require_initial_evidence_clear(path)
+        require(path not in pilot._state_lock_owners, "Another operation owns pilot state")
+        pilot._state_lock_owners[path] = (os.getpid(), threading.get_ident())
+        state = {"checkpoint": cp}
+        try:
+            active_attempt(cp)["filled_leg1_recovery"]["resume_consumed_at"] = datetime.now(timezone.utc).isoformat()
+            persist(state)  # Consume BEFORE reads/intent/POST; crash cannot replay.
+            reads = EvidenceReads(session, state)
+            reads.reads = copy.deepcopy(active_attempt(state["checkpoint"])["reads"])
+            return finish_second_leg(session, state, reads)
+        except (OSError, *scanner.API_ERRORS) as error:
+            safe = (pilot.PilotBlocked, pilot_account.AccountReadinessBlocked, live.LiveSettlementBlocked,
+                    PreviewBlocked, single.TestError, probe.ProbeBlocked)
+            return halt(state, str(error) if isinstance(error, safe) else "Continuation unavailable/ambiguous; no submission retry")
+        except BaseException:
+            halt(state, "Recovered execution interrupted; no automatic continuation or retry")
+            raise
+        finally:
+            pilot._state_lock_owners.pop(path, None)
+
+
+def main(argv=()):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--resume-recovered-leg1", metavar="ATTEMPT_ID",
+                        help="Explicitly continue one GET-reconciled filled first leg; may submit leg two")
+    args = parser.parse_args(argv)
     if not config.AUTONOMOUS_LIVE_PILOT_ENABLED:
         print("DISABLED | Set AUTONOMOUS_LIVE_PILOT_ENABLED only after explicit review")
         return 0  # No credentials, reads, state writes or intents while disabled.
@@ -997,7 +1085,9 @@ def main():
         require(bool(key), "SIG_API_KEY is unavailable")
         with requests.Session() as session:
             session.headers.update({"Authorization": f"Bearer {key}"})
-            result = run(session)
+            result = resume_recovered_leg1(session, args.resume_recovered_leg1) if args.resume_recovered_leg1 else run(session)
+            if args.resume_recovered_leg1:
+                print(f"{result['state']} | {result.get('execution_id', result.get('reason', ''))}")
         return 1 if result and result["state"] == pilot.HALTED else 0
     except KeyboardInterrupt:
         print("Stopped. Any interrupted execution remains halted for review.")
@@ -1008,4 +1098,4 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))
