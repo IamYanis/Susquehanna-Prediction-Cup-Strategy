@@ -4,6 +4,7 @@ import math
 import os
 import re
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from uuid import UUID
 
@@ -25,6 +26,10 @@ from price_reader import (
 # Bound the work even if a faulty server keeps returning new cursors forever.
 # Reaching this limit is an incomplete read, never evidence of zero orders.
 MAX_ORDER_PAGES = 50
+# One cent-displayed cost basis can differ by half a cent. This is separate
+# from the 0.02 bound for a DIFFERENCE of two displayed account balances.
+POSITION_COST_ROUNDING_TOLERANCE = Decimal("0.005")
+POSITION_PRICE_PRECISION = Decimal("0.000000001")
 
 
 def require_number(value, nonnegative=False):
@@ -32,6 +37,27 @@ def require_number(value, nonnegative=False):
     if not is_finite_number(value) or (nonnegative and value < 0):
         raise DataValidationError("Invalid account number")
     return value
+
+
+def one_no_buy_cost_matches(position, fill_notional):
+    """Accept exact cost or half-cent display rounding for ONE known NO buy.
+
+    Average entry cost must still match the actual fill to numeric precision.
+    A different quantity, missing data or a non-cent rounded basis fails.
+    Instrument identity, fills, ledger and cash remain the caller's checks.
+    """
+    try:
+        if require_number(position["quantity"]) != -1:
+            return False
+        average = Decimal(str(require_number(position["avgCost"], nonnegative=True)))
+        basis = Decimal(str(require_number(position["costBasis"], nonnegative=True)))
+        if abs(average - fill_notional) > POSITION_PRICE_PRECISION:
+            return False
+        difference = abs(basis - fill_notional)
+        return difference <= POSITION_PRICE_PRECISION or (
+            basis % Decimal("0.01") == 0 and difference <= POSITION_COST_ROUNDING_TOLERANCE)
+    except API_ERRORS:
+        return False
 
 
 def validate_positions(payload):

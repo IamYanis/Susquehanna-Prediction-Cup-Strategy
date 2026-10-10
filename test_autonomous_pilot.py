@@ -5,7 +5,7 @@ import subprocess
 import sys
 import unittest
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from types import SimpleNamespace
 from pathlib import Path
 from urllib.parse import urlparse
@@ -124,7 +124,7 @@ class AutonomousPilotTests(unittest.TestCase):
         cash = Decimal(str(self.fixture.current["tournament"]["myBalance"]))
         self.fixture.current["tournament"]["myBalance"] = float(cash - notional - fee)
         holding = position(eid, mid, float(-quantity))
-        holding.update(costBasis=float(notional), marketValue=float(notional), currentPrice=float(price), unrealizedPnl=0)
+        holding.update(avgCost=float(price), costBasis=float(notional), marketValue=float(notional), currentPrice=float(price), unrealizedPnl=0)
         self.fixture.current.update(holdings([*self.fixture.current["positions"], holding]))
         fill = {"id": fid, "orderId": oid, "exchangeId": eid, "marketId": mid, "side": "no",
                 "quantity": float(-quantity), "price": float(price), "filledAt": stamp}
@@ -172,6 +172,51 @@ class AutonomousPilotTests(unittest.TestCase):
 
     def checkpoint(self):
         return pilot.load_checkpoint()
+
+    def rounded_position_post(self, url, **kwargs):
+        """Model cent-displayed basis with precise average/fill prices."""
+        response = self.post(url, **kwargs)
+        receipt = response.json()
+        account = self.fixture.current
+        row = next(p for p in account["positions"] if p["exchangeId"] == receipt["exchangeId"])
+        row["costBasis"] = float(Decimal(str(row["avgCost"])).quantize(Decimal(".01"), rounding=ROUND_HALF_UP))
+        account.update(holdings(account["positions"]))
+        account["tournament"]["myBalance"] = float(Decimal(str(account["tournament"]["myBalance"])).quantize(
+            Decimal(".01"), rounding=ROUND_HALF_UP))
+        return response
+
+    def test_half_cent_basis_passes_both_leg_reconciliation_and_completion_risk(self):
+        self.books = {"11": exchange_book(1, 11, bid=.705, ask=.710),
+                      "12": exchange_book(2, 12, bid=.31, ask=.315)}
+        self.session.post.side_effect = self.rounded_position_post
+        result = self.execute()
+        self.assertEqual(result["state"], pilot.READY, result)
+        self.assertEqual(len(self.posts), 2)
+        p = next(iter(self.checkpoint()["autonomous_positions"].values()))
+        self.assertEqual(list(map(Decimal, p["actual_entry_prices"])), [Decimal(".295"), Decimal(".69")])
+
+    def test_material_basis_difference_reports_rounding_mismatch_and_stops_leg_two(self):
+        def wrong_basis(url, **kwargs):
+            response = self.post(url, **kwargs)
+            account = self.fixture.current
+            account["positions"][0]["costBasis"] = .41
+            account.update(holdings(account["positions"]))
+            return response
+        self.session.post.side_effect = wrong_basis
+        result = self.execute()
+        self.assertTrue(result["reason"].startswith("POSITION_COST_ROUNDING_MISMATCH"))
+        self.assertEqual(result["state"], pilot.HALTED)
+        self.assertEqual(len(self.posts), 1)
+
+    def test_wrong_average_entry_cost_stops_leg_two_despite_matching_basis(self):
+        def wrong_average(url, **kwargs):
+            response = self.post(url, **kwargs)
+            self.fixture.current["positions"][0]["avgCost"] = .405
+            return response
+        self.session.post.side_effect = wrong_average
+        result = self.execute()
+        self.assertTrue(result["reason"].startswith("POSITION_AVERAGE_COST_MISMATCH"))
+        self.assertEqual(len(self.posts), 1)
 
     def assert_halted(self, expected_posts):
         result = self.execute()

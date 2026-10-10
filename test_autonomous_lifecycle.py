@@ -64,7 +64,8 @@ class AutonomousLifecycleTests(unittest.TestCase):
         if remaining:
             row = position(eid, mid, float(-remaining))
             basis = Decimal(str(old["costBasis"])) * remaining if old else notional
-            row.update(costBasis=float(basis), marketValue=float(basis), currentPrice=float(price), unrealizedPnl=0)
+            row.update(avgCost=old["avgCost"] if old else float(price), costBasis=float(basis),
+                       marketValue=float(basis), currentPrice=float(price), unrealizedPnl=0)
             rows.append(row)
         account.update(holdings(rows))
         fill = {"id": fid, "orderId": oid, "exchangeId": eid, "marketId": mid,

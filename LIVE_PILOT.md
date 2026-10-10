@@ -76,6 +76,49 @@ HALTED_MANUAL_REVIEW, zero confirmed pilot debit/unconfirmed reservation,
 hashes confirm unchanged `.env`, runtime state, frozen journals, strategy code,
 trading configuration and paper portfolio. No commit was made.
 
+## Alaska leg-two mark-refresh recovery
+
+Transaction comparisons now share a canonical representation keyed by unique
+`event_id`. Only mutable `currentPrice`, `marketTitle` and `marketImage` are
+excluded. All other fields, including any order/fill linkage, executed price,
+quantity, action/side, settlement and cash/collateral fields remain checked.
+Timestamps are normalized to UTC. Reordering identical events is harmless;
+missing, added, duplicated or financially changed events still block trading.
+The same comparison is used before leg two, during buy reconciliation and for
+transaction-head rereads. Account capture also ignores position marks while
+retaining cash, quantity, entry cost, lots, settlement status and open orders.
+
+The diagnosed Alaska attempt `b620ac32c3bd51fdde79a6491dc31d440e0972995b9d9107ab4a2750341e31ab`
+halted before creating a leg-two intent because its original trade's market
+mark refreshed from 0.710 to 0.705. Its actual execution price stayed 0.295.
+The targeted command defaults to GET-only dry-run:
+
+```bash
+.venv/bin/python recover_leg2_recheck.py --attempt b620ac32c3bd51fdde79a6491dc31d440e0972995b9d9107ab4a2750341e31ab --dry-run
+```
+
+Only a separately requested `--apply` may atomically restore `LEG2_RECHECK`.
+It revalidates settlement, the exact known order/fill, one Alaska first-leg NO
+share, no second-leg holding/order/fill, unchanged Colorado inventory, complete
+economic history, exactly 20,571.10 cash, unchanged quarantine, and allocation
+accounting under the exclusive lock. There is no cash-tolerance override.
+Confirmed debits/shares are preserved; the second-leg reservation and existing
+buffer are restored. The command never submits/cancels an order.
+
+The original filled-leg recovery and its consumed resume timestamp remain
+immutable. A separate audit records a new checkpoint-bound one-use permission:
+
+```bash
+.venv/bin/python autonomous_pilot.py --resume-leg2-recheck ATTEMPT_ID --continuation PERMISSION_ID
+```
+
+Use the exact command printed by **applied** recovery. It consumes this new
+permission before any reads or intent, re-fetches current account/settlement
+and the second-leg quote, and uses actual first-leg cost 0.295 with the unchanged
+completion rule. It can submit only a new second leg; leg one is never retried.
+A crash, stale/changed evidence or quote deterioration halts. Ordinary startup
+still halts unfinished executions, and neither permission can be replayed.
+
 ## Explicit recovery of a rejected first-leg submission
 
 The 10 October first submission received **HTTP 403 / INSUFFICIENT_SCOPES**,
@@ -1812,3 +1855,69 @@ order submissions and zero runtime writes. Runtime state remains halted at
 revision 64; the READY/revision-65 values above are a preview only. File
 fingerprints confirmed that `.env`, runtime state/journals, allocation,
 authorization files and enable/risk configuration were unchanged.
+
+## One-contract displayed cost-basis rounding and Alaska recovery
+
+Fresh official Alaska evidence reports a precise 0.295 fill/average entry cost
+and a cent-displayed 0.300 `costBasis`. Colorado previously displayed 0.080 for
+its precise 0.075 fill. Ordinary one-contract NO BUY reconciliation now shares
+`account_reader.one_no_buy_cost_matches`: quantity must be exactly -1 and
+average entry cost must match actual fill notional within 1e-9 numeric precision.
+Cost basis must either match to that precision or be a cent value differing by
+at most **0.005 SUSQies**. A non-cent difference, larger discrepancy, missing
+average or wrong quantity fails closed. This is a narrow half-cent display
+allowance, not the 0.020 bound for a difference of two account balance readings.
+Fill/intent identities, ledger, zero-collateral receipt, cash, authorization,
+allocation, duplicate and execution checks remain mandatory and unchanged.
+
+New-leg reconciliation and the pre-leg-two holdings risk check use this same
+rule. A basis discrepancy now reports `POSITION_COST_ROUNDING_MISMATCH`; a
+wrong average reports `POSITION_AVERAGE_COST_MISMATCH`. Recovered holdings keep
+their stricter comparison to the actual API basis saved by recovery. Existing
+Colorado recovery records and completed position are neither rewritten nor
+reauthorized by this change.
+
+The existing `recover_filled_leg1.py` command additionally supports only the
+diagnosed Alaska attempt: markets 377/378, exchanges 1066/1067, first order
+29739740, fill 124491142, BUY one NO at 0.295. It revalidates settlement and
+fresh complete GET-only order/fill/account/history evidence. No second-leg
+order/fill or unexpected activity may exist. Historical transaction display
+prices/titles may refresh; execution and cash fields must stay unchanged.
+The original intent, key, receipt, fill/review/account evidence and read/stage
+history are retained in the immutable recovery audit. A failed check leaves
+the halt and one-sided holding in place.
+
+Read-only preview (default):
+
+```bash
+.venv/bin/python recover_filled_leg1.py --attempt b620ac32c3bd51fdde79a6491dc31d440e0972995b9d9107ab4a2750341e31ab --dry-run
+```
+
+Only after a separate explicit decision, replace `--dry-run` with `--apply`.
+That repeats the GET checks under the existing lock and performs one atomic
+local reconciliation write. It does not submit either leg or start the bot.
+
+Expected state if recovery is explicitly applied and fresh checks still pass:
+
+- Revision 89 -> 90, state `LEG2_RECHECK`, Alaska remains the active execution.
+- Confirmed quantities `[1, 0]`, costs `[0.295, 0]`; first-leg key retired
+  permanently. Leg two still has no intent, key or submission.
+- Displayed cash 20571.39 -> 20571.10: debit 0.290 is consistent with the 0.295
+  fill within the unchanged 0.020 bound. Conservative Alaska allocation charge
+  `max(0.295, 0.290 + 0.020) = 0.310`; gross pilot allocation charges 1.310.
+- Allocation cash remaining 4998.690; prospective leg-two reserve 0.695 plus
+  the existing 0.040 buffer = 0.735; quarantine reserve remains 0.125;
+  usable pilot allocation 4997.830. This pending reserve is not an order.
+- Colorado attempt, OPEN position, prices/cost, allocation charge and consumed
+  resume marker remain unchanged.
+
+Ordinary startup still halts an unfinished execution. Any future second-leg
+continuation requires the existing explicit one-use `--resume-recovered-leg1`
+command and all fresh completion checks; recovery does not run it.
+
+Validation: **165 focused tests passed**, including ordinary rounded-cost entry,
+both leg checks and existing recoveries; **6 Alaska recovery tests passed** after
+the final receipt checks; **670 full-suite tests passed**. Fresh official recovery
+dry run passed with 22 GET responses and zero submissions/runtime writes.
+The real checkpoint remains halted at revision 89. Fingerprints confirm `.env`,
+runtime state/journals, allocation, approvals and trading configuration unchanged.

@@ -46,7 +46,7 @@ class AccountingProbeTests(unittest.TestCase):
         self.after["freshness"] = {"started_monotonic": 102, "completed_monotonic": 103}
         self.after["account"]["tournament"]["myBalance"] = 19999.6
         row = position("11", "1", -1)
-        row.update(costBasis=.4, marketValue=.4, currentPrice=.4, unrealizedPnl=0)
+        row.update(avgCost=.4, costBasis=.4, marketValue=.4, currentPrice=.4, unrealizedPnl=0)
         self.after["account"].update(holdings([row]))
         self.after["recent_transactions"] = [self.trade()]
         self.receipt = {"orderId": 101, "exchangeId": "11", "open": False, "remainingQuantity": 0,
@@ -198,7 +198,7 @@ class AccountingProbeTests(unittest.TestCase):
         self.activity["fills"][0]["price"] = .335
         self.after["account"]["tournament"]["myBalance"] = 19999.66
         row = self.after["account"]["positions"][0]
-        row.update(costBasis=.335, marketValue=.335, unrealizedPnl=0)
+        row.update(avgCost=.335, costBasis=.335, marketValue=.335, unrealizedPnl=0)
         self.after["account"].update(holdings([row]))
         self.after["recent_transactions"][0]["price"] = .335
         result = self.review()
@@ -232,6 +232,36 @@ class AccountingProbeTests(unittest.TestCase):
         self.assertNotIn("COLLATERAL_CASH_EFFECT_UNVERIFIED", result["issues"])
         self.assertTrue(result["observations"]["isolated_execution_reconciled"])
         self.assertEqual(result["observations"]["all_execution_economics"], self.receipt["all"])
+
+    def test_half_cent_display_basis_passes_only_with_exact_average_and_fill(self):
+        self.receipt.update(price=.295, fillPrice=.295, totalCost=.295, all=zero_collateral(.295))
+        self.activity["order"]["priceLimit"] = .295
+        self.activity["fills"][0]["price"] = .295
+        row = self.after["account"]["positions"][0]
+        row.update(avgCost=.295, costBasis=.300, marketValue=.300)
+        self.after["account"].update(holdings([row]))
+        self.after["account"]["tournament"]["myBalance"] = 19999.71
+        self.after["recent_transactions"][0]["price"] = .295
+        self.after["recent_fills"] = [{**self.activity["fills"][0], "orderId": 101, "marketId": "1", "exchangeId": "11"}]
+        self.assertTrue(self.review()["observations"]["isolated_execution_reconciled"])
+        row["avgCost"] = .300
+        self.assertIn("POSITION_AVERAGE_COST_MISMATCH", self.review()["issues"])
+
+    def test_larger_or_noncent_basis_difference_fails_closed(self):
+        row = self.after["account"]["positions"][0]
+        for basis in (.410, .405, .405000001):
+            row["costBasis"] = basis
+            self.after["account"].update(holdings([row]))
+            with self.subTest(basis=basis):
+                self.assertIn("POSITION_COST_ROUNDING_MISMATCH", self.review()["issues"])
+                self.assertFalse(self.review()["observations"]["isolated_execution_reconciled"])
+
+    def test_display_tolerance_does_not_accept_missing_average_or_wrong_quantity(self):
+        row = {"quantity": -1, "avgCost": .295, "costBasis": .300}
+        self.assertTrue(probe.account_reader.one_no_buy_cost_matches(row, Decimal(".295")))
+        for bad in (dict(row, quantity=-2), dict(row, avgCost=.300), {k:v for k,v in row.items() if k != "avgCost"},
+                    dict(row, costBasis=.31), dict(row, costBasis=.300000001), dict(row, costBasis=True)):
+            self.assertFalse(probe.account_reader.one_no_buy_cost_matches(bad, Decimal(".295")))
 
     def test_nonzero_or_linked_collateral_fails_closed(self):
         for key, value in (("collateralSavings", .01), ("outstandingAdvanceAfter", .01),
@@ -607,7 +637,7 @@ class ManualProbeExecutionTests(unittest.TestCase):
         self.after["recent_transactions"][0]["price"] = .335
         self.after["account"]["tournament"]["myBalance"] = 19999.66
         row = self.after["account"]["positions"][0]
-        row.update(costBasis=.335, marketValue=.335, currentPrice=.335)
+        row.update(avgCost=.335, costBasis=.335, marketValue=.335, currentPrice=.335)
         self.after["account"].update(holdings([row]))
         record = self.run_probe()
         checkpoint = self.assert_halted(".34")

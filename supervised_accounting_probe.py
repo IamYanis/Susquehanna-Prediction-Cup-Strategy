@@ -234,9 +234,11 @@ def review_observation(before, after, receipt, activity, market_id, exchange_id)
         require(position is not None and scanner.numeric_id(position["marketId"]) == mid and position["settled"] is False
                 and Decimal(str(position["quantity"])) == -quantity, "Position does not match completed NO fill")
         cost = money(position["costBasis"])
+        require(abs(money(position["avgCost"]) - notional) <= account_reader.POSITION_PRICE_PRECISION,
+                "POSITION_AVERAGE_COST_MISMATCH")
         observations["execution_and_inventory_verified"] = True
-        if abs(cost - notional) > Decimal(".000000001"):
-            result["issues"].append("POSITION_COST_SEMANTICS_UNVERIFIED")
+        if not account_reader.one_no_buy_cost_matches(position, notional):
+            result["issues"].append("POSITION_COST_ROUNDING_MISMATCH")
         delta = money(b["tournament"]["myBalance"]) - money(a["tournament"]["myBalance"])
         # The docs specify two decimals, but not the rounding mode. Conservatively
         # allow one cent per reading (covering nearest, floor and ceiling), hence
@@ -264,9 +266,11 @@ def review_observation(before, after, receipt, activity, market_id, exchange_id)
             require(row["event_id"] not in seen_transactions, "Duplicate transaction event")
             seen_transactions.add(row["event_id"])
             if row["event_id"] in previous:
-                require(row == previous[row["event_id"]], "Existing ledger entry changed")
+                require(pilot_account.canonical_transaction(row) ==
+                        pilot_account.canonical_transaction(previous[row["event_id"]]), "Existing ledger entry changed")
             else:
                 new.append(row)
+        require(set(previous).issubset(seen_transactions), "Existing ledger entry disappeared")
         result["observations"]["new_transactions"] = copy.deepcopy(new)
         if not any(r["event_type"] == "trade" and scanner.numeric_id(r["exchangeId"]) == eid for r in new):
             result["issues"].append("TRADE_LEDGER_RECONCILIATION_UNAVAILABLE")

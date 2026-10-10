@@ -25,6 +25,7 @@ import requests
 from dotenv import load_dotenv
 
 import config
+import account_reader
 import live_settlement
 import pilot_account
 import account_test as single
@@ -314,7 +315,8 @@ def _read_checkpoint_locked(path):
         raise PilotBlocked("HALTED_MANUAL_REVIEW: pilot allocation checkpoint missing or invalid; manual review required") from error
 
 
-def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False, settlement_recovery=False, filled_recovery=False, completed_recovery=False):
+def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False, settlement_recovery=False,
+                            filled_recovery=False, completed_recovery=False, leg2_recovery=False):
     """Validate then fsync/replace/fsync-directory while holding one stable lock."""
     require(_state_lock_owners.get(path) == (os.getpid(), threading.get_ident()),
             "Pilot state mutation requires the exclusive process lock")
@@ -335,7 +337,8 @@ def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False
             # permission rejection. Ordinary state saves cannot clear halts.
             from recover_rejected_attempt import validate_transition
             validate_transition(previous, proposed)
-        require(sum((bool(rejected_recovery), bool(settlement_recovery), bool(filled_recovery), bool(completed_recovery))) <= 1,
+        require(sum((bool(rejected_recovery), bool(settlement_recovery), bool(filled_recovery), bool(completed_recovery),
+                     bool(leg2_recovery))) <= 1,
                 "Recovery types cannot be combined")
         if settlement_recovery:
             from recover_settlement_halt import validate_transition
@@ -349,7 +352,11 @@ def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False
         if completed_recovery:
             from recover_completed_pair import validate_transition
             validate_transition(previous, proposed)
-        require(rejected_recovery or settlement_recovery or filled_recovery or completed_recovery or not previous["manual_review_required"] or proposed["state"] == HALTED,
+        if leg2_recovery:
+            from recover_leg2_recheck import validate_transition
+            validate_transition(previous, proposed)
+        require(rejected_recovery or settlement_recovery or filled_recovery or completed_recovery or leg2_recovery
+                or not previous["manual_review_required"] or proposed["state"] == HALTED,
                 "A persistent manual-review halt cannot be cleared automatically")
         for fingerprint, cost in previous["accounted_pair_costs"].items():
             require(fingerprint in proposed["accounted_pair_costs"]
@@ -375,7 +382,7 @@ def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False
         if "autonomous_execution" in previous:
             from autonomous_pilot import validate_update
             validate_update(previous, proposed, rejected_recovery=rejected_recovery, filled_recovery=filled_recovery,
-                            completed_recovery=completed_recovery)
+                            completed_recovery=completed_recovery, leg2_recovery=leg2_recovery)
     proposed["revision"] += 1
     proposed["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="microseconds")
     validate_checkpoint(proposed)
@@ -525,9 +532,14 @@ def pilot_risk(account, exchange_ids, proposed_capital, quantity, checkpoint):
                     saved_row = next(r for r in recovered["snapshot"]["account"]["positions"]
                                      if scanner.numeric_id(r["exchangeId"]) == exchange_id)
                     expected_basis = amount(saved_row["costBasis"])
+                basis_matches = row is not None and abs(amount(row["costBasis"]) - expected_basis) <= Decimal(".00000001")
+                if not recovered and q == 1 and row is not None and not basis_matches:
+                    # A newly reconciled single fill can have a cent-displayed
+                    # basis. Require its exact average cost and half-cent bound.
+                    basis_matches = account_reader.one_no_buy_cost_matches(row, c)
                 require(row is not None and scanner.numeric_id(row["marketId"]) == market_id
                         and abs(Decimal(str(row["quantity"])) + q) <= Decimal(".000000001")
-                        and abs(amount(row["costBasis"]) - expected_basis) <= Decimal(".00000001")
+                        and basis_matches
                         and row["settled"] is False, "Actual holdings disagree with persisted pilot exposure; manual review required")
     holdings = max(amount(risk["existing_holdings_cost_basis"]), stored_holdings)
     # Include external orders as well as saved possible pilot fills. They can

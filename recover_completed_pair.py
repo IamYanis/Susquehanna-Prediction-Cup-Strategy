@@ -68,11 +68,8 @@ def eligible_attempt(checkpoint, key):
 
 
 def transaction_identity(row):
-    """Compare stable execution/cash fields; currentPrice/title/image can refresh."""
-    return (row["event_type"], auto.single.parse_api_timestamp(row["createdAt"]), row["tournamentId"],
-            row.get("exchangeId"), row.get("marketId"), row["quantity"], row.get("price"), row.get("amount"),
-            row.get("transactionType"), row.get("orderType"), row.get("outstandingAdvanceAfter"),
-            row.get("componentId"), row.get("reason"), row.get("collateralDelta"))
+    """Share the execution/cash comparison, including any order/fill linkage."""
+    return pilot_account.canonical_transaction(row)
 
 
 def fill_identity(row):

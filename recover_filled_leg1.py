@@ -1,4 +1,4 @@
-"""Reconcile the diagnosed Colorado first fill; GET-only dry run by default.
+"""Reconcile diagnosed Colorado/Alaska first fills; GET-only dry run by default.
 
 --apply makes one atomic local recovery write, never an order. The original
 request, key and receipt remain immutable. Ordinary startup still halts an
@@ -32,29 +32,54 @@ TARGET = {
     "order": 29229136, "fill": 122411192, "price": Decimal(".075"),
 }
 HALT_REASON = "Order expiry conflicts with the saved intent"
+ALASKA_TARGET = {
+    "attempt": "b620ac32c3bd51fdde79a6491dc31d440e0972995b9d9107ab4a2750341e31ab",
+    "markets": ["377", "378"], "exchanges": ["1066", "1067"],
+    "order": 29739740, "fill": 124491142, "price": Decimal(".295"),
+}
+ALASKA_HALT_REASON = "ACCOUNTING_MODEL_MISMATCH or incomplete isolated reconciliation; manual review required"
+
+
+def recovery_target(key):
+    """Only these two exact diagnosed attempts have a recovery permission."""
+    if key == TARGET["attempt"]:
+        return TARGET, "FILLED_LEG1_EXPIRY_NORMALIZATION", HALT_REASON
+    pilot.require(key == ALASKA_TARGET["attempt"], "Not a supported diagnosed filled-leg attempt")
+    return ALASKA_TARGET, "FILLED_LEG1_POSITION_COST_ROUNDING", ALASKA_HALT_REASON
 
 
 def eligible_attempt(checkpoint, key):
     """This recovery is deliberately limited to the diagnosed filled attempt."""
+    target, kind, reason = recovery_target(key)
+    rounding = kind == "FILLED_LEG1_POSITION_COST_ROUNDING"
     journal = checkpoint.get("autonomous_execution", {})
-    pilot.require(key == TARGET["attempt"] and journal.get("active_attempt") == key
+    pilot.require(journal.get("active_attempt") == key
                   and checkpoint["state"] == pilot.HALTED and checkpoint["manual_review_required"]
-                  and checkpoint["review_reason"] == HALT_REASON,
-                  "Not the diagnosed filled-leg expiry halt")
+                  and checkpoint["review_reason"] == reason,
+                  "Not the diagnosed filled-leg halt")
     attempt = journal["attempts"][key]
     approval = attempt["authorization"]
     first, second = attempt["legs"]
     pilot.require(attempt["state"] == pilot.HALTED and attempt["halted_from"] == pilot.LEG1_RECONCILING
-                  and attempt["halt_reason"] == HALT_REASON and "filled_leg1_recovery" not in attempt
-                  and approval["market_ids"] == TARGET["markets"] and approval["exchange_ids"] == TARGET["exchanges"]
-                  and first["post_attempted"] and first["intent"]["state"] == "ACCEPTED"
-                  and first["intent"]["order_id"] == TARGET["order"]
+                  and attempt["halt_reason"] == reason and "filled_leg1_recovery" not in attempt
+                  and approval["market_ids"] == target["markets"] and approval["exchange_ids"] == target["exchanges"]
+                  and first["post_attempted"]
+                  and first["intent"]["order_id"] == target["order"]
                   and first["placement_response"]["http_status"] == 200 and first["receipt"] is not None
-                  and first["activity"] is None and first["review"] is None
                   and second["intent"] is None and not second["post_attempted"]
                   and all(second[k] is None for k in ("placement_response", "receipt", "activity", "review"))
-                  and attempt["after"] == [None, None] and attempt["completion"] is None,
+                  and attempt["after"][1] is None and attempt["completion"] is None,
                   "Attempt contains unexpected execution evidence; keep the halt")
+    if rounding:
+        pilot.require(first["intent"]["state"] == "OBSERVED_TERMINAL" and first["activity"] is not None
+                      and attempt["after"][0] is not None and first["review"]["issues"] == [
+                          "POSITION_COST_SEMANTICS_UNVERIFIED",
+                          "Rounded balances and ledger proximity do not prove receipt-linked fee-inclusive debit"],
+                      "Not the isolated diagnosed position-cost rounding failure")
+    else:
+        pilot.require(first["intent"]["state"] == "ACCEPTED" and first["activity"] is None
+                      and first["review"] is None and attempt["after"][0] is None,
+                      "Unexpected pre-expiry-reconciliation evidence")
     pilot.require(all(k == key or a["state"] in {pilot.READY, pilot.REJECTED_RETIRED}
                       for k, a in journal["attempts"].items())
                   and all(k == key or e["execution_status"] in {"RECONCILED_PAIR", pilot.REJECTED_RETIRED}
@@ -66,15 +91,21 @@ def eligible_attempt(checkpoint, key):
                   "Saved cash baseline differs from the pre-leg-one account")
     exposure = checkpoint["live_exposures"][key]
     pilot.require(exposure["execution_status"] == "MANUAL_REVIEW"
-                  and all(pilot.amount(v) == 0 for k in ("confirmed_quantities", "confirmed_costs") for v in exposure[k])
-                  and pilot.amount(exposure["capital_charge"]) == 0
-                  and list(map(pilot.amount, exposure["possible_additional_quantities"])) == [1, 0],
+                  and list(map(pilot.amount, exposure["confirmed_quantities"])) == ([1, 0] if rounding else [0, 0])
+                  and list(map(pilot.amount, exposure["confirmed_costs"])) == ([target["price"], 0] if rounding else [0, 0])
+                  and pilot.amount(exposure["capital_charge"]) == (target["price"] if rounding else 0)
+                  and list(map(pilot.amount, exposure["possible_additional_quantities"])) == ([0, 0] if rounding else [1, 0]),
                   "Saved first-leg exposure is inconsistent")
     return attempt
 
 
-def new_rows(before, after, identity):
+def new_rows(before, after, identity, rounding=False):
     """Existing history must remain present and unchanged, with unique IDs."""
+    if rounding:
+        # Reuse stable financial identities: a display price/title refresh does
+        # not change the original execution or cash amount of a ledger event.
+        from recover_completed_pair import history_delta, fill_identity, transaction_identity
+        return history_delta(before, after, identity, fill_identity if identity == "id" else transaction_identity)
     old = {r[identity]: r for r in before}
     new = {r[identity]: r for r in after}
     pilot.require(len(old) == len(before) and len(new) == len(after)
@@ -83,7 +114,7 @@ def new_rows(before, after, identity):
     return [r for r in after if r[identity] not in old]
 
 
-def prove_fill(attempt, snapshot, orders, observed):
+def prove_fill(attempt, snapshot, orders, observed, target=None):
     """Check the actual order, exact fill, inventory, ledger and rounded cash.
 
     This uses the existing historical zero-extra-fee assumption and rounding
@@ -91,22 +122,24 @@ def prove_fill(attempt, snapshot, orders, observed):
     Archived snapshots are checked by UTC chronology and capture duration;
     monotonic clocks from different processes must never be compared.
     """
+    target = TARGET if target is None else target
+    rounding = target is ALASKA_TARGET
     original = attempt["legs"][0]["intent"]
     body, receipt = original["request"], attempt["legs"][0]["receipt"]
-    mid, eid = TARGET["markets"][0], TARGET["exchanges"][0]
+    mid, eid = target["markets"][0], target["exchanges"][0]
     tid = attempt["authorization"]["tournament_id"]
-    price = TARGET["price"]
+    price = target["price"]
     pilot.require(original["market_id"] == mid and body["exchangeId"] == eid
                   and body["tournamentId"] == tid and body["side"] == "no" and body["action"] == "buy"
                   and body["quantity"] == 1 and Decimal(str(body["price"])) == price
                   and observed["request"] == body and observed["approval"] == original["approval"]
-                  and observed["order_id"] == TARGET["order"] and observed["state"] == "OBSERVED_TERMINAL",
+                  and observed["order_id"] == target["order"] and observed["state"] == "OBSERVED_TERMINAL",
                   "Saved/observed intent differs from the diagnosed one-contract buy")
     auto.single.validate_intent(observed)
     observation = observed["observation"]
     pilot.require(observation["open"] is False and observation["filled_quantity"] == 1
                   and Decimal(str(observation["filled_cost"])) == price
-                  and receipt["orderId"] == TARGET["order"] and scanner.numeric_id(receipt["exchangeId"]) == eid
+                  and receipt["orderId"] == target["order"] and scanner.numeric_id(receipt["exchangeId"]) == eid
                   and receipt["side"] == "no" and receipt["action"] == "buy" and receipt["quantity"] == 1
                   and receipt["quantityTraded"] == 1 and receipt["remainingQuantity"] == 0
                   and receipt["open"] is False and Decimal(str(receipt["price"])) == price
@@ -115,6 +148,8 @@ def prove_fill(attempt, snapshot, orders, observed):
     # The real receipt includes ALL economics even though no collateral was
     # used. Allow only its explicit zero-collateral case, never a cash advance.
     economics = receipt.get("all")
+    if rounding:
+        pilot.require(probe.ordinary_cash_receipt(economics, price), "Receipt has unexplained collateral/cash economics")
     if economics is not None:
         expected = {"fullNotionalCost": price, "effectiveEntryCost": price, "netBuyingPowerImpact": price,
                     "collateralSavings": Decimal(0), "guaranteedPayoutFloorAfter": Decimal(0),
@@ -144,15 +179,15 @@ def prove_fill(attempt, snapshot, orders, observed):
                   and len(activity["fills"]) == 1 and Decimal(activity["fill_notional"]) == price,
                   "Order is not the fully filled first leg")
     fill = activity["fills"][0]
-    pilot.require(fill["id"] == TARGET["fill"] and fill["side"] == "no" and fill["quantity"] == -1
+    pilot.require(fill["id"] == target["fill"] and fill["side"] == "no" and fill["quantity"] == -1
                   and Decimal(str(fill["price"])) == price, "Known fill is missing or differs")
-    fills = new_rows(before["recent_fills"], snapshot["recent_fills"], "id")
-    pilot.require(len(fills) == 1 and fills[0]["id"] == TARGET["fill"] and fills[0]["orderId"] == TARGET["order"]
+    fills = new_rows(before["recent_fills"], snapshot["recent_fills"], "id", rounding)
+    pilot.require(len(fills) == 1 and fills[0]["id"] == target["fill"] and fills[0]["orderId"] == target["order"]
                   and scanner.numeric_id(fills[0]["exchangeId"]) == eid and scanner.numeric_id(fills[0]["marketId"]) == mid
                   and all(fills[0][k] == fill[k] for k in ("side", "quantity", "filledAt"))
                   and abs(Decimal(str(fills[0]["price"])) - price) <= Decimal(".000000001"),
                   "Portfolio fill history differs or contains additional execution")
-    trades = new_rows(before["recent_transactions"], snapshot["recent_transactions"], "event_id")
+    trades = new_rows(before["recent_transactions"], snapshot["recent_transactions"], "event_id", rounding)
     pilot.require(len(trades) == 1, "Unexpected transaction, fee or debit prevents recovery")
     transaction = trades[0]
     pilot_account.validate_transaction(transaction, tid)
@@ -162,14 +197,16 @@ def prove_fill(attempt, snapshot, orders, observed):
                   and Decimal(str(transaction["price"])) == price and transaction["amount"] is None
                   and transaction["transactionType"] is None
                   and auto.single.parse_api_timestamp(transaction["createdAt"]) == auto.single.parse_api_timestamp(fill["filledAt"])
-                  and all(transaction.get(k) is None for k in ("outstandingAdvanceAfter", "componentId", "reason")),
+                  and all(transaction.get(k) is None for k in ("outstandingAdvanceAfter", "componentId", "reason", "collateralDelta")),
                   "Transaction contradicts the known BUY or introduces unexplained cash effects")
     positions = [r for r in account["positions"] if scanner.numeric_id(r["exchangeId"]) == eid]
-    pilot.require(len(positions) == 1 and not any(scanner.numeric_id(r["exchangeId"]) in TARGET["exchanges"]
+    pilot.require(len(positions) == 1 and not any(scanner.numeric_id(r["exchangeId"]) in target["exchanges"]
                   for r in before["account"]["positions"])
                   and probe.inventory(account, eid) == probe.inventory(before["account"], eid),
                   "Other holdings changed or the pair has unexpected exposure")
     holding = positions[0]
+    if rounding:
+        pilot.require(probe.account_reader.one_no_buy_cost_matches(holding, price), "POSITION_COST_ROUNDING_MISMATCH")
     pilot.require(scanner.numeric_id(holding["marketId"]) == mid and holding["quantity"] == -1
                   and holding["settled"] is False and Decimal(str(holding["avgCost"])) == price
                   and abs(Decimal(str(holding["costBasis"])) - price) <= pilot_account.BALANCE_DELTA_TOLERANCE,
@@ -193,6 +230,7 @@ def prove_fill(attempt, snapshot, orders, observed):
 
 
 def proposed_checkpoint(checkpoint, key, record):
+    target, _, _ = recovery_target(key)
     proposed = copy.deepcopy(checkpoint)
     attempt = proposed["autonomous_execution"]["attempts"][key]
     first = attempt["legs"][0]
@@ -206,7 +244,7 @@ def proposed_checkpoint(checkpoint, key, record):
     attempt.update(state=pilot.LEG2_RECHECK, halt_reason="", halted_from=None)
     exposure = proposed["live_exposures"][key]
     charge = record["review"]["conservative_allocation_charge"]
-    exposure.update(confirmed_quantities=["1", "0"], confirmed_costs=[str(TARGET["price"]), "0"],
+    exposure.update(confirmed_quantities=["1", "0"], confirmed_costs=[str(target["price"]), "0"],
                     possible_additional_quantities=["0", "1"], capital_charge=charge,
                     execution_status="EXECUTING", accounting_buffer=str(auto.ACCOUNTING_BUFFER))
     proposed["accounted_pair_costs"][key] = charge
@@ -220,13 +258,22 @@ def proposed_checkpoint(checkpoint, key, record):
 def validate_recovered(checkpoint, key):
     """Keep recovery proof and retired key immutable through later completion."""
     attempt = checkpoint["autonomous_execution"]["attempts"][key]
+    target, kind, reason = recovery_target(key)
     record = attempt["filled_leg1_recovery"]
-    pilot.require(key == TARGET["attempt"] and set(record) == {"version", "kind", "recovered_at", "prior_checkpoint_hash",
+    fields = {"version", "kind", "recovered_at", "prior_checkpoint_hash",
                   "prior_revision", "prior_updated_at", "prior_halt_reason", "original_intent", "original_receipt",
                   "observed_intent", "snapshot", "orders", "reads", "review", "submission_status",
                   "retired_idempotency_key", "resume_consumed_at"}
-                  and record["version"] == 1 and record["kind"] == "FILLED_LEG1_EXPIRY_NORMALIZATION"
-                  and record["prior_halt_reason"] == HALT_REASON and record["submission_status"] == "RETIRED_NEVER_RETRY"
+    if kind == "FILLED_LEG1_POSITION_COST_ROUNDING":
+        fields.add("original_leg1_evidence")
+        pilot.require(set(record["original_leg1_evidence"]) == {"activity", "review", "after"}
+                      and record["original_leg1_evidence"]["review"]["issues"] == [
+                          "POSITION_COST_SEMANTICS_UNVERIFIED",
+                          "Rounded balances and ledger proximity do not prove receipt-linked fee-inclusive debit"],
+                      "Original rounding halt evidence is missing")
+    pilot.require(set(record) == fields
+                  and record["version"] == 1 and record["kind"] == kind
+                  and record["prior_halt_reason"] == reason and record["submission_status"] == "RETIRED_NEVER_RETRY"
                   and len(record["prior_checkpoint_hash"]) == 64 and type(record["prior_revision"]) is int
                   and record["retired_idempotency_key"] == attempt["legs"][0]["intent"]["request"]["idempotencyKey"]
                   and record["original_intent"]["request"] == attempt["legs"][0]["intent"]["request"]
@@ -239,7 +286,7 @@ def validate_recovered(checkpoint, key):
                   "Invalid recovery timestamp or raw GET evidence")
     archived = copy.deepcopy(attempt)
     archived["legs"][0]["intent"] = record["original_intent"]
-    pilot.require(prove_fill(archived, record["snapshot"], record["orders"], record["observed_intent"]) == record["review"],
+    pilot.require(prove_fill(archived, record["snapshot"], record["orders"], record["observed_intent"], target) == record["review"],
                   "Archived recovery proof is inconsistent")
     if record["resume_consumed_at"] is not None:
         pilot.require(auto.single.parse_api_timestamp(record["resume_consumed_at"]) >= auto.single.parse_api_timestamp(record["recovered_at"]),
@@ -251,13 +298,18 @@ def validate_recovered(checkpoint, key):
 def validate_transition(previous, proposed):
     key = previous["autonomous_execution"]["active_attempt"]
     attempt = eligible_attempt(previous, key)
+    target, kind, _ = recovery_target(key)
     record = proposed["autonomous_execution"]["attempts"][key]["filled_leg1_recovery"]
     pilot.require(record["prior_checkpoint_hash"] == pilot.snapshot_hash(previous)
                   and record["prior_revision"] == previous["revision"] and record["prior_updated_at"] == previous["updated_at"]
                   and record["original_intent"] == attempt["legs"][0]["intent"]
                   and record["original_receipt"] == attempt["legs"][0]["receipt"] and record["resume_consumed_at"] is None,
                   "Recovery does not bind the current halt and original request/receipt")
-    pilot.require(record["review"] == prove_fill(attempt, record["snapshot"], record["orders"], record["observed_intent"])
+    if kind == "FILLED_LEG1_POSITION_COST_ROUNDING":
+        pilot.require(record["original_leg1_evidence"] == {"activity": attempt["legs"][0]["activity"],
+                      "review": attempt["legs"][0]["review"], "after": attempt["after"][0]},
+                      "Original first-leg review, fills or account evidence changed")
+    pilot.require(record["review"] == prove_fill(attempt, record["snapshot"], record["orders"], record["observed_intent"], target)
                   and proposed == proposed_checkpoint(previous, key, record), "Recovery contains an unrelated state change")
     model = sum((sum(map(pilot.amount, e["confirmed_costs"])) for e in proposed["live_exposures"].values()), Decimal(0))
     returned = sum((pilot.amount(p["exit_proceeds"]) for p in proposed.get("autonomous_positions", {}).values()), Decimal(0))
@@ -284,6 +336,7 @@ def recover(session, key, apply=False):
     with readonly_pilot_lock() as path:
         checkpoint = pilot._read_checkpoint_locked(path)
         attempt = eligible_attempt(checkpoint, key)
+        target, kind, _ = recovery_target(key)
         pilot.require_external_execution_clear()
         pilot.require_initial_evidence_clear(path)
         reads = probe.EvidenceReads(session)  # Memory only until explicit --apply.
@@ -294,16 +347,19 @@ def recover(session, key, apply=False):
         observed = copy.deepcopy(attempt["legs"][0]["intent"])
         observed["state"], observed["observation"] = auto.single.observe_test(get_only, observed)
         snapshot = pilot_account.read_snapshot(get_only, attempt["authorization"]["tournament_slug"], checkpoint,
-                                               started=started, order_ids=[TARGET["order"]])
+                                               started=started, order_ids=[target["order"]])
         pilot.require(read_orders(get_only, checkpoint["tournament_id"]) == orders, "Order history changed during recovery")
-        review = prove_fill(attempt, snapshot, orders, observed)
-        record = {"version": 1, "kind": "FILLED_LEG1_EXPIRY_NORMALIZATION", "recovered_at": datetime.now(timezone.utc).isoformat(),
+        review = prove_fill(attempt, snapshot, orders, observed, target)
+        record = {"version": 1, "kind": kind, "recovered_at": datetime.now(timezone.utc).isoformat(),
                   "prior_checkpoint_hash": pilot.snapshot_hash(checkpoint), "prior_revision": checkpoint["revision"],
                   "prior_updated_at": checkpoint["updated_at"], "prior_halt_reason": checkpoint["review_reason"],
                   "original_intent": copy.deepcopy(attempt["legs"][0]["intent"]), "original_receipt": copy.deepcopy(attempt["legs"][0]["receipt"]),
                   "observed_intent": observed, "snapshot": snapshot, "orders": orders, "reads": reads.reads, "review": review,
                   "submission_status": "RETIRED_NEVER_RETRY", "retired_idempotency_key": observed["request"]["idempotencyKey"],
                   "resume_consumed_at": None}
+        if kind == "FILLED_LEG1_POSITION_COST_ROUNDING":
+            record["original_leg1_evidence"] = copy.deepcopy({"activity": attempt["legs"][0]["activity"],
+                "review": attempt["legs"][0]["review"], "after": attempt["after"][0]})
         proposed = proposed_checkpoint(checkpoint, key, record)
         pilot.validate_checkpoint(proposed)
         validate_transition(checkpoint, proposed)
@@ -318,11 +374,14 @@ def recover(session, key, apply=False):
                 proposed = pilot._save_checkpoint_locked(proposed, path, filled_recovery=True)
             finally:
                 pilot._state_lock_owners.pop(path, None)
-        fields = ("state", "confirmed_cumulative_debits", "allocated_cash_remaining", "reserved_unconfirmed_capital",
+        fields = ("state", "revision", "confirmed_cumulative_debits", "allocated_cash_remaining", "reserved_unconfirmed_capital",
                   "quarantine_reserve", "calculated_remaining_allocation", "last_reconciled_account_cash")
+        after = {f: proposed[f] for f in fields}
+        if not apply:
+            after["revision"] += 1
         return {"result": "RECOVERED" if apply else "DRY_RUN_PASS", "attempt": key,
-                "order_id": TARGET["order"], "fill_id": TARGET["fill"], "accounting": review,
-                "before": {f: checkpoint[f] for f in fields}, "after": {f: proposed[f] for f in fields},
+                "order_id": target["order"], "fill_id": target["fill"], "accounting": review,
+                "before": {f: checkpoint[f] for f in fields}, "after": after,
                 "exposure_after": proposed["live_exposures"][key], "retired_idempotency_key": record["retired_idempotency_key"],
                 "leg_two_intent": None, "orders_submitted": 0, "state_written": apply, "get_requests": len(reads.reads),
                 "continuation": "Separate explicit --resume-recovered-leg1 command; ordinary startup halts unfinished execution"}

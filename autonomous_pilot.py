@@ -148,7 +148,8 @@ def validate_journal(checkpoint):
         require(isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
                 and isinstance(attempt, dict) and set(attempt) in
                 (fields, fields | {"rejection_recovery"}, fields | {"filled_leg1_recovery"},
-                 fields | {"filled_leg1_recovery", "final_reconciliation_recovery"}),
+                 fields | {"filled_leg1_recovery", "final_reconciliation_recovery"},
+                 fields | {"filled_leg1_recovery", "leg2_recheck_recovery"}),
                 "Invalid autonomous execution record")
         approval = attempt["authorization"]
         live.validate_authorization(approval)
@@ -216,6 +217,9 @@ def validate_journal(checkpoint):
         if "filled_leg1_recovery" in attempt:
             from recover_filled_leg1 import validate_recovered
             validate_recovered(checkpoint, fingerprint)
+        if "leg2_recheck_recovery" in attempt:
+            from recover_leg2_recheck import validate_recovered
+            validate_recovered(checkpoint, fingerprint)
         if "final_reconciliation_recovery" in attempt:
             from recover_completed_pair import validate_completed
             validate_completed(checkpoint, fingerprint)
@@ -241,7 +245,8 @@ def validate_journal(checkpoint):
                 <= pilot_account.BALANCE_DELTA_TOLERANCE, "Completed autonomous accounting baseline is inconsistent")
 
 
-def validate_update(previous, proposed, rejected_recovery=False, filled_recovery=False, completed_recovery=False):
+def validate_update(previous, proposed, rejected_recovery=False, filled_recovery=False, completed_recovery=False,
+                    leg2_recovery=False):
     """No deletion, key reuse, changed request or clearing a historical halt."""
     old, new = previous["autonomous_execution"], proposed.get("autonomous_execution")
     require(new is not None and old["policy"] == new["policy"] and old["reference_cash"] == new["reference_cash"],
@@ -255,6 +260,7 @@ def validate_update(previous, proposed, rejected_recovery=False, filled_recovery
         require(attempt["state"] != pilot.HALTED or current["state"] == pilot.HALTED
                 or rejected_recovery and current["state"] == pilot.REJECTED_RETIRED
                 or filled_recovery and current["state"] == pilot.LEG2_RECHECK
+                or leg2_recovery and current["state"] == pilot.LEG2_RECHECK
                 or completed_recovery and current["state"] == pilot.READY, "Autonomous halt cannot clear")
         old_final, new_final = attempt.get("final_reconciliation_recovery"), current.get("final_reconciliation_recovery")
         require((old_final is not None and new_final == old_final)
@@ -271,6 +277,17 @@ def validate_update(previous, proposed, rejected_recovery=False, filled_recovery
                     "Filled-leg recovery evidence or consumed resume permission changed")
         else:
             require(new_recovery is None or filled_recovery, "Filled-leg recovery requires its dedicated verified transition")
+        old_recheck, new_recheck = attempt.get("leg2_recheck_recovery"), current.get("leg2_recheck_recovery")
+        if old_recheck is not None:
+            require(new_recheck is not None, "Leg-two recovery audit cannot disappear")
+            old_record, new_record = copy.deepcopy(old_recheck), copy.deepcopy(new_recheck)
+            old_consumed, new_consumed = old_record.pop("consumed_at"), new_record.pop("consumed_at")
+            require(old_record == new_record and (old_consumed == new_consumed or
+                    old_consumed is None and new_consumed is not None and
+                    previous["state"] == proposed["state"] == pilot.LEG2_RECHECK),
+                    "Leg-two recovery evidence or consumed permission changed")
+        else:
+            require(new_recheck is None or leg2_recovery, "Leg-two recovery requires its dedicated verified transition")
         require(current["stages"][:len(attempt["stages"])] == attempt["stages"], "Execution stage history cannot be erased")
         for prior_leg, current_leg in zip(attempt["legs"], current["legs"]):
             require(not prior_leg["post_attempted"] or current_leg["post_attempted"], "A possible POST was forgotten")
@@ -498,6 +515,10 @@ def reconcile_leg(reads, state, index):
         observations["isolated_execution_reconciled"] = True
         leg["review"]["autonomous_policy_note"] = "Diagnostic probe debit proof excluded; reserved live allocation/caps apply."
     persist(state)
+    require("POSITION_COST_ROUNDING_MISMATCH" not in leg["review"]["issues"],
+            "POSITION_COST_ROUNDING_MISMATCH: costBasis differs from the fill beyond the 0.005 cent-display bound")
+    require("POSITION_AVERAGE_COST_MISMATCH" not in leg["review"]["issues"],
+            "POSITION_AVERAGE_COST_MISMATCH: holding average entry cost differs from actual fills")
     require(leg["review"]["observations"]["isolated_execution_reconciled"] is True,
             "ACCOUNTING_MODEL_MISMATCH or incomplete isolated reconciliation; manual review required")
     cp = state["checkpoint"]
@@ -538,6 +559,15 @@ def completion_limits(attempt, book, account_started):
                           "book": copy.deepcopy(book)}
 
 
+def account_unchanged_after_leg1(previous, after):
+    """Marks can move while cash, inventory and execution history stay fixed."""
+    return (probe.money(after["account"]["tournament"]["myBalance"]) ==
+            probe.money(previous["account"]["tournament"]["myBalance"])
+            and probe.inventory(after["account"], "") == probe.inventory(previous["account"], "")
+            and not after["account"]["orders"] and after["recent_fills"] == previous["recent_fills"]
+            and pilot_account.transaction_histories_equal(after["recent_transactions"], previous["recent_transactions"]))
+
+
 def prepare_second_leg(reads, state):
     cp = state["checkpoint"]
     approval = active_attempt(cp)["authorization"]
@@ -548,10 +578,7 @@ def prepare_second_leg(reads, state):
     after = pilot_account.read_snapshot(reads, approval["tournament_slug"], cp, order_ids=[])
     attempt = active_attempt(state["checkpoint"])
     previous = attempt["after"][0]
-    require(probe.money(after["account"]["tournament"]["myBalance"]) == probe.money(previous["account"]["tournament"]["myBalance"])
-            and probe.inventory(after["account"], "") == probe.inventory(previous["account"], "")
-            and not after["account"]["orders"] and after["recent_fills"] == previous["recent_fills"]
-            and after["recent_transactions"] == previous["recent_transactions"], "Account changed before leg two")
+    require(account_unchanged_after_leg1(previous, after), "Account changed before leg two")
     book = scanner.get_best_prices(reads, markets[1], approval["tournament_id"])
     cp = state["checkpoint"]
     attempt = active_attempt(cp)
@@ -1048,7 +1075,7 @@ def run(session):
             time.sleep(max(0, scanner.SCAN_INTERVAL - (time.monotonic() - started)))
 
 
-def resume_recovered_leg1(session, attempt_id):
+def resume_recovered_leg1(session, attempt_id, continuation=None):
     """Explicit one-use continuation; ordinary restart still halts execution.
 
     This command can submit ONLY a newly rechecked leg two. The first leg's
@@ -1060,14 +1087,19 @@ def resume_recovered_leg1(session, attempt_id):
     require_submission()
     with readonly_pilot_lock() as path:
         cp = pilot._read_checkpoint_locked(path)  # No automatic restart mutation.
-        require_resume(cp, attempt_id)
+        if continuation is None:
+            require_resume(cp, attempt_id)
+        else:
+            from recover_leg2_recheck import require_resume as require_new_permission
+            require_new_permission(cp, attempt_id, continuation)
         pilot.require_external_execution_clear()
         pilot.require_initial_evidence_clear(path)
         require(path not in pilot._state_lock_owners, "Another operation owns pilot state")
         pilot._state_lock_owners[path] = (os.getpid(), threading.get_ident())
         state = {"checkpoint": cp}
         try:
-            active_attempt(cp)["filled_leg1_recovery"]["resume_consumed_at"] = datetime.now(timezone.utc).isoformat()
+            record = active_attempt(cp)["filled_leg1_recovery" if continuation is None else "leg2_recheck_recovery"]
+            record["resume_consumed_at" if continuation is None else "consumed_at"] = datetime.now(timezone.utc).isoformat()
             persist(state)  # Consume BEFORE reads/intent/POST; crash cannot replay.
             reads = EvidenceReads(session, state)
             reads.reads = copy.deepcopy(active_attempt(state["checkpoint"])["reads"])
@@ -1085,9 +1117,15 @@ def resume_recovered_leg1(session, attempt_id):
 
 def main(argv=()):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--resume-recovered-leg1", metavar="ATTEMPT_ID",
+    resume = parser.add_mutually_exclusive_group()
+    resume.add_argument("--resume-recovered-leg1", metavar="ATTEMPT_ID",
                         help="Explicitly continue one GET-reconciled filled first leg; may submit leg two")
+    resume.add_argument("--resume-leg2-recheck", metavar="ATTEMPT_ID",
+                        help="Continue the separately recovered leg-two check; may submit only leg two")
+    parser.add_argument("--continuation", metavar="PERMISSION_ID", help="Exact new one-use recovery permission")
     args = parser.parse_args(argv)
+    if bool(args.resume_leg2_recheck) != bool(args.continuation):
+        parser.error("--resume-leg2-recheck requires --continuation, and vice versa")
     if not config.AUTONOMOUS_LIVE_PILOT_ENABLED:
         print("DISABLED | Set AUTONOMOUS_LIVE_PILOT_ENABLED only after explicit review")
         return 0  # No credentials, reads, state writes or intents while disabled.
@@ -1098,8 +1136,9 @@ def main(argv=()):
         require(bool(key), "SIG_API_KEY is unavailable")
         with requests.Session() as session:
             session.headers.update({"Authorization": f"Bearer {key}"})
-            result = resume_recovered_leg1(session, args.resume_recovered_leg1) if args.resume_recovered_leg1 else run(session)
-            if args.resume_recovered_leg1:
+            attempt_id = args.resume_leg2_recheck or args.resume_recovered_leg1
+            result = resume_recovered_leg1(session, attempt_id, args.continuation) if attempt_id else run(session)
+            if attempt_id:
                 print(f"{result['state']} | {result.get('execution_id', result.get('reason', ''))}")
         return 1 if result and result["state"] == pilot.HALTED else 0
     except KeyboardInterrupt:

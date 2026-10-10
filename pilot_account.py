@@ -129,6 +129,59 @@ def validate_transaction(row, tournament_id):
     return parse_api_timestamp(row["createdAt"])
 
 
+def canonical_transaction(row):
+    """Keep execution/cash evidence, excluding only known mutable display data.
+
+    Use an exclusion list so new order/fill links or accounting fields are
+    checked automatically. Unknown fields are never silently discarded.
+    """
+    require(isinstance(row, dict) and isinstance(row.get("event_id"), str)
+            and bool(row["event_id"]), RECONCILIATION_UNAVAILABLE, "Missing transaction identity")
+    validate_transaction(row, row["tournamentId"])
+    result = {key: value for key, value in row.items()
+              if key not in {"currentPrice", "marketTitle", "marketImage"}}
+    # Z and UTC offsets describe the same immutable execution timestamp.
+    result["createdAt"] = parse_api_timestamp(row["createdAt"]).astimezone(timezone.utc).isoformat()
+    json.dumps(result, allow_nan=False)  # Malformed new accounting fields fail closed too.
+    return result
+
+
+def canonical_transaction_history(rows):
+    """Compare by unique event ID; API list order is not an economic event.
+
+    Changing which event belongs to which ID still fails, as does a duplicate
+    even when both copies happen to contain identical financial values.
+    """
+    require(isinstance(rows, list), RECONCILIATION_UNAVAILABLE, "Invalid transaction history")
+    result = {}
+    for row in rows:
+        canonical = canonical_transaction(row)
+        key = canonical["event_id"]
+        require(key not in result, RECONCILIATION_UNAVAILABLE, "Duplicate transaction identity")
+        result[key] = canonical
+    return result
+
+
+def transaction_histories_equal(before, after):
+    """Malformed, duplicated or economically changed history fails closed."""
+    try:
+        return canonical_transaction_history(before) == canonical_transaction_history(after)
+    except scanner.API_ERRORS:
+        return False
+
+
+def account_execution_state(account):
+    """Remove position marks, retaining cash, entry cost, lots and settlement."""
+    result = copy.deepcopy(account)
+    for position in result["positions"]:
+        for key in ("currentPrice", "marketValue", "unrealizedPnl", "unrealizedPnlPct"):
+            position.pop(key, None)
+    result["positions"].sort(key=lambda p: scanner.numeric_id(p["exchangeId"]))
+    for key in ("totalMarketValue", "totalUnrealizedPnl"):
+        result["summary"].pop(key, None)
+    return result
+
+
 def read_history(session, path, started, validate, identity, since=None):
     """Read the whole relevant window, or the full lifecycle for a known order.
 
@@ -283,10 +336,13 @@ def read_snapshot(session, slug="midterm-elections", checkpoint=None, initial_ac
                 "Too many recent receipts for a fresh complete read")
         activity = [read_order_activity(session, oid, fills, account, started) for oid in order_ids]
         final_account = read_current_account(session, slug, allow_inactive)
-        require(final_account == account, INCONSISTENT, "Balance, holdings, orders or quarantine changed during the read")
+        require(account_execution_state(final_account) == account_execution_state(account),
+                INCONSISTENT, "Balance, holdings, orders or quarantine changed during the read")
         for path, old_head in ((base + "/fills", fill_head), (base + "/transactions", transaction_head)):
             latest = get_data(session, path, {"limit": 200}, started)
-            require(latest["coverage"]["complete"] is True and latest["data"][:1] == old_head,
+            same_head = (transaction_histories_equal(latest["data"][:1], old_head)
+                         if path.endswith("/transactions") else latest["data"][:1] == old_head)
+            require(latest["coverage"]["complete"] is True and same_head,
                     INCONSISTENT, "Account activity changed during the read")
         check_fresh(started)
         return {"account": account, "recent_fills": fills, "recent_transactions": transactions,
