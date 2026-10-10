@@ -194,6 +194,95 @@ class AutonomousLifecycleTests(unittest.TestCase):
         self.assertGreater(Decimal(self.fixture.checkpoint()["total_live_exposure"]), 0)
         self.assertEqual(len(self.posts), 2)
 
+    def test_stale_read_only_exit_evaluation_skips_without_persistent_halt(self):
+        self.assertEqual(self.cycle()["state"], pilot.READY)
+        original_quote = auto.exit_quote
+        def slow_quote(*args, **kwargs):
+            # A valid snapshot began at 100; serial GETs have now taken 16s.
+            auto.time.monotonic.return_value = 116
+            return original_quote(*args, **kwargs)
+        with patch.object(auto, "exit_quote", side_effect=slow_quote), patch.object(auto, "halt") as halt:
+            result = self.manage()
+        self.assertEqual(result["state"], pilot.READY)
+        self.assertEqual(result["positions"][0]["reason"], "HOLD_SKIPPED_STALE_ACCOUNT")
+        halt.assert_not_called()
+        cp = self.fixture.checkpoint()
+        self.assertFalse(cp["manual_review_required"])
+        self.assertEqual(cp["review_reason"], "")
+        self.assertIsNone(next(iter(cp["autonomous_positions"].values()))["exit_execution"])
+        self.assertEqual(len(self.posts), 2)  # Only the earlier mocked entry.
+
+    def test_stale_hold_snapshot_capture_skips_with_zero_state_writes(self):
+        self.cycle()
+        before = self.fixture.path.read_bytes()
+        error = auto.pilot_account.AccountReadinessBlocked(auto.pilot_account.STALE, "Synthetic slow GETs")
+        with patch.object(auto.pilot_account, "read_snapshot", side_effect=error):
+            result = self.manage()
+        self.assertEqual(result["state"], pilot.READY)
+        self.assertEqual(result["positions"][0]["reason"], "HOLD_SKIPPED_STALE_ACCOUNT")
+        self.assertEqual(self.fixture.path.read_bytes(), before)
+        self.assertEqual(len(self.posts), 2)
+
+    def test_stale_fresh_account_immediately_before_sell_still_halts_without_post(self):
+        self.cycle()
+        self.quote_exit(.495)
+        original = auto.pilot_account.read_snapshot
+        calls = []
+        def expires_before_sell(*args, **kwargs):
+            result = original(*args, **kwargs)
+            calls.append(result)
+            if len(calls) == 2:  # First is HOLD; second is the pre-SELL read.
+                auto.time.monotonic.return_value = 116
+            return result
+        with patch.object(auto.pilot_account, "read_snapshot", side_effect=expires_before_sell):
+            result = self.manage()
+        self.assertEqual(result["state"], pilot.HALTED)
+        self.assertIn("STALE_ACCOUNT_DATA", result["reason"])
+        self.assertEqual(len(self.posts), 2)
+        self.assertTrue(self.fixture.checkpoint()["manual_review_required"])
+
+    def test_final_freshness_check_after_sale_authorization_blocks_post(self):
+        self.cycle()
+        self.quote_exit(.495)
+        original = live.revalidate_authorization
+        def slow_final_authorization(approval):
+            result = original(approval)
+            cp = pilot._read_checkpoint_locked(self.fixture.path.resolve())
+            if any(p["exit_execution"] and p["exit_execution"]["legs"][0]["post_attempted"]
+                   for p in cp["autonomous_positions"].values()):
+                auto.time.monotonic.return_value = 116
+            return result
+        with patch.object(live, "revalidate_authorization", side_effect=slow_final_authorization):
+            result = self.manage()
+        self.assertEqual(result["state"], pilot.HALTED)
+        self.assertIn("STALE_ACCOUNT_DATA", result["reason"])
+        self.assertEqual(len(self.posts), 2)
+
+    def test_unexplained_hold_cash_change_still_halts(self):
+        self.cycle()
+        self.fixture.fixture.current["tournament"]["myBalance"] -= .1
+        result = self.manage()
+        self.assertEqual(result["state"], pilot.HALTED)
+        self.assertIn("Unexplained account cash change", result["reason"])
+        self.assertEqual(len(self.posts), 2)
+
+    def test_financial_transaction_change_before_sell_blocks_post(self):
+        self.cycle()
+        self.quote_exit(.495)
+        original = auto.pilot_account.read_snapshot
+        calls = []
+        def changed_before_sell(*args, **kwargs):
+            snapshot = original(*args, **kwargs)
+            calls.append(snapshot)
+            if len(calls) == 2:
+                snapshot["recent_transactions"][0]["price"] += .005
+            return snapshot
+        with patch.object(auto.pilot_account, "read_snapshot", side_effect=changed_before_sell):
+            result = self.manage()
+        self.assertEqual(result["state"], pilot.HALTED)
+        self.assertIn("Account changed before sale", result["reason"])
+        self.assertEqual(len(self.posts), 2)
+
     def test_missing_holding_without_settlement_evidence_halts(self):
         self.cycle()
         self.settle("1", 0, with_event=False)

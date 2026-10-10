@@ -1921,3 +1921,40 @@ the final receipt checks; **670 full-suite tests passed**. Fresh official recove
 dry run passed with 22 GET responses and zero submissions/runtime writes.
 The real checkpoint remains halted at revision 89. Fingerprints confirm `.env`,
 runtime state/journals, allocation, approvals and trading configuration unchanged.
+
+## Read-only HOLD freshness and revision-221 recovery
+
+Position management skips a read-only HOLD/exit evaluation if its account
+snapshot exceeds the existing 15-second window. It returns and prints
+`HOLD_SKIPPED_STALE_ACCOUNT`; the next cycle obtains another snapshot. This
+does not clear an existing halt or waive account inconsistency checks.
+
+Once a sale is staged, stale account data still halts execution. Each SELL
+fetches a fresh account snapshot and executable quote after persisting intent,
+compares cash, holdings, fills and economically canonical transactions, and
+checks account freshness again immediately before POST. Entry thresholds,
+allocation/risk caps, settlement approvals and reconciliation are unchanged.
+
+The dedicated command below diagnoses only the pinned revision-221
+`STALE_ACCOUNT_DATA` halt with no active attempt and the three completed OPEN
+Colorado, Alaska and New Hampshire pairs:
+
+```bash
+.venv/bin/python recover_position_freshness.py --dry-run
+```
+
+It uses the existing read-only exclusive lock and GET-only adapters. It checks
+all six terminal orders/fills, the complete tournament order set, exact saved
+cash/inventory, financial transaction history and fresh official authorization
+evidence. Mutable marks are excluded by the existing canonical comparisons.
+Terminal receipts are read separately from the final bracketed account
+snapshot so they do not consume that snapshot's freshness window.
+
+Only after separate explicit approval, `--apply` repeats those checks and
+atomically appends `position_freshness_recoveries`, preserves the original halt
+reason/revision/state hash and GET evidence, and changes only the review flags
+and state to READY (plus normal revision/timestamp metadata). All three position
+records, original entry history, allocation charges and quarantine reserve
+remain unchanged. Recovery does not start the bot or submit/cancel any order.
+Ordinary writes cannot append/erase the audit or clear the halt. A changed
+checkpoint or account fails closed. Dry-run writes nothing.

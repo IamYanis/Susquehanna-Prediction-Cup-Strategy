@@ -888,13 +888,16 @@ def execute_exit_locked(session, state, key, before):
         fresh = pilot_account.read_snapshot(reads, approval["tournament_slug"], state["checkpoint"], order_ids=[])
         require(held_quantity(fresh["account"], eid) == 1 and not fresh["account"]["orders"]
                 and probe.inventory(fresh["account"], "") == probe.inventory(current["account"], "")
-                and fresh["account"]["tournament"]["myBalance"] == current["account"]["tournament"]["myBalance"],
+                and fresh["account"]["tournament"]["myBalance"] == current["account"]["tournament"]["myBalance"]
+                and fresh["recent_fills"] == current["recent_fills"]
+                and pilot_account.transaction_histories_equal(fresh["recent_transactions"], current["recent_transactions"]),
                 "Account changed before sale")
         latest, _ = exit_quote(reads, approval, fresh["freshness"]["started_monotonic"])
         live.revalidate_authorization(approval)
         require(latest[i] >= Decimal(str(body["price"])) and
                 (Decimal(p["exit_proceeds"]) + latest[i] if i else sum(latest)) >= EARLY_EXIT_PROCEEDS,
                 "Executable exit disappeared before submission")
+        pilot_account.check_fresh(fresh["freshness"]["started_monotonic"])
         response = session.post(scanner.API_BASE_URL + "/orders", json=copy.deepcopy(body),
                                 timeout=scanner.REQUEST_TIMEOUT, allow_redirects=False)
         leg = state["checkpoint"]["autonomous_positions"][key]["exit_execution"]["legs"][i]
@@ -985,6 +988,17 @@ def manage_positions_locked(session, checkpoint):
             reports.append({"pair": p["pair"], "action": "HOLD", "exit_value": str(sum(prices))})
         return {"state": state["checkpoint"]["state"], "positions": reports, "checkpoint": state["checkpoint"]}
     except (OSError, *scanner.API_ERRORS) as error:
+        # Slow GET-only HOLD checks do not imply uncertain execution. Skip this
+        # evaluation; the next cycle obtains a new account snapshot. Once an
+        # exit is staged, freshness failures still halt and cannot reach POST.
+        cp = state["checkpoint"]
+        if (isinstance(error, pilot_account.AccountReadinessBlocked) and error.code == pilot_account.STALE
+                and cp["state"] == pilot.READY and not cp["manual_review_required"]
+                and cp.get("autonomous_execution", {}).get("active_attempt") is None
+                and not any(p["status"] == "EXITING" for p in cp.get("autonomous_positions", {}).values())):
+            return {"state": cp["state"], "checkpoint": cp, "positions": [
+                {"pair": p["pair"], "action": "HOLD", "reason": "HOLD_SKIPPED_STALE_ACCOUNT"}
+                for p in cp.get("autonomous_positions", {}).values() if p["status"] == "OPEN"]}
         safe = (pilot.PilotBlocked, pilot_account.AccountReadinessBlocked, live.LiveSettlementBlocked, PreviewBlocked)
         return halt(state, str(error) if isinstance(error, safe) else "Position account/execution unavailable; manual review required")
     except BaseException:
@@ -1072,6 +1086,8 @@ def run(session):
             for report in result["positions"]:
                 if report["action"] != "HOLD":
                     print(f"{report['action']} | {report['pair']} | realized P&L {report['realized_pnl']} SUSQies")
+                elif report.get("reason") == "HOLD_SKIPPED_STALE_ACCOUNT":
+                    print(f"HOLD_SKIPPED_STALE_ACCOUNT | {report['pair']}")
             time.sleep(max(0, scanner.SCAN_INTERVAL - (time.monotonic() - started)))
 
 

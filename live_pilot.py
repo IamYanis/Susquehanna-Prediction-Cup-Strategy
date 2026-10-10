@@ -157,7 +157,7 @@ def validate_checkpoint(checkpoint):
         "live_exposures", "quarantine_reserve", "reserved_unconfirmed_capital", "total_live_exposure",
         "calculated_remaining_allocation", "state", "revision", "created_at", "updated_at"}
     optional = {"baseline_snapshot", "baseline_snapshot_hash", "autonomous_execution", "autonomous_positions",
-                "settlement_halt_recoveries"}
+                "settlement_halt_recoveries", "position_freshness_recoveries"}
     require(isinstance(checkpoint, dict) and fields.issubset(checkpoint)
             and not set(checkpoint) - fields - optional
             and ("baseline_snapshot" in checkpoint) == ("baseline_snapshot_hash" in checkpoint),
@@ -290,6 +290,9 @@ def validate_checkpoint(checkpoint):
     if "settlement_halt_recoveries" in checkpoint:
         from recover_settlement_halt import validate_history
         validate_history(checkpoint["settlement_halt_recoveries"])
+    if "position_freshness_recoveries" in checkpoint:
+        from recover_position_freshness import validate_history
+        validate_history(checkpoint)
 
 
 def snapshot_hash(snapshot):
@@ -316,7 +319,7 @@ def _read_checkpoint_locked(path):
 
 
 def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False, settlement_recovery=False,
-                            filled_recovery=False, completed_recovery=False, leg2_recovery=False):
+                            filled_recovery=False, completed_recovery=False, leg2_recovery=False, freshness_recovery=False):
     """Validate then fsync/replace/fsync-directory while holding one stable lock."""
     require(_state_lock_owners.get(path) == (os.getpid(), threading.get_ident()),
             "Pilot state mutation requires the exclusive process lock")
@@ -338,7 +341,7 @@ def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False
             from recover_rejected_attempt import validate_transition
             validate_transition(previous, proposed)
         require(sum((bool(rejected_recovery), bool(settlement_recovery), bool(filled_recovery), bool(completed_recovery),
-                     bool(leg2_recovery))) <= 1,
+                     bool(leg2_recovery), bool(freshness_recovery))) <= 1,
                 "Recovery types cannot be combined")
         if settlement_recovery:
             from recover_settlement_halt import validate_transition
@@ -355,7 +358,13 @@ def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False
         if leg2_recovery:
             from recover_leg2_recheck import validate_transition
             validate_transition(previous, proposed)
-        require(rejected_recovery or settlement_recovery or filled_recovery or completed_recovery or leg2_recovery
+        if freshness_recovery:
+            from recover_position_freshness import validate_transition
+            validate_transition(previous, proposed)
+        else:
+            require(proposed.get("position_freshness_recoveries") == previous.get("position_freshness_recoveries"),
+                    "Position freshness recovery audit cannot change outside explicit recovery")
+        require(rejected_recovery or settlement_recovery or filled_recovery or completed_recovery or leg2_recovery or freshness_recovery
                 or not previous["manual_review_required"] or proposed["state"] == HALTED,
                 "A persistent manual-review halt cannot be cleared automatically")
         for fingerprint, cost in previous["accounted_pair_costs"].items():
