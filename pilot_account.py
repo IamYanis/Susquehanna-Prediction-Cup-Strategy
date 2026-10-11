@@ -279,6 +279,20 @@ def read_order_activity(session, order_id, recent_fills, account, started):
                 abs(abs(quantity) - Decimal(str(account_reader.require_number(order["quantityFilled"], True))))
                 <= Decimal(".000000001") and abs(quantity) <= Decimal(str(order["quantity"])) + Decimal(".000000001"),
                 RECONCILIATION_UNAVAILABLE, "Closed order disagrees with filled quantity")
+    activity = {"order": order, "fills": fills, "fill_notional": str(notional)}
+    check_order_activity(activity, recent_fills, account)
+    return activity
+
+
+def check_order_activity(activity, recent_fills, account):
+    """Cross-check separately verified order/fills against fresh account data.
+
+    This performs no GETs. The caller must first verify the order's full
+    lifecycle/scope, then obtain a fresh bracketed account/history snapshot.
+    """
+    order, fills = activity["order"], activity["fills"]
+    order_id, exchange_id = order["id"], scanner.numeric_id(order["exchangeId"])
+    require(order["tournamentId"] == account["tournament"]["id"], INCONSISTENT, "Order/account tournament differs")
     active = next((r for r in account["orders"] if r["id"] == order_id), None)
     require(order["open"] == (active is not None) and (active is None or
             all(order[k] == active[k] for k in active)), INCONSISTENT, "Open-order inventory changed during the read")
@@ -290,7 +304,6 @@ def read_order_activity(session, order_id, recent_fills, account, started):
                     all(row[k] == other[k] for k in ("side", "quantity", "filledAt")) and
                     abs(Decimal(str(row["price"])) - Decimal(str(other["price"]))) <= Decimal(".000000001"),
                     RECONCILIATION_UNAVAILABLE, "Portfolio and order fills disagree")
-    return {"order": order, "fills": fills, "fill_notional": str(notional)}
 
 
 def read_snapshot(session, slug="midterm-elections", checkpoint=None, initial_account=None, started=None,

@@ -41,9 +41,12 @@ ALASKA_HALT_REASON = "ACCOUNTING_MODEL_MISMATCH or incomplete isolated reconcili
 
 
 def recovery_target(key):
-    """Only these two exact diagnosed attempts have a recovery permission."""
+    """Only the exact diagnosed first-leg attempts have recovery permission."""
     if key == TARGET["attempt"]:
         return TARGET, "FILLED_LEG1_EXPIRY_NORMALIZATION", HALT_REASON
+    from recover_filled_addon_leg1 import TARGET as addon_target, KIND, HALT_REASON as addon_reason
+    if key == addon_target["attempt"]:
+        return addon_target, KIND, addon_reason
     pilot.require(key == ALASKA_TARGET["attempt"], "Not a supported diagnosed filled-leg attempt")
     return ALASKA_TARGET, "FILLED_LEG1_POSITION_COST_ROUNDING", ALASKA_HALT_REASON
 
@@ -51,6 +54,9 @@ def recovery_target(key):
 def eligible_attempt(checkpoint, key):
     """This recovery is deliberately limited to the diagnosed filled attempt."""
     target, kind, reason = recovery_target(key)
+    if kind == "FILLED_ADDON_LEG1_FRESHNESS":
+        from recover_filled_addon_leg1 import eligible_attempt as eligible_addon
+        return eligible_addon(checkpoint, key)
     rounding = kind == "FILLED_LEG1_POSITION_COST_ROUNDING"
     journal = checkpoint.get("autonomous_execution", {})
     pilot.require(journal.get("active_attempt") == key
@@ -259,6 +265,9 @@ def validate_recovered(checkpoint, key):
     """Keep recovery proof and retired key immutable through later completion."""
     attempt = checkpoint["autonomous_execution"]["attempts"][key]
     target, kind, reason = recovery_target(key)
+    if kind == "FILLED_ADDON_LEG1_FRESHNESS":
+        from recover_filled_addon_leg1 import validate_recovered as validate_addon
+        return validate_addon(checkpoint, key)
     record = attempt["filled_leg1_recovery"]
     fields = {"version", "kind", "recovered_at", "prior_checkpoint_hash",
                   "prior_revision", "prior_updated_at", "prior_halt_reason", "original_intent", "original_receipt",
@@ -297,6 +306,9 @@ def validate_recovered(checkpoint, key):
 
 def validate_transition(previous, proposed):
     key = previous["autonomous_execution"]["active_attempt"]
+    if recovery_target(key)[1] == "FILLED_ADDON_LEG1_FRESHNESS":
+        from recover_filled_addon_leg1 import validate_transition as validate_addon_transition
+        return validate_addon_transition(previous, proposed)
     attempt = eligible_attempt(previous, key)
     target, kind, _ = recovery_target(key)
     record = proposed["autonomous_execution"]["attempts"][key]["filled_leg1_recovery"]
@@ -333,6 +345,9 @@ def require_resume(checkpoint, key):
 
 
 def recover(session, key, apply=False):
+    if recovery_target(key)[1] == "FILLED_ADDON_LEG1_FRESHNESS":
+        from recover_filled_addon_leg1 import recover as recover_addon
+        return recover_addon(session, key, apply=apply)
     with readonly_pilot_lock() as path:
         checkpoint = pilot._read_checkpoint_locked(path)
         attempt = eligible_attempt(checkpoint, key)

@@ -632,7 +632,9 @@ def reconcile_leg(reads, state, index):
     wait_for_account_cache()
     cp = state["checkpoint"]
     leg = active_attempt(cp)["legs"][index]
-    leg["intent"]["state"], leg["intent"]["observation"] = single.observe_test(reads, copy.deepcopy(leg["intent"]))
+    activity = {}
+    leg["intent"]["state"], leg["intent"]["observation"] = single.observe_test(
+        reads, copy.deepcopy(leg["intent"]), activity=activity)
     # GET callbacks replace the checkpoint object. Apply the observation to the
     # newest object rather than overwriting it with an older captured reference.
     observation = copy.deepcopy(leg["intent"])
@@ -643,12 +645,15 @@ def reconcile_leg(reads, state, index):
     require(leg["intent"]["state"] == "OBSERVED_TERMINAL" and leg["intent"]["observation"]["filled_quantity"] == 1
             and leg["receipt"]["open"] is False and leg["receipt"]["remainingQuantity"] == 0
             and leg["receipt"]["quantityTraded"] == 1, "Partial, resting, rejected or unknown leg requires manual review")
-    after = pilot_account.read_snapshot(reads, attempt["authorization"]["tournament_slug"], cp,
-                                        order_ids=[leg["intent"]["order_id"]])
+    # Terminal order/fills were verified above, before this fresh account clock.
+    # Still cross-check them with the fresh portfolio history and open orders;
+    # never spend the account freshness budget fetching the same receipt twice.
+    after = pilot_account.read_snapshot(reads, attempt["authorization"]["tournament_slug"], cp, order_ids=[])
+    pilot_account.check_order_activity(activity, after["recent_fills"], after["account"])
+    after["order_activity"] = [copy.deepcopy(activity)]
     attempt = active_attempt(state["checkpoint"])
     attempt["after"][index] = copy.deepcopy(after)
     leg = attempt["legs"][index]
-    activity = next((item for item in after["order_activity"] if item["order"]["id"] == leg["intent"]["order_id"]), None)
     before = attempt["before"] if index == 0 else attempt["after"][0]
     leg["activity"] = activity
     existing = None

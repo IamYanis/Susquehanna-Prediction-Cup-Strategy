@@ -2092,3 +2092,55 @@ in `completed_addon_recovery`. Existing debit charges stay unchanged. Only the
 0.040 add-on buffer is released; quarantine stays 0.125. The active attempt is
 cleared and state becomes READY without submitting/cancelling or starting the
 bot. Ordinary saves cannot clear this halt or change the recovery audit.
+
+### Filled Colorado add-on leg-one freshness recovery
+
+Leg reconciliation now retains the terminal order and complete fill pages from
+its existing intent verification. Only then does it start a fresh bracketed
+account/history read with `order_ids=[]`. The retained order/fills are still
+cross-checked against fresh portfolio fills, cash, holdings, transactions and
+open orders before any continuation. No submission freshness threshold changes;
+a stale/inconsistent fresh read still halts. The account window no longer spends
+time fetching the same terminal order/fills a second time.
+
+Revision 577's diagnosed Colorado add-on has a dedicated GET-only command:
+
+```bash
+.venv/bin/python recover_filled_addon_leg1.py --dry-run \
+  --attempt c163a240772836f934fe35fc42ad2f467d46bfca05949e9cb400aa4c637f8c50
+```
+
+This binds order 30406346, fill 127219604, transaction engine-127219609, market
+256/exchange 945 and the original 0.075 BUY request/key. It requires the saved
+Colorado quantity-three parent, actual 4/3 NO holdings, unchanged other
+positions/costs/lots, no leg-two intent/order or other new financial activity,
+complete history, reconciled cash and current official authorization. The
+original first-leg request, receipt, observation and GET/stage history remain
+preserved; the recovery archives its prior halt/hash/revision and fresh proof.
+
+Only a separately authorized `--apply` writes the recovery. It retains the
+unmatched share and completed quantity-three parent, retires the first key as
+`RETIRED_NEVER_RETRY`, restores LEG2_RECHECK and issues a one-use permission via
+the existing immutable recovery record (`resume_consumed_at=null`). Leg two
+remains without an intent/key/POST. Normal startup cannot resume this execution.
+
+The existing conservative debit policy charges `max(fill notional, displayed
+debit + 0.020)`: for 0.075 notional and 0.070 displayed debit, the charge becomes
+0.090 instead of the preliminary 0.075. This is a 0.015 top-up, not another cash
+debit. The unsubmitted second-leg limit of 0.905 and buffer 0.040 are reserved
+before continuation; quarantine stays 0.125. The completed positions do not
+change during recovery.
+
+After a successful, explicitly requested applied recovery, the separate command
+below can submit only a freshly rechecked leg two:
+
+```bash
+.venv/bin/python autonomous_pilot.py --resume-recovered-leg1 \
+  c163a240772836f934fe35fc42ad2f467d46bfca05949e9cb400aa4c637f8c50
+```
+
+It consumes permission before reads/intent/POST, uses the actual 0.075 leg-one
+fill, repeats settlement/account/risk checks, fetches the current leg-two quote
+and retains the existing add-on completion rule. Only fully reconciled leg two
+merges Colorado 3 -> 4. An interrupted/failed continuation cannot replay the
+permission or first-leg request; recovery itself submits zero orders.

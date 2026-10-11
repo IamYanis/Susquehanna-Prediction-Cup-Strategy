@@ -403,14 +403,19 @@ def read_order(session, intent):
     return verify_order_intent(order, intent)
 
 
-def observe_test(session, intent):
-    """Read specific order and every fill page without changing any journal."""
+def observe_test(session, intent, activity=None):
+    """Read specific order and every fill page without changing any journal.
+
+    An optional output dictionary retains these already-verified terminal
+    records for account reconciliation, avoiding a second order/fill GET.
+    """
     validate_intent(intent)
     order = read_order(session, intent)
     body, order_id = intent["request"], intent["order_id"]
     params = {"limit": 200}
     seen_cursors, seen_fills = set(), set()
     quantity, cost, lifecycle = 0, 0, None
+    observed_fills = []
     sign = 1 if body["side"] == "yes" else -1
     for _ in range(50):
         payload = fetch_json(session, f"{API_BASE_URL}/orders/{order_id}/fills", params=params.copy())
@@ -431,6 +436,7 @@ def observe_test(session, intent):
                     and 0 < sign * fill["quantity"] <= 1 and is_finite_number(fill["price"])
                     and 0 <= fill["price"] <= body["price"], "Invalid or duplicate fill")
             seen_fills.add(fill["id"])
+            observed_fills.append(copy.deepcopy(fill))
             parse_api_timestamp(fill["filledAt"])
             quantity += sign * fill["quantity"]
             cost += sign * fill["quantity"] * fill["price"]
@@ -468,6 +474,10 @@ def observe_test(session, intent):
                 "Closed order and fills disagree; check again")
     observation = {**prior, "filled_quantity": quantity, "filled_cost": cost,
                    "open": order["open"], "terminal_reason": order.get("terminalReasonCode")}
+    if activity is not None:
+        activity.update(order=copy.deepcopy(order), fills=observed_fills,
+                        fill_notional=str(sum((abs(Decimal(str(f["quantity"]))) * Decimal(str(f["price"]))
+                                               for f in observed_fills), Decimal(0))))
     # Preserve an uncertain cancel until GET explicitly reports the order closed.
     state = intent["state"] if order["open"] else "OBSERVED_TERMINAL"
     return state, observation
