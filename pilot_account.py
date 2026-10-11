@@ -386,7 +386,7 @@ def accounting_model(snapshot=None):
             "reason": "No documented receipt-linked all-in cash debit or guaranteed trading-fee bound; do not infer zero fees"}
 
 
-def assess_snapshot(snapshot, checkpoint, exchange_ids, capital, quantity=1):
+def assess_snapshot(snapshot, checkpoint, exchange_ids, capital, quantity=1, managed_position_id=None):
     """Assess structural consistency/risk even when fee verification blocks use."""
     # Import locally to keep the existing pilot state/risk logic as the sole
     # owner of allocation accounting; this module does not write pilot state.
@@ -407,7 +407,7 @@ def assess_snapshot(snapshot, checkpoint, exchange_ids, capital, quantity=1):
         # proof. Do not adopt them as authoritative accounting after restart.
         if set(checkpoint["accounted_pair_costs"]) != set(checkpoint["live_exposures"]):
             failures.append({"code": INCONSISTENT, "reason": "Durable debits lack matching saved live exposure"})
-        risk = pilot.pilot_risk(account, exchange_ids, capital, quantity, checkpoint)
+        risk = pilot.pilot_risk(account, exchange_ids, capital, quantity, checkpoint, managed_position_id=managed_position_id)
     except scanner.API_ERRORS as error:
         reason = str(error) if isinstance(error, pilot.PilotBlocked) else "Account risk/overlap checks failed"
         code = INCONSISTENT if any(word in reason for word in ("disagree", "checkpoint", "cash changed")) else "LIVE_ACCOUNT_RISK_FAILED"
@@ -425,14 +425,14 @@ def require_verified_accounting():
     require(model["verified"] is True, model["status"], model["reason"])
 
 
-def assess_autonomous_snapshot(snapshot, checkpoint, exchange_ids, capital, quantity=1):
+def assess_autonomous_snapshot(snapshot, checkpoint, exchange_ids, capital, quantity=1, managed_position_id=None):
     """Separate assumption-based policy; never change the ordinary verified gate.
 
     Only the named historical model can replace ACCOUNTING_MODEL_UNVERIFIED
     in this assessment. The coordinator must reconcile every leg and cumulative
     balance immediately, and permanently halt on the first discrepancy.
     """
-    result = assess_snapshot(snapshot, checkpoint, exchange_ids, capital, quantity)
+    result = assess_snapshot(snapshot, checkpoint, exchange_ids, capital, quantity, managed_position_id=managed_position_id)
     result["failures"] = [row for row in result["failures"] if row["code"] != ACCOUNTING_UNVERIFIED]
     if result["accounting"]["observed_fee_events"]:
         result["failures"].append({"code": "ACCOUNTING_MODEL_MISMATCH", "reason": "Fee events contradict the pilot assumption"})

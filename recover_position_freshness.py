@@ -7,6 +7,7 @@ import argparse
 import copy
 import json
 import os
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -28,27 +29,33 @@ from senate_readiness_watcher import readonly_pilot_lock
 
 HALT_REASON = "STALE_ACCOUNT_DATA | Account read exceeded the existing 15-second freshness window"
 KIND = "READ_ONLY_POSITION_FRESHNESS"
+AUDIT_KEY = "position_freshness_recoveries"
+SAVE_FLAG = "freshness_recovery"
 TARGET_REVISION = 221
 # Bind the entire diagnosed state, including all three positions and reserves.
 # This command is deliberately not a generic way to clear any account halt.
 TARGET_CHECKPOINT_HASH = "5b3cc00253b6b47395f32a2c3c64f1c1b6bc471ba46eeedaa0d0439dd28f5687"
 
 
-def eligible_checkpoint(checkpoint):
+def eligible_checkpoint(checkpoint, rules=None):
+    # The interruption command reuses these proofs with its own exact revision,
+    # reason and checkpoint hash. Neither command can clear arbitrary halts.
+    rules = rules or sys.modules[__name__]
     pilot.validate_checkpoint(checkpoint)
     journal = checkpoint.get("autonomous_execution", {})
-    pilot.require(checkpoint["revision"] == TARGET_REVISION
-                  and pilot.snapshot_hash(checkpoint) == TARGET_CHECKPOINT_HASH
+    pilot.require(checkpoint["revision"] == rules.TARGET_REVISION
+                  and pilot.snapshot_hash(checkpoint) == rules.TARGET_CHECKPOINT_HASH
                   and checkpoint["state"] == pilot.HALTED and checkpoint["manual_review_required"]
-                  and checkpoint["review_reason"] == HALT_REASON
+                  and checkpoint["review_reason"] == rules.HALT_REASON
                   and journal.get("active_attempt") is None
                   and all(a["state"] in {pilot.READY, pilot.REJECTED_RETIRED} for a in journal["attempts"].values())
                   and pilot.amount(checkpoint["reserved_unconfirmed_capital"]) == 0,
-                  "Not the exact no-execution revision-221 position freshness halt")
+                  f"Not the exact no-execution revision-{rules.TARGET_REVISION} {rules.KIND} halt")
     positions = checkpoint.get("autonomous_positions", {})
     pilot.require(positions and all(p["status"] == "OPEN" and p["remaining_quantities"] == ["1", "1"]
                   and not any(p["settled_legs"]) and p["exit_execution"] is None for p in positions.values()),
-                  "Unfinished/changed managed position prevents freshness recovery")
+                  "Unfinished/changed managed position prevents read-only halt recovery")
+    pilot.require(not auto.exit_keys(checkpoint), "Saved sale key prevents read-only halt recovery")
     baselines = [p["last_snapshot"] for p in positions.values()]
     pilot.require(all(b == baselines[0] for b in baselines), "Managed account baselines disagree")
     return baselines[0]
@@ -106,26 +113,28 @@ def prove_orders(checkpoint, attempt_ids, activities, orders, snapshot):
                       "Portfolio fill history lacks a saved fill")
 
 
-def proposed_checkpoint(checkpoint, record):
+def proposed_checkpoint(checkpoint, record, rules=None):
+    rules = rules or sys.modules[__name__]
     proposed = copy.deepcopy(checkpoint)
-    proposed.setdefault("position_freshness_recoveries", []).append(copy.deepcopy(record))
+    proposed.setdefault(rules.AUDIT_KEY, []).append(copy.deepcopy(record))
     proposed.update(state=pilot.READY, manual_review_required=False, review_reason="")
     return proposed
 
 
-def validate_history(checkpoint):
+def validate_history(checkpoint, rules=None):
     """Archived GET evidence remains valid after later position/account changes."""
-    records = checkpoint["position_freshness_recoveries"]
-    pilot.require(isinstance(records, list) and len(records) == 1, "Invalid freshness recovery history")
+    rules = rules or sys.modules[__name__]
+    records = checkpoint[rules.AUDIT_KEY]
+    pilot.require(isinstance(records, list) and len(records) == 1, "Invalid read-only halt recovery history")
     fields = {"version", "kind", "recovered_at", "prior_checkpoint_hash", "prior_revision", "prior_updated_at",
               "prior_halt_reason", "attempt_ids", "approvals", "evidence", "baseline_snapshot", "snapshot",
               "activities", "orders", "reads"}
     for record in records:
-        pilot.require(set(record) == fields and record["version"] == 1 and record["kind"] == KIND
-                      and record["prior_checkpoint_hash"] == TARGET_CHECKPOINT_HASH
-                      and record["prior_revision"] == TARGET_REVISION and record["prior_halt_reason"] == HALT_REASON
+        pilot.require(set(record) == fields and record["version"] == 1 and record["kind"] == rules.KIND
+                      and record["prior_checkpoint_hash"] == rules.TARGET_CHECKPOINT_HASH
+                      and record["prior_revision"] == rules.TARGET_REVISION and record["prior_halt_reason"] == rules.HALT_REASON
                       and auto.single.parse_api_timestamp(record["recovered_at"]) >=
-                      auto.single.parse_api_timestamp(record["prior_updated_at"]), "Invalid archived freshness halt")
+                      auto.single.parse_api_timestamp(record["prior_updated_at"]), "Invalid archived read-only halt")
         pilot.require(record["attempt_ids"] and len(set(record["attempt_ids"])) == len(record["attempt_ids"])
                       and len(record["attempt_ids"]) == len(record["approvals"]) == len(record["evidence"]),
                       "Missing pair-specific settlement evidence")
@@ -139,21 +148,23 @@ def validate_history(checkpoint):
                       for r in record["reads"]), "Missing/invalid recovery GET evidence")
 
 
-def validate_transition(previous, proposed):
-    baseline = eligible_checkpoint(previous)
-    record = proposed["position_freshness_recoveries"][-1]
+def validate_transition(previous, proposed, rules=None):
+    rules = rules or sys.modules[__name__]
+    baseline = rules.eligible_checkpoint(previous)
+    record = proposed[rules.AUDIT_KEY][-1]
     pilot.require(record["baseline_snapshot"] == baseline and record["prior_updated_at"] == previous["updated_at"]
                   and record["attempt_ids"] == list(previous["autonomous_positions"])
-                  and proposed == proposed_checkpoint(previous, record),
-                  "Recovery may only archive and clear this exact freshness halt")
-    validate_history(proposed)
+                  and proposed == rules.proposed_checkpoint(previous, record),
+                  "Recovery may only archive and clear this exact read-only halt")
+    rules.validate_history(proposed)
     pilot_account.check_fresh(record["snapshot"]["freshness"]["started_monotonic"])
 
 
-def recover(session, apply=False):
+def recover(session, apply=False, rules=None):
+    rules = rules or sys.modules[__name__]
     with readonly_pilot_lock() as path:
         checkpoint = pilot._read_checkpoint_locked(path)
-        baseline = eligible_checkpoint(checkpoint)
+        baseline = rules.eligible_checkpoint(checkpoint)
         pilot.require_external_execution_clear()
         pilot.require_initial_evidence_clear(path)
         reads = probe.EvidenceReads(session)  # No disk evidence sink during dry-run.
@@ -188,14 +199,14 @@ def recover(session, apply=False):
         auto.check_cash_model(checked, snapshot)
         pilot.require(pilot.amount(snapshot["account"]["quarantine_reserve"]) == pilot.amount(checkpoint["quarantine_reserve"]),
                       "Quarantine reserve changed")
-        record = {"version": 1, "kind": KIND, "recovered_at": datetime.now(timezone.utc).isoformat(),
+        record = {"version": 1, "kind": rules.KIND, "recovered_at": datetime.now(timezone.utc).isoformat(),
                   "prior_checkpoint_hash": pilot.snapshot_hash(checkpoint), "prior_revision": checkpoint["revision"],
                   "prior_updated_at": checkpoint["updated_at"], "prior_halt_reason": checkpoint["review_reason"],
                   "attempt_ids": attempt_ids, "approvals": approvals, "evidence": evidence,
                   "baseline_snapshot": baseline, "snapshot": snapshot, "activities": activities,
                   "orders": orders, "reads": reads.reads}
-        proposed = proposed_checkpoint(checkpoint, record)
-        validate_transition(checkpoint, proposed)
+        proposed = rules.proposed_checkpoint(checkpoint, record)
+        rules.validate_transition(checkpoint, proposed)
         pilot.validate_checkpoint(proposed)
         for approval in approvals:
             live.revalidate_authorization(approval)
@@ -206,7 +217,7 @@ def recover(session, apply=False):
             pilot.require(path not in pilot._state_lock_owners, "Another operation owns pilot state")
             pilot._state_lock_owners[path] = (os.getpid(), threading.get_ident())
             try:
-                proposed = pilot._save_checkpoint_locked(proposed, path, freshness_recovery=True)
+                proposed = pilot._save_checkpoint_locked(proposed, path, **{rules.SAVE_FLAG: True})
             finally:
                 pilot._state_lock_owners.pop(path, None)
         fields = ("state", "revision", "manual_review_required", "review_reason", "confirmed_cumulative_debits",
@@ -220,8 +231,9 @@ def recover(session, apply=False):
                 "get_requests": len(reads.reads), "orders_submitted": 0, "state_written": apply}
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
+def main(argv=None, rules=None):
+    rules = rules or sys.modules[__name__]
+    parser = argparse.ArgumentParser(description=rules.__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="GET-only preview (default)")
     mode.add_argument("--apply", action="store_true", help="Explicit atomic local recovery; does not start trading")
@@ -234,7 +246,7 @@ def main(argv=None):
     try:
         with requests.Session() as session:
             session.headers.update({"Authorization": "Bearer " + key})
-            print(json.dumps(recover(session, apply=args.apply), indent=2))
+            print(json.dumps(rules.recover(session, apply=args.apply), indent=2))
         return 0
     except (OSError, *scanner.API_ERRORS) as error:
         reason = str(error) if isinstance(error, (pilot.PilotBlocked, live.LiveSettlementBlocked,

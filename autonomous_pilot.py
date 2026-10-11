@@ -1,4 +1,4 @@
-"""Autonomous v0.1: scan -> buy -> hold -> sell/settle -> record P&L -> repeat.
+"""Autonomous v0.2: one-unit entries/add-ons -> hold -> sell/settle -> P&L.
 
 The exact intents, keys, receipts and observations share the pilot allocation's
 atomic write and exclusive lock. A crash never resumes a submission. Only fake
@@ -7,6 +7,7 @@ HTTP is used by the tests. The single autonomous enable switch is off by default
 import copy
 import argparse
 import hashlib
+import json
 import os
 import re
 import sys
@@ -30,6 +31,8 @@ import supervised_accounting_probe as probe
 from order_preview import PreviewBlocked, ceil_buy_limit, executable_buy_limit, executable_limits, require_preview
 
 MIN_EDGE = Decimal("0.005")
+MIN_ADDON_EDGE = config.MIN_ADDON_EDGE
+MIN_ADDON_COMPLETION_EDGE = config.MIN_ADDON_COMPLETION_EDGE
 MAX_DETERIORATION = Decimal(".005")
 # Entry needs positive edge. After an actual first fill, v0.1 permits
 # break-even completion, retaining the same one-tick deterioration limits.
@@ -103,24 +106,93 @@ def observed_autonomous_limits(books, account_started):
     return result
 
 
+def position_execution_ids(key, position):
+    """Legacy one-pair records need no migration; their entry key is the lot."""
+    return position.get("execution_ids", [key])
+
+
+def execution_position_id(checkpoint, key):
+    """Only a saved exact add-on binding may share a position's exchanges."""
+    attempt = checkpoint.get("autonomous_execution", {}).get("attempts", {}).get(key, {})
+    return attempt.get("addon", {}).get("position_id", key)
+
+
+def position_leg_costs(checkpoint, key):
+    position = checkpoint["autonomous_positions"][key]
+    return [sum((pilot.amount(checkpoint["live_exposures"][eid]["confirmed_costs"][i])
+                 for eid in position_execution_ids(key, position)), Decimal(0)) for i in range(2)]
+
+
+def average_pair_cost(checkpoint, key):
+    return sum(position_leg_costs(checkpoint, key)) / checkpoint["autonomous_positions"][key]["quantity"]
+
+
+def open_position_id(checkpoint, approval):
+    matches = [key for key, p in checkpoint.get("autonomous_positions", {}).items()
+               if p["status"] != "CLOSED" and p["market_ids"] == approval["market_ids"]
+               and p["exchange_ids"] == approval["exchange_ids"]]
+    require(len(matches) <= 1, "Overlapping managed positions require review")
+    return matches[0] if matches else None
+
+
+def book_fingerprint(approval, books):
+    """Consume an authoritative version/depth snapshot, not a UI valuation.
+
+    Receipt times and an asOf clock refresh alone cannot manufacture a new
+    opportunity. A changed sequence or executable bid/depth is a new snapshot.
+    """
+    values = {"tournament": approval["tournament_id"], "markets": approval["market_ids"],
+              "exchanges": approval["exchange_ids"], "books": [
+                  {"sequence": b["version"]["sequence"], "bid": str(b["bid"]),
+                   "depth": str(b["bid_quantity"])} for b in books]}
+    return hashlib.sha256(json.dumps(values, sort_keys=True).encode()).hexdigest()
+
+
+def require_addon(checkpoint, key, prices, edge, fingerprint):
+    """One NEW marginal unit must improve/maintain average entry economics."""
+    p = checkpoint["autonomous_positions"][key]
+    require(p["status"] == "OPEN" and not any(p["settled_legs"]) and p["exit_execution"] is None
+            and all(Decimal(q) == p["quantity"] for q in p["remaining_quantities"]),
+            "Add-on needs an intact, unsettled matched position")
+    require(p["quantity"] < config.MAX_MATCHED_PAIRS_PER_RACE, "Matched-pair race quantity cap reached")
+    cost = sum(Decimal(str(x)) for x in prices)
+    require_preview(Decimal(edge) >= MIN_ADDON_EDGE, "Marginal add-on edge is below 1.0%")
+    require_preview(cost <= average_pair_cost(checkpoint, key), "Marginal cost is worse than existing average pair cost")
+    used = [a["quote"]["fingerprint"] for eid, a in checkpoint["autonomous_execution"]["attempts"].items()
+            if execution_position_id(checkpoint, eid) == key and "quote" in a]
+    require_preview(fingerprint not in used, "This executable quote snapshot has already been consumed")
+
+
 def fresh_candidate(session, ids, checkpoint):
     """GET-only detection/preflight; never make an intent or infer permission."""
     pilot.require_execution_clear(checkpoint)
     approval = autonomous_authorization(ids, checkpoint["tournament_id"])
     markets, allowed, context = pilot.read_live_pair(session, approval)
     require("NO-PAIR" in allowed, "Settlement does not verify the NO pair")
+    parent = open_position_id(checkpoint, approval)
+    if parent is not None:
+        require(approval == checkpoint["autonomous_execution"]["attempts"][parent]["authorization"],
+                "Add-on authorization differs from the existing exact pair approval")
     snapshot = pilot_account.read_snapshot(session, approval["tournament_slug"], checkpoint, order_ids=[])
     books = [scanner.get_best_prices(session, market, approval["tournament_id"]) for market in markets]
     prices, quantity, cost, edge = observed_autonomous_limits(books, snapshot["freshness"]["started_monotonic"])
+    fingerprint = book_fingerprint(approval, books)
+    if parent is not None:
+        require_addon(checkpoint, parent, prices, edge, fingerprint)
     second_cap = min(Decimal(".995"), Decimal(str(prices[1])) + MAX_DETERIORATION)
     reserve = Decimal(str(prices[0])) + second_cap + ACCOUNTING_BUFFER
-    assessment = pilot_account.assess_autonomous_snapshot(snapshot, checkpoint, approval["exchange_ids"], reserve, quantity)
+    assessment = pilot_account.assess_autonomous_snapshot(snapshot, checkpoint, approval["exchange_ids"], reserve,
+                                                         quantity, managed_position_id=parent)
     pilot_account.require_ready(assessment)
     require(not snapshot["account"]["orders"], "Open orders prevent isolated autonomous accounting")
     live.revalidate_authorization(approval)
     return {"authorization": approval, "markets": markets, "settlement": context, "before": snapshot,
             "books": books, "prices": prices, "edge": str(edge), "second_cap": str(second_cap),
             "reserve": str(reserve), "risk": assessment["risk"], "accounting_policy": POLICY,
+            "position_id": parent, "execution_type": "ADDON" if parent is not None else "INITIAL",
+            "quote": {"fingerprint": fingerprint, "books": copy.deepcopy(books),
+                      "prices": prices[:], "pair_cost": str(cost), "edge": str(edge),
+                      "available_depth": [str(b["bid_quantity"]) for b in books]},
             "authorization_tier": live.authorization_tier(approval),
             "formally_verified": False, "submission_enabled": False}
 
@@ -142,17 +214,61 @@ def validate_journal(checkpoint):
     active = journal["active_attempt"]
     require(active is None or active in journal["attempts"], "Missing active autonomous execution")
     keys = set()
+    consumed_quotes = set()
     fields = {"state", "created_at", "authorization", "initial_prices", "initial_edge", "before", "after",
               "legs", "reads", "halt_reason", "halted_from", "completion", "stages"}
     for fingerprint, attempt in journal["attempts"].items():
         require(isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)
-                and isinstance(attempt, dict) and set(attempt) in
+                and isinstance(attempt, dict) and set(attempt) - {"quote", "addon"} in
                 (fields, fields | {"rejection_recovery"}, fields | {"filled_leg1_recovery"},
                  fields | {"filled_leg1_recovery", "final_reconciliation_recovery"},
-                 fields | {"filled_leg1_recovery", "leg2_recheck_recovery"}),
+                 fields | {"filled_leg1_recovery", "leg2_recheck_recovery"},
+                 fields | {"completed_addon_recovery"}),
                 "Invalid autonomous execution record")
         approval = attempt["authorization"]
         live.validate_authorization(approval)
+        if "quote" in attempt:
+            quote = attempt["quote"]
+            require(set(quote) == {"fingerprint", "books", "prices", "pair_cost", "edge", "available_depth"}
+                    and isinstance(quote["books"], list) and len(quote["books"]) == 2
+                    and quote["fingerprint"] == book_fingerprint(approval, quote["books"])
+                    and quote["prices"] == attempt["initial_prices"] and quote["edge"] == attempt["initial_edge"]
+                    and Decimal(quote["pair_cost"]) == sum(Decimal(str(p)) for p in quote["prices"])
+                    and quote["available_depth"] == [str(b["bid_quantity"]) for b in quote["books"]]
+                    and all(Decimal(d) >= 1 for d in quote["available_depth"]), "Saved executable quote evidence changed")
+            for book, price in zip(quote["books"], quote["prices"]):
+                require(ceil_buy_limit(float(Decimal(1) - Decimal(str(book["bid"])))) == price,
+                        "Saved marginal price differs from its executable book")
+            identity = (execution_position_id(checkpoint, fingerprint), quote["fingerprint"])
+            require(identity not in consumed_quotes, "Duplicate consumed add-on quote snapshot")
+            consumed_quotes.add(identity)
+        if "addon" in attempt:
+            addon = attempt["addon"]
+            require(set(addon) == {"position_id", "baseline_quantity", "baseline_leg_costs", "baseline_execution_ids",
+                                  "average_pair_cost"} and "quote" in attempt,
+                    "Incomplete exact add-on position binding")
+            parent = checkpoint.get("autonomous_positions", {}).get(addon["position_id"])
+            prior_ids = addon["baseline_execution_ids"]
+            require(parent is not None and parent["market_ids"] == approval["market_ids"]
+                    and parent["exchange_ids"] == approval["exchange_ids"]
+                    and type(addon["baseline_quantity"]) is int and 1 <= addon["baseline_quantity"] < config.MAX_MATCHED_PAIRS_PER_RACE
+                    and len(prior_ids) == addon["baseline_quantity"] and len(set(prior_ids)) == len(prior_ids)
+                    and position_execution_ids(addon["position_id"], parent)[:len(prior_ids)] == prior_ids
+                    and prior_ids[0] == addon["position_id"] and fingerprint not in prior_ids
+                    and all(checkpoint["autonomous_execution"]["attempts"][eid]["state"] == pilot.READY for eid in prior_ids),
+                    "Add-on parent/history identity changed")
+            costs = [sum((pilot.amount(checkpoint["live_exposures"][eid]["confirmed_costs"][i]) for eid in prior_ids), Decimal(0))
+                     for i in range(2)]
+            require(list(map(pilot.amount, addon["baseline_leg_costs"])) == costs
+                    and Decimal(addon["average_pair_cost"]) == sum(costs) / addon["baseline_quantity"]
+                    and Decimal(attempt["initial_edge"]) >= MIN_ADDON_EDGE
+                    and sum(Decimal(str(p)) for p in attempt["initial_prices"]) <= Decimal(addon["average_pair_cost"]),
+                    "Saved marginal add-on economics changed")
+            require((attempt["state"] == pilot.READY and fingerprint in position_execution_ids(addon["position_id"], parent))
+                    or (attempt["state"] != pilot.READY and parent["status"] == "OPEN"
+                        and parent["quantity"] == addon["baseline_quantity"]
+                        and fingerprint not in position_execution_ids(addon["position_id"], parent)),
+                    "Add-on was forgotten or merged before reconciliation")
         require(approval["execution_mode"] == live.AUTONOMOUS_MODE
                 and approval["verification_route"] in {live.MACHINE, live.MANUAL_AUTONOMOUS},
                 "Saved execution lacks explicit autonomous authorization")
@@ -223,6 +339,9 @@ def validate_journal(checkpoint):
         if "final_reconciliation_recovery" in attempt:
             from recover_completed_pair import validate_completed
             validate_completed(checkpoint, fingerprint)
+        if "completed_addon_recovery" in attempt:
+            from recover_completed_addon import validate_completed
+            validate_completed(checkpoint, fingerprint)
         if attempt["state"] == pilot.READY:
             require(exposure["execution_status"] == "RECONCILED_PAIR" and pilot.amount(exposure["accounting_buffer"]) == 0
                     and all(leg["post_attempted"] and leg["intent"]["state"] == "OBSERVED_TERMINAL"
@@ -255,6 +374,7 @@ def validate_update(previous, proposed, rejected_recovery=False, filled_recovery
         current = new["attempts"].get(fingerprint)
         require(current is not None and all(current[k] == attempt[k] for k in
                 ("created_at", "authorization", "initial_prices", "initial_edge", "before")), "Execution binding/history changed")
+        require(all(current.get(k) == attempt.get(k) for k in ("quote", "addon")), "Marginal quote/position binding changed")
         require(attempt["state"] not in {pilot.READY, pilot.REJECTED_RETIRED} or current == attempt,
                 "Completed/retired execution evidence changed")
         require(attempt["state"] != pilot.HALTED or current["state"] == pilot.HALTED
@@ -266,6 +386,10 @@ def validate_update(previous, proposed, rejected_recovery=False, filled_recovery
         require((old_final is not None and new_final == old_final)
                 or (old_final is None and (new_final is None or completed_recovery)),
                 "Final reconciliation audit requires its dedicated recovery and cannot change")
+        old_addon, new_addon = attempt.get("completed_addon_recovery"), current.get("completed_addon_recovery")
+        require((old_addon is not None and new_addon == old_addon)
+                or (old_addon is None and (new_addon is None or completed_recovery)),
+                "Completed add-on audit requires its dedicated recovery and cannot change")
         old_recovery, new_recovery = attempt.get("filled_leg1_recovery"), current.get("filled_leg1_recovery")
         if old_recovery is not None:
             require(new_recovery is not None, "Filled-leg recovery audit cannot disappear")
@@ -299,11 +423,27 @@ def validate_update(previous, proposed, rejected_recovery=False, filled_recovery
     for key, old_position in previous.get("autonomous_positions", {}).items():
         position = proposed.get("autonomous_positions", {}).get(key)
         require(position is not None, "Position/P&L history cannot disappear")
-        for field in ("pair", "market_ids", "exchange_ids", "quantity", "entry_timestamp", "actual_entry_prices", "entry_edge"):
+        for field in ("pair", "market_ids", "exchange_ids", "entry_timestamp", "actual_entry_prices", "entry_edge"):
             require(position[field] == old_position[field], "Recorded entry changed")
-        require(position.get("total_entry_cost") == old_position.get("total_entry_cost"), "Recorded entry cost changed")
+        old_ids, ids = position_execution_ids(key, old_position), position_execution_ids(key, position)
+        require(ids[:len(old_ids)] == old_ids, "Original position executions cannot disappear/reorder")
+        added = ids[len(old_ids):]
+        require(len(added) <= 1 and position["quantity"] == old_position["quantity"] + len(added),
+                "Only one reconciled marginal pair may be merged at a time")
+        if added:
+            require(old_position["status"] == position["status"] == "OPEN"
+                    and previous["autonomous_execution"]["active_attempt"] == added[0]
+                    and (old["attempts"][added[0]]["state"] == pilot.FINAL_RECONCILING
+                         or completed_recovery and old["attempts"][added[0]]["halted_from"] == pilot.FINAL_RECONCILING
+                         and "completed_addon_recovery" in new["attempts"][added[0]])
+                    and new["attempts"][added[0]]["state"] == pilot.READY
+                    and new["attempts"][added[0]]["addon"]["position_id"] == key
+                    and proposed["autonomous_execution"]["active_attempt"] is None,
+                    "Position grew without a fully reconciled add-on")
+        else:
+            require(position.get("total_entry_cost") == old_position.get("total_entry_cost"), "Recorded entry cost changed")
         require(old_position["status"] != "CLOSED" or position == old_position, "Closed P&L history changed")
-        require(all(Decimal(q) <= Decimal(old_q) for q, old_q in zip(position["remaining_quantities"], old_position["remaining_quantities"]))
+        require(all(Decimal(q) <= Decimal(old_q) + len(added) for q, old_q in zip(position["remaining_quantities"], old_position["remaining_quantities"]))
                 and Decimal(position["allocation_credit"]) >= Decimal(old_position["allocation_credit"]),
                 "Position quantities/credits regressed")
         old_exit = old_position["exit_execution"]
@@ -388,6 +528,16 @@ def begin(state, candidate, reads):
         "halt_reason": "", "halted_from": None, "completion": None,
         "stages": [{"state": pilot.READY, "at": datetime.now(timezone.utc).isoformat()},
                    {"state": pilot.LEG1_SUBMITTING, "at": datetime.now(timezone.utc).isoformat()}]}
+    if "quote" in candidate:
+        journal["attempts"][fingerprint]["quote"] = copy.deepcopy(candidate["quote"])
+    parent = candidate.get("position_id")
+    if parent is not None:
+        position = cp["autonomous_positions"][parent]
+        journal["attempts"][fingerprint]["addon"] = {
+            "position_id": parent, "baseline_quantity": position["quantity"],
+            "baseline_leg_costs": list(map(str, position_leg_costs(cp, parent))),
+            "baseline_execution_ids": position_execution_ids(parent, position)[:],
+            "average_pair_cost": str(average_pair_cost(cp, parent))}
     cp["state"] = pilot.LEG1_SUBMITTING
     cp["live_exposures"][fingerprint] = {"market_ids": approval["market_ids"], "exchange_ids": approval["exchange_ids"],
         "position_type": "NO-PAIR", "confirmed_quantities": ["0", "0"], "confirmed_costs": ["0", "0"],
@@ -501,8 +651,16 @@ def reconcile_leg(reads, state, index):
     activity = next((item for item in after["order_activity"] if item["order"]["id"] == leg["intent"]["order_id"]), None)
     before = attempt["before"] if index == 0 else attempt["after"][0]
     leg["activity"] = activity
-    leg["review"] = probe.review_observation(before, after, leg["receipt"], activity,
-                                            leg["intent"]["market_id"], leg["intent"]["request"]["exchangeId"])
+    existing = None
+    if "addon" in attempt:
+        existing = {"quantity": str(attempt["addon"]["baseline_quantity"]),
+                    "cost": attempt["addon"]["baseline_leg_costs"][index]}
+    review_args = (before, after, leg["receipt"], activity,
+                   leg["intent"]["market_id"], leg["intent"]["request"]["exchangeId"])
+    # Initial entries and their existing recovery hooks keep the original call
+    # signature. Only an exact add-on supplies a prior-holding baseline.
+    leg["review"] = (probe.review_observation(*review_args, existing_no=existing) if existing is not None
+                     else probe.review_observation(*review_args))
     # Reuse the execution/inventory/ledger checks, but not the diagnostic
     # probe's demand to PROVE an upper debit <=1 from rounded balances. A .990
     # first fill is a valid autonomous entry; its rounding buffer and the live
@@ -544,16 +702,17 @@ def reconcile_leg(reads, state, index):
 
 
 def completion_limits(attempt, book, account_started):
-    """Complete at non-negative edge, losing at most one tick of initial edge."""
+    """Keep one-tick deterioration; add-ons also retain a 0.5% completion floor."""
     # Leg one is an actual fill, so validate just the remaining authoritative
     # book. Do not substitute a hypothetical price for the filled first leg.
     pilot_account.check_fresh(account_started)
     price = Decimal(str(executable_buy_limit("NO-PAIR", book, minimum_depth=1)))
     actual_first = Decimal(str(attempt["legs"][0]["intent"]["observation"]["filled_cost"]))
     edge = Decimal("1.000") - actual_first - price
-    required = max(MIN_COMPLETION_EDGE, Decimal(attempt["initial_edge"]) - MAX_DETERIORATION)
+    floor = MIN_ADDON_COMPLETION_EDGE if "addon" in attempt else MIN_COMPLETION_EDGE
+    required = max(floor, Decimal(attempt["initial_edge"]) - MAX_DETERIORATION)
     require(price <= Decimal(str(attempt["initial_prices"][1])) + MAX_DETERIORATION
-            and edge >= required, "Leg two quote deteriorated beyond the one-tick / non-negative completion rule")
+            and edge >= required, "Leg two quote deteriorated beyond the one-tick / completion rule")
     return float(price), {"actual_leg1_notional": str(actual_first), "leg2_limit": str(price),
                           "pair_notional": str(actual_first + price), "edge": str(edge), "minimum_edge": str(required),
                           "book": copy.deepcopy(book)}
@@ -591,7 +750,8 @@ def prepare_second_leg(reads, state):
     risk_checkpoint["live_exposures"][fingerprint]["accounting_buffer"] = "0"
     pilot.refresh_totals(risk_checkpoint)
     assessment = pilot_account.assess_autonomous_snapshot(after, risk_checkpoint, [approval["exchange_ids"][1]],
-                                                         Decimal(str(price)) + ACCOUNTING_BUFFER, 1)
+                                                         Decimal(str(price)) + ACCOUNTING_BUFFER, 1,
+                                                         managed_position_id=attempt.get("addon", {}).get("position_id"))
     pilot_account.require_ready(assessment)
     live.revalidate_authorization(approval)
     attempt["completion"] = completion
@@ -602,12 +762,33 @@ def prepare_second_leg(reads, state):
     return book, after["freshness"]["started_monotonic"]
 
 
+def require_unchanged_final_account(previous, fresh):
+    """Only marks may change after both buys; cash, costs, lots/history may not."""
+    require(pilot_account.account_execution_state(previous["account"]) ==
+            pilot_account.account_execution_state(fresh["account"])
+            and account_unchanged_after_leg1(previous, fresh),
+            "Account changed during final reconciliation; manual review required")
+
+
 def finish_second_leg(session, state, reads):
     """Shared continuation, reachable only after a reconciled first leg."""
     book, account_started = prepare_second_leg(reads, state)
     submit_once(session, reads, state, 1, lambda: completion_limits(active_attempt(state["checkpoint"]), book, account_started))
     after = reconcile_leg(reads, state, 1)
     single.observe_test(reads, copy.deepcopy(active_attempt(state["checkpoint"])["legs"][0]["intent"]))
+    try:
+        pilot_account.check_fresh(after["freshness"]["started_monotonic"])
+    except pilot_account.AccountReadinessBlocked as error:
+        if error.code != pilot_account.STALE:
+            raise
+        # Both buys are terminal and individually reconciled. Extra GETs/fsyncs
+        # can age their snapshot: take a new bracketed read, never another POST.
+        # Any financial change still halts; the old leg snapshots stay archived.
+        attempt = active_attempt(state["checkpoint"])
+        fresh = pilot_account.read_snapshot(reads, attempt["authorization"]["tournament_slug"],
+                                            state["checkpoint"], order_ids=[])
+        require_unchanged_final_account(after, fresh)
+        after = fresh
     pilot_account.check_fresh(after["freshness"]["started_monotonic"])
     cp = state["checkpoint"]
     fingerprint = cp["autonomous_execution"]["active_attempt"]
@@ -631,8 +812,15 @@ def _execute_locked(session, ids, checkpoint):
         persist(state)  # Activation/readiness does not create an intent/key.
         begin(state, candidate, reads.reads)
         observed_autonomous_limits(candidate["books"], candidate["before"]["freshness"]["started_monotonic"])
-        submit_once(session, reads, state, 0, lambda: observed_autonomous_limits(
-            candidate["books"], candidate["before"]["freshness"]["started_monotonic"]))
+        def entry_recheck():
+            result = observed_autonomous_limits(candidate["books"], candidate["before"]["freshness"]["started_monotonic"])
+            if candidate.get("position_id") is not None:
+                # The same marginal/average policy applies after intent fsync.
+                require_preview(result[3] >= MIN_ADDON_EDGE and result[2] <=
+                                Decimal(active_attempt(state["checkpoint"])["addon"]["average_pair_cost"]),
+                                "Marginal add-on economics no longer qualify")
+            return result
+        submit_once(session, reads, state, 0, entry_recheck)
         reconcile_leg(reads, state, 0)
         stage(state, pilot.LEG2_RECHECK)
         persist(state)
@@ -671,6 +859,23 @@ def record_position(checkpoint, key, snapshot):
     """Entry receipts remain immutable; this separate record tracks the holding."""
     attempt = checkpoint["autonomous_execution"]["attempts"][key]
     prices = checkpoint["live_exposures"][key]["confirmed_costs"]  # Exactly one share each.
+    if "addon" in attempt:
+        parent = attempt["addon"]["position_id"]
+        p = checkpoint["autonomous_positions"][parent]
+        require(p["status"] == "OPEN" and p["quantity"] == attempt["addon"]["baseline_quantity"],
+                "Add-on parent changed before merging fills")
+        ids = position_execution_ids(parent, p)[:]
+        require(key not in ids, "This add-on has already been merged")
+        p["execution_ids"] = ids + [key]
+        p["quantity"] += 1
+        p["remaining_quantities"] = [str(Decimal(q) + 1) for q in p["remaining_quantities"]]
+        costs = position_leg_costs(checkpoint, parent)
+        p.update(per_leg_quantities=[str(p["quantity"])] * 2, per_leg_costs=list(map(str, costs)),
+                 total_entry_cost=str(sum(costs)), average_entry_prices=[str(c / p["quantity"]) for c in costs],
+                 average_pair_cost=str(sum(costs) / p["quantity"]), settlement_floor=str(p["quantity"]),
+                 embedded_settlement_edge=str(Decimal(p["quantity"]) - sum(costs)), last_snapshot=copy.deepcopy(snapshot))
+        p["notes"].append(f"Add-on {key}: one matched pair, actual prices {prices}; marginal cost {sum(map(Decimal, prices))}.")
+        return  # Original entry prices and every prior receipt/fill stay intact.
     checkpoint.setdefault("autonomous_positions", {})[key] = {
         "pair": attempt["authorization"]["pair_name"],
         "market_ids": attempt["authorization"]["market_ids"], "exchange_ids": attempt["authorization"]["exchange_ids"],
@@ -696,29 +901,46 @@ def validate_positions(checkpoint):
         attempt = checkpoint["autonomous_execution"]["attempts"].get(key)
         require(attempt is not None and attempt["state"] == pilot.READY
                 and p["market_ids"] == attempt["authorization"]["market_ids"]
-                and p["exchange_ids"] == attempt["authorization"]["exchange_ids"] and p["quantity"] == 1,
+                and p["exchange_ids"] == attempt["authorization"]["exchange_ids"]
+                and type(p["quantity"]) is int and 1 <= p["quantity"] <= config.MAX_MATCHED_PAIRS_PER_RACE,
                 "Position differs from its completed entry")
         require(p["status"] in {"OPEN", "EXITING", "CLOSED"}
                 and len(p["remaining_quantities"]) == len(p["leg_proceeds"]) == len(p["settled_legs"]) == 2
-                and all(0 <= pilot.amount(q) <= 1 for q in p["remaining_quantities"])
+                and all(0 <= pilot.amount(q) <= p["quantity"] for q in p["remaining_quantities"])
                 and all(type(v) is bool for v in p["settled_legs"]), "Invalid held quantities/state")
         proceeds = sum(map(pilot.amount, p["leg_proceeds"]))
+        ids = position_execution_ids(key, p)
+        require(len(ids) == p["quantity"] and len(set(ids)) == len(ids) and ids[0] == key,
+                "Matched quantity differs from its immutable execution history")
+        for eid in ids[1:]:
+            a = checkpoint["autonomous_execution"]["attempts"].get(eid)
+            require(a is not None and a["state"] == pilot.READY and a.get("addon", {}).get("position_id") == key
+                    and a["authorization"] == attempt["authorization"], "Aggregate position lost a reconciled add-on")
+        costs = position_leg_costs(checkpoint, key)
+        charge = sum((pilot.amount(checkpoint["accounted_pair_costs"][eid]) for eid in ids), Decimal(0))
         require(pilot.amount(p["exit_proceeds"]) == proceeds and pilot.amount(p["allocation_credit"]) <=
-                min(proceeds, pilot.amount(checkpoint["accounted_pair_costs"][key])), "Invalid recycled principal")
+                min(proceeds, charge), "Invalid recycled principal")
         prices = checkpoint["live_exposures"][key]["confirmed_costs"]
         require(p["actual_entry_prices"] == prices and Decimal(p["entry_edge"]) == Decimal("1.000") - sum(map(Decimal, prices)),
                 "Position entry economics changed")
-        require("total_entry_cost" not in p or Decimal(p["total_entry_cost"]) == sum(map(Decimal, prices)),
+        require("total_entry_cost" not in p or Decimal(p["total_entry_cost"]) == sum(costs),
                 "Position total entry cost differs from actual fills")
+        if p["quantity"] > 1:
+            require(p["per_leg_quantities"] == [str(p["quantity"])] * 2 and list(map(Decimal, p["per_leg_costs"])) == costs
+                    and list(map(Decimal, p["average_entry_prices"])) == [c / p["quantity"] for c in costs]
+                    and Decimal(p["average_pair_cost"]) == sum(costs) / p["quantity"]
+                    and Decimal(p["settlement_floor"]) == p["quantity"]
+                    and Decimal(p["embedded_settlement_edge"]) == p["quantity"] - sum(costs),
+                    "Aggregate quantity/weighted economics differ from saved fills")
         single.parse_api_timestamp(p["entry_timestamp"])
         if p["status"] == "CLOSED":
             require(all(Decimal(q) == 0 for q in p["remaining_quantities"]) and
                     p["exit_reason"] in {"EARLY_EXIT", "SETTLEMENT"} and
-                    Decimal(p["realized_pnl"]) == proceeds - sum(map(Decimal, prices)), "Invalid closed P&L")
+                    Decimal(p["realized_pnl"]) == proceeds - sum(costs), "Invalid closed P&L")
             single.parse_api_timestamp(p["exit_timestamp"])
             require((p["exit_reason"] == "SETTLEMENT" and all(p["settled_legs"])) or
                     (p["exit_reason"] == "EARLY_EXIT" and p["exit_execution"] is not None and
-                     all(Decimal(leg["filled_quantity"]) == 1 for leg in p["exit_execution"]["legs"])),
+                     all(Decimal(leg["filled_quantity"]) == p["quantity"] for leg in p["exit_execution"]["legs"])),
                     "Close lacks settlement or full-sale evidence")
         if p["exit_execution"]:
             for leg in p["exit_execution"]["legs"]:
@@ -726,7 +948,7 @@ def validate_positions(checkpoint):
                 require(not leg["post_attempted"] or body is not None, "Possible sale lacks saved intent")
                 if body:
                     require(body["idempotencyKey"] not in keys and body["action"] == "sell" and body["side"] == "no"
-                            and body["quantity"] == 1 and body["tournamentId"] == checkpoint["tournament_id"]
+                            and body["quantity"] == p["quantity"] and body["tournamentId"] == checkpoint["tournament_id"]
                             and Decimal(".005") <= Decimal(str(body["price"])) <= Decimal(".995")
                             and Decimal(str(body["price"])) % Decimal(".005") == 0, "Invalid/duplicate saved sale key")
                     keys.add(body["idempotencyKey"])
@@ -750,7 +972,7 @@ def scoped_markets(session, approval):
 
 def close_position(p, reason):
     p.update(status="CLOSED", exit_reason=reason, exit_timestamp=datetime.now(timezone.utc).isoformat(),
-             realized_pnl=str(Decimal(p["exit_proceeds"]) - sum(map(Decimal, p["actual_entry_prices"]))))
+             realized_pnl=str(Decimal(p["exit_proceeds"]) - Decimal(p.get("total_entry_cost", sum(map(Decimal, p["actual_entry_prices"]))))))
 
 
 def credit_position(checkpoint, key, index, proceeds, observed_credit):
@@ -760,7 +982,9 @@ def credit_position(checkpoint, key, index, proceeds, observed_credit):
     # Rounded balances can overstate the cash credit by .02. Retain that
     # allowance until enough cash has actually returned. Never recycle profits.
     credit = max(Decimal(0), min(proceeds, observed_credit - pilot_account.BALANCE_DELTA_TOLERANCE))
-    p["allocation_credit"] = str(min(pilot.amount(checkpoint["accounted_pair_costs"][key]),
+    charge = sum((pilot.amount(checkpoint["accounted_pair_costs"][eid])
+                  for eid in position_execution_ids(key, p)), Decimal(0))
+    p["allocation_credit"] = str(min(charge,
                                      Decimal(p["allocation_credit"]) + credit))
     recalculate_budget(checkpoint)
 
@@ -807,16 +1031,24 @@ def process_settlements(session, state, snapshot):
         for i, (mid, eid) in enumerate(zip(p["market_ids"], p["exchange_ids"])):
             events = [r for r in new_settlements if r["exchangeId"] == eid and r["marketId"] == mid]
             if events:
-                require(not p["settled_legs"][i] and len(events) == 1 and markets[i]["status"] == "settled"
+                require(not p["settled_legs"][i] and markets[i]["status"] == "settled"
                         and held_quantity(snapshot["account"], eid) == 0,
                         "Ambiguous settlement/position change; manual review required")
-                event = events[0]
-                require(not (event.get("transactionType") or "").startswith("ALL_"), "Collateral is not a settlement cash payout")
-                payout = probe.money(event["amount"])
-                require(0 <= payout <= 1, "Unexpected one-contract settlement payout")
+                # A platform may emit one aggregate payout or one per lot. For
+                # multiple events require exact quantities covering the held
+                # leg, rather than guessing which credits belong to it.
+                if len(events) > 1:
+                    quantities = [abs(Decimal(str(event["quantity"]))) for event in events]
+                    require(all(q > 0 for q in quantities) and sum(quantities) == Decimal(p["remaining_quantities"][i])
+                            and all(0 <= probe.money(event["amount"]) <= q for event, q in zip(events, quantities)),
+                            "Settlement events do not cover the exact held quantity")
+                require(all(not (event.get("transactionType") or "").startswith("ALL_") for event in events),
+                        "Collateral is not a settlement cash payout")
+                payout = sum((probe.money(event["amount"]) for event in events), Decimal(0))
+                require(0 <= payout <= Decimal(p["remaining_quantities"][i]), "Unexpected quantity-scaled settlement payout")
                 p["remaining_quantities"][i], p["settled_legs"][i] = "0", True
-                p["settlement_event_ids"].append(event["event_id"])
-                p["notes"].append(f"Settlement {event['event_id']} market {mid}: credited {payout} SUSQies.")
+                p["settlement_event_ids"].extend(event["event_id"] for event in events)
+                p["notes"].append(f"Settlement {[event['event_id'] for event in events]} market {mid}: credited {payout} SUSQies.")
                 credit_position(cp, key, i, payout, payout)
             require(held_quantity(snapshot["account"], eid) == Decimal(p["remaining_quantities"][i]),
                     "Actual holding differs from recorded position without a reconciled settlement")
@@ -832,14 +1064,14 @@ def process_settlements(session, state, snapshot):
     return reports
 
 
-def exit_quote(session, approval, started, markets=None):
+def exit_quote(session, approval, started, markets=None, quantity=1):
     """NO executable bid is 1 - YES ask. Round DOWN to an executable sell tick."""
     markets = scoped_markets(session, approval) if markets is None else markets
     require(all(m["status"] == "open" for m in markets), "Held market is closed; await settlement")
     books = [scanner.get_best_prices(session, m, approval["tournament_id"]) for m in markets]
     pilot_account.check_fresh(started)
     # Shared validator checks age, version and the YES ask's executable depth.
-    prices = [Decimal("1.000") - Decimal(str(executable_buy_limit("YES-PAIR", b, minimum_depth=1))) for b in books]
+    prices = [Decimal("1.000") - Decimal(str(executable_buy_limit("YES-PAIR", b, minimum_depth=quantity))) for b in books]
     require(all(Decimal(".005") <= p <= Decimal(".995") for p in prices), "No executable sell limit")
     return prices, books
 
@@ -849,9 +1081,12 @@ def execute_exit_locked(session, state, key, before):
     cp = state["checkpoint"]
     p = cp["autonomous_positions"][key]
     approval = cp["autonomous_execution"]["attempts"][key]["authorization"]
-    initial, _ = exit_quote(session, approval, before["freshness"]["started_monotonic"])
-    if sum(initial) < EARLY_EXIT_PROCEEDS:
-        return {"pair": p["pair"], "action": "HOLD", "exit_value": str(sum(initial))}
+    quantity = p["quantity"]
+    require(p["remaining_quantities"] == [str(quantity)] * 2, "Sale requires the full remaining matched quantity")
+    target = EARLY_EXIT_PROCEEDS * quantity
+    initial, _ = exit_quote(session, approval, before["freshness"]["started_monotonic"], quantity=quantity)
+    if sum(initial) * quantity < target:
+        return {"pair": p["pair"], "action": "HOLD", "exit_value": str(sum(initial) * quantity)}
     p["status"], cp["state"] = "EXITING", pilot.EXECUTING
     p["exit_execution"] = {"before": copy.deepcopy(before), "legs": [
         {"request": None, "post_attempted": False, "response": None, "receipt": None, "after": None,
@@ -865,19 +1100,19 @@ def execute_exit_locked(session, state, key, before):
         quarantine.require_unblocked_markets(approval["market_ids"])
         quarantine.require_unblocked_exchanges(approval["exchange_ids"])
         # SELL beyond an owned NO share can be canonicalized to a new YES BUY.
-        # Never permit that: exactly one owned, unsettled NO share backs each leg.
-        require(not current["account"]["orders"] and held_quantity(current["account"], eid) == 1,
+        # Sell only the fully backed, unsettled matched holding, never net YES.
+        require(not current["account"]["orders"] and held_quantity(current["account"], eid) == quantity,
                 "Sale is not fully backed or an open order overlaps it")
-        prices, _ = exit_quote(session, approval, current["freshness"]["started_monotonic"])
+        prices, _ = exit_quote(session, approval, current["freshness"]["started_monotonic"], quantity=quantity)
         p = state["checkpoint"]["autonomous_positions"][key]
-        completed = Decimal(p["exit_proceeds"]) + prices[i] if i else sum(prices)
-        require(completed >= EARLY_EXIT_PROCEEDS and prices[i] >= initial[i] - MAX_DETERIORATION,
+        completed = Decimal(p["exit_proceeds"]) + prices[i] * quantity if i else sum(prices) * quantity
+        require(completed >= target and prices[i] >= initial[i] - MAX_DETERIORATION,
                 "Exit quote deteriorated; preserve remaining holding for review")
         new_key = "autonomous-exit-" + uuid4().hex
         used = exit_keys(state["checkpoint"]) | {leg["intent"]["request"]["idempotencyKey"]
                 for a in state["checkpoint"]["autonomous_execution"]["attempts"].values() for leg in a["legs"] if leg["intent"]}
         require(new_key not in used, "Duplicate sale idempotency key; no retry")
-        body = {"idempotencyKey": new_key, "exchangeId": eid, "side": "no", "action": "sell", "quantity": 1,
+        body = {"idempotencyKey": new_key, "exchangeId": eid, "side": "no", "action": "sell", "quantity": quantity,
                 "price": float(prices[i]), "tournamentId": approval["tournament_id"],
                 "expirationDate": (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat(timespec="milliseconds")}
         leg = p["exit_execution"]["legs"][i]
@@ -886,16 +1121,16 @@ def execute_exit_locked(session, state, key, before):
         require_submission()
         # Fresh account + price immediately before submission, after fsync.
         fresh = pilot_account.read_snapshot(reads, approval["tournament_slug"], state["checkpoint"], order_ids=[])
-        require(held_quantity(fresh["account"], eid) == 1 and not fresh["account"]["orders"]
+        require(held_quantity(fresh["account"], eid) == quantity and not fresh["account"]["orders"]
                 and probe.inventory(fresh["account"], "") == probe.inventory(current["account"], "")
                 and fresh["account"]["tournament"]["myBalance"] == current["account"]["tournament"]["myBalance"]
                 and fresh["recent_fills"] == current["recent_fills"]
                 and pilot_account.transaction_histories_equal(fresh["recent_transactions"], current["recent_transactions"]),
                 "Account changed before sale")
-        latest, _ = exit_quote(reads, approval, fresh["freshness"]["started_monotonic"])
+        latest, _ = exit_quote(reads, approval, fresh["freshness"]["started_monotonic"], quantity=quantity)
         live.revalidate_authorization(approval)
         require(latest[i] >= Decimal(str(body["price"])) and
-                (Decimal(p["exit_proceeds"]) + latest[i] if i else sum(latest)) >= EARLY_EXIT_PROCEEDS,
+                (Decimal(p["exit_proceeds"]) + latest[i] * quantity if i else sum(latest) * quantity) >= target,
                 "Executable exit disappeared before submission")
         pilot_account.check_fresh(fresh["freshness"]["started_monotonic"])
         response = session.post(scanner.API_BASE_URL + "/orders", json=copy.deepcopy(body),
@@ -918,15 +1153,17 @@ def execute_exit_locked(session, state, key, before):
         leg = state["checkpoint"]["autonomous_positions"][key]["exit_execution"]["legs"][i]
         leg["after"] = copy.deepcopy(after)
         activity = after["order_activity"][0]
-        quantity = sum((abs(Decimal(str(f["quantity"]))) for f in activity["fills"]), Decimal(0))
+        filled = sum((abs(Decimal(str(f["quantity"]))) for f in activity["fills"]), Decimal(0))
         proceeds = Decimal(activity["fill_notional"])
-        leg["filled_quantity"], leg["proceeds"] = str(quantity), str(proceeds)
-        state["checkpoint"]["autonomous_positions"][key]["remaining_quantities"][i] = str(1 - quantity)
+        leg["filled_quantity"], leg["proceeds"] = str(filled), str(proceeds)
+        state["checkpoint"]["autonomous_positions"][key]["remaining_quantities"][i] = str(quantity - filled)
         pilot.refresh_totals(state["checkpoint"])
         persist(state)  # Preserve a known partial sale before stopping.
-        require(quantity == 1 and receipt["quantityTraded"] == 1 and receipt["open"] is False and
+        require(filled == quantity and receipt["quantityTraded"] == quantity and receipt["open"] is False and
                 receipt["remainingQuantity"] == 0 and activity["order"]["open"] is False and
-                activity["order"]["action"] == "sell" and activity["order"]["side"] == "no" and
+                activity["order"]["action"] == "sell" and activity["order"]["side"] == "no"
+                and activity["order"]["quantity"] == activity["order"]["quantityFilled"] == quantity
+                and receipt["quantity"] == quantity and
                 activity["order"]["exchangeId"] == eid and activity["order"]["priceLimit"] == body["price"] and
                 single.same_order_expiry(activity["order"]["expirationDate"], body["expirationDate"]) and
                 all(Decimal(str(f["price"])) >= Decimal(str(body["price"])) for f in activity["fills"])
@@ -939,8 +1176,8 @@ def execute_exit_locked(session, state, key, before):
                 held_quantity(after["account"], eid) == 0 and not after["account"]["orders"]
                 and probe.inventory(current["account"], eid) == probe.inventory(after["account"], eid)
                 and len(events) == 1 and events[0]["event_type"] == "trade" and events[0]["exchangeId"] == eid
-                and events[0]["orderType"] == "SELL" and abs(Decimal(str(events[0]["quantity"]))) == 1
-                and abs(probe.money(events[0]["price"]) - proceeds) <= Decimal(".000000001"),
+                and events[0]["orderType"] == "SELL" and abs(Decimal(str(events[0]["quantity"]))) == quantity
+                and abs(probe.money(events[0]["price"]) * quantity - proceeds) <= Decimal(".000000001"),
                 "Sale cash/position/ledger reconciliation is ambiguous")
         credit_position(state["checkpoint"], key, i, proceeds, delta)
         check_cash_model(state["checkpoint"], after)
@@ -954,6 +1191,32 @@ def execute_exit_locked(session, state, key, before):
     recalculate_budget(state["checkpoint"])
     persist(state)
     return {"pair": p["pair"], "action": "EARLY_EXIT", "realized_pnl": p["realized_pnl"]}
+
+
+def position_interruption(state, error):
+    """Describe interruption risk using both memory and the last durable write.
+
+    EXITING is saved before any sale key/POST. A clean Ctrl+C is safe only
+    before that boundary; even an interrupted intent write requires review.
+    Only the exception class is recorded, never its potentially sensitive text.
+    """
+    saved = pilot._read_checkpoint_locked(pilot.ALLOCATION_PATH.resolve())
+    checkpoints = (saved, state["checkpoint"])
+    pending = [p for cp in checkpoints for p in cp.get("autonomous_positions", {}).values()
+               if p["status"] != "CLOSED" and p["exit_execution"] is not None]
+    legs = [leg for p in pending for leg in p["exit_execution"]["legs"]]
+    active = any(cp.get("autonomous_execution", {}).get("active_attempt") is not None for cp in checkpoints)
+    sensitive = active or bool(pending) or any(cp["state"] in pilot.EXECUTION_STATES for cp in checkpoints)
+    receipt_pending = any(leg["receipt"] is not None and
+                          (leg["after"] is None or Decimal(leg["filled_quantity"]) != p["quantity"])
+                          for p in pending for leg in p["exit_execution"]["legs"])
+    reason = ("Position execution interrupted; never resume a sale automatically"
+              f" | stage={state['checkpoint']['state']} | saved_stage={saved['state']}"
+              f" | sale_intent={bool(pending)} | active_attempt={active}"
+              f" | post_attempted={any(leg['post_attempted'] for leg in legs)}"
+              f" | receipt_pending={receipt_pending}"
+              f" | exception={type(error).__name__}")
+    return sensitive, reason
 
 
 def manage_positions_locked(session, checkpoint):
@@ -978,14 +1241,15 @@ def manage_positions_locked(session, checkpoint):
                 reports.append({"pair": p["pair"], "action": "HOLD", "reason": "Closed; awaiting settlement ledger"})
                 continue
             try:
-                prices, _ = exit_quote(session, approval, snapshot["freshness"]["started_monotonic"], markets)
+                prices, _ = exit_quote(session, approval, snapshot["freshness"]["started_monotonic"], markets,
+                                       quantity=p["quantity"])
             except (PreviewBlocked, scanner.DataValidationError):
                 reports.append({"pair": p["pair"], "action": "HOLD", "reason": "No fresh executable exit"})
                 continue
             if sum(prices) >= EARLY_EXIT_PROCEEDS:
                 reports.append(execute_exit_locked(session, state, key, snapshot))
                 break  # One sale execution at a time; reread next cycle.
-            reports.append({"pair": p["pair"], "action": "HOLD", "exit_value": str(sum(prices))})
+            reports.append({"pair": p["pair"], "action": "HOLD", "exit_value": str(sum(prices) * p["quantity"])})
         return {"state": state["checkpoint"]["state"], "positions": reports, "checkpoint": state["checkpoint"]}
     except (OSError, *scanner.API_ERRORS) as error:
         # Slow GET-only HOLD checks do not imply uncertain execution. Skip this
@@ -1001,8 +1265,17 @@ def manage_positions_locked(session, checkpoint):
                 for p in cp.get("autonomous_positions", {}).values() if p["status"] == "OPEN"]}
         safe = (pilot.PilotBlocked, pilot_account.AccountReadinessBlocked, live.LiveSettlementBlocked, PreviewBlocked)
         return halt(state, str(error) if isinstance(error, safe) else "Position account/execution unavailable; manual review required")
-    except BaseException:
-        halt(state, "Position execution interrupted; never resume a sale automatically")
+    except (KeyboardInterrupt, SystemExit) as error:
+        sensitive, reason = position_interruption(state, error)
+        if sensitive:
+            halt(state, reason)
+        # During GET-only HOLD evaluation there is nothing to reconcile. Let
+        # the outer command exit without changing positions or review flags.
+        raise
+    except BaseException as error:
+        # Unexpected faults still fail closed, including during a saved sale.
+        _, reason = position_interruption(state, error)
+        halt(state, reason)
         raise
 
 
@@ -1018,12 +1291,12 @@ def execute_candidate(session, ids, mode=config.LIVE_PILOT):
 def best_candidate(session, checkpoint):
     """Scan only exact authorized pairs; edge, then executable depth decide rank."""
     occupied = {eid for key, e in checkpoint["live_exposures"].items()
-                if checkpoint.get("autonomous_positions", {}).get(key, {}).get("status") != "CLOSED"
+                if checkpoint.get("autonomous_positions", {}).get(execution_position_id(checkpoint, key), {}).get("status") != "CLOSED"
                 for eid, q, pending in zip(e["exchange_ids"], e["confirmed_quantities"], e["possible_additional_quantities"])
                 if Decimal(q) or Decimal(pending)}
     candidates = []
     for approval in live.autonomous_authorizations():
-        if occupied.intersection(approval["exchange_ids"]):
+        if occupied.intersection(approval["exchange_ids"]) and open_position_id(checkpoint, approval) is None:
             continue
         try:
             if not all(m["status"] == "open" for m in scoped_markets(session, approval)):

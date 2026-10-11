@@ -114,8 +114,12 @@ def refresh_totals(checkpoint):
     debits = sum((amount(cost) for cost in checkpoint["accounted_pair_costs"].values()), Decimal(0))
     confirmed = reserved = Decimal(0)
     for key, exposure in checkpoint["live_exposures"].items():
-        position = checkpoint.get("autonomous_positions", {}).get(key)
-        basis = sum((amount(cost) * amount(q) for cost, q in zip(exposure["confirmed_costs"],
+        from autonomous_pilot import execution_position_id, position_execution_ids
+        parent = execution_position_id(checkpoint, key)
+        position = checkpoint.get("autonomous_positions", {}).get(parent)
+        if position and key not in position_execution_ids(parent, position):
+            position = None  # An unfinished add-on still has its own reservation.
+        basis = sum((amount(cost) * amount(q) / position["quantity"] for cost, q in zip(exposure["confirmed_costs"],
                     position["remaining_quantities"])), Decimal(0)) if position else sum(map(amount, exposure["confirmed_costs"]))
         confirmed += basis if position else max(basis, amount(exposure.get("capital_charge", 0)))
         reserved += sum((amount(quantity) * amount(price) for quantity, price in
@@ -157,7 +161,7 @@ def validate_checkpoint(checkpoint):
         "live_exposures", "quarantine_reserve", "reserved_unconfirmed_capital", "total_live_exposure",
         "calculated_remaining_allocation", "state", "revision", "created_at", "updated_at"}
     optional = {"baseline_snapshot", "baseline_snapshot_hash", "autonomous_execution", "autonomous_positions",
-                "settlement_halt_recoveries", "position_freshness_recoveries"}
+                "settlement_halt_recoveries", "position_freshness_recoveries", "position_interruption_recoveries"}
     require(isinstance(checkpoint, dict) and fields.issubset(checkpoint)
             and not set(checkpoint) - fields - optional
             and ("baseline_snapshot" in checkpoint) == ("baseline_snapshot_hash" in checkpoint),
@@ -195,7 +199,7 @@ def validate_checkpoint(checkpoint):
             and (bool(checkpoint["review_reason"].strip()) if checkpoint["manual_review_required"]
                  else checkpoint["review_reason"] == ""), "Pilot halt state/reason disagree")
     require(isinstance(checkpoint["live_exposures"], dict), "Invalid saved pilot exposure")
-    seen_exchanges = set()
+    seen_exchanges = {}
     for fingerprint, exposure in checkpoint["live_exposures"].items():
         exposure_fields = {
                     "market_ids", "exchange_ids", "position_type", "confirmed_quantities", "confirmed_costs",
@@ -210,10 +214,13 @@ def validate_checkpoint(checkpoint):
             require(isinstance(ids, list) and len(ids) == 2 and len(set(ids)) == 2
                     and all(isinstance(value, str) and scanner.numeric_id(value) == value for value in ids),
                     "Invalid saved pilot instrument IDs")
-        position = checkpoint.get("autonomous_positions", {}).get(fingerprint)
+        from autonomous_pilot import execution_position_id
+        owner = execution_position_id(checkpoint, fingerprint)
+        position = checkpoint.get("autonomous_positions", {}).get(owner)
         if exposure["execution_status"] != REJECTED_RETIRED and (position is None or position["status"] != "CLOSED"):
-            require(not seen_exchanges.intersection(exposure["exchange_ids"]), "Duplicate saved pilot exchange exposure")
-            seen_exchanges.update(exposure["exchange_ids"])
+            require(all(eid not in seen_exchanges or seen_exchanges[eid] == owner for eid in exposure["exchange_ids"]),
+                    "Duplicate saved pilot exchange exposure")
+            seen_exchanges.update({eid: owner for eid in exposure["exchange_ids"]})
         for key in ("confirmed_quantities", "confirmed_costs", "possible_additional_quantities", "limit_prices"):
             require(isinstance(exposure[key], list) and len(exposure[key]) == 2, "Incomplete saved pilot exposure")
         for quantity, cost, pending, price in zip(exposure["confirmed_quantities"], exposure["confirmed_costs"],
@@ -293,6 +300,9 @@ def validate_checkpoint(checkpoint):
     if "position_freshness_recoveries" in checkpoint:
         from recover_position_freshness import validate_history
         validate_history(checkpoint)
+    if "position_interruption_recoveries" in checkpoint:
+        from recover_position_interruption import validate_history
+        validate_history(checkpoint)
 
 
 def snapshot_hash(snapshot):
@@ -319,7 +329,8 @@ def _read_checkpoint_locked(path):
 
 
 def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False, settlement_recovery=False,
-                            filled_recovery=False, completed_recovery=False, leg2_recovery=False, freshness_recovery=False):
+                            filled_recovery=False, completed_recovery=False, leg2_recovery=False, freshness_recovery=False,
+                            interruption_recovery=False):
     """Validate then fsync/replace/fsync-directory while holding one stable lock."""
     require(_state_lock_owners.get(path) == (os.getpid(), threading.get_ident()),
             "Pilot state mutation requires the exclusive process lock")
@@ -341,7 +352,7 @@ def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False
             from recover_rejected_attempt import validate_transition
             validate_transition(previous, proposed)
         require(sum((bool(rejected_recovery), bool(settlement_recovery), bool(filled_recovery), bool(completed_recovery),
-                     bool(leg2_recovery), bool(freshness_recovery))) <= 1,
+                     bool(leg2_recovery), bool(freshness_recovery), bool(interruption_recovery))) <= 1,
                 "Recovery types cannot be combined")
         if settlement_recovery:
             from recover_settlement_halt import validate_transition
@@ -353,7 +364,11 @@ def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False
             from recover_filled_leg1 import validate_transition
             validate_transition(previous, proposed)
         if completed_recovery:
-            from recover_completed_pair import validate_transition
+            key = previous.get("autonomous_execution", {}).get("active_attempt")
+            if "completed_addon_recovery" in proposed.get("autonomous_execution", {}).get("attempts", {}).get(key, {}):
+                from recover_completed_addon import validate_transition
+            else:
+                from recover_completed_pair import validate_transition
             validate_transition(previous, proposed)
         if leg2_recovery:
             from recover_leg2_recheck import validate_transition
@@ -364,7 +379,14 @@ def _save_checkpoint_locked(checkpoint, path, new=False, rejected_recovery=False
         else:
             require(proposed.get("position_freshness_recoveries") == previous.get("position_freshness_recoveries"),
                     "Position freshness recovery audit cannot change outside explicit recovery")
-        require(rejected_recovery or settlement_recovery or filled_recovery or completed_recovery or leg2_recovery or freshness_recovery
+        if interruption_recovery:
+            from recover_position_interruption import validate_transition
+            validate_transition(previous, proposed)
+        else:
+            require(proposed.get("position_interruption_recoveries") == previous.get("position_interruption_recoveries"),
+                    "Position interruption recovery audit cannot change outside explicit recovery")
+        require(rejected_recovery or settlement_recovery or filled_recovery or completed_recovery or leg2_recovery
+                or freshness_recovery or interruption_recovery
                 or not previous["manual_review_required"] or proposed["state"] == HALTED,
                 "A persistent manual-review halt cannot be cleared automatically")
         for fingerprint, cost in previous["accounted_pair_costs"].items():
@@ -504,7 +526,7 @@ def require_external_execution_clear():
         raise PilotBlocked("Existing paired journal requires manual review before pilot use")
 
 
-def pilot_risk(account, exchange_ids, proposed_capital, quantity, checkpoint):
+def pilot_risk(account, exchange_ids, proposed_capital, quantity, checkpoint, managed_position_id=None):
     """Apply pilot limits in addition to the existing account/overlap checks.
 
     All account holdings/orders count conservatively. The existing reader has
@@ -513,7 +535,27 @@ def pilot_risk(account, exchange_ids, proposed_capital, quantity, checkpoint):
     validate_checkpoint(checkpoint)
     require(not checkpoint["manual_review_required"], "Pilot halted for manual review; no further live trading")
     require(checkpoint["tournament_id"] == account["tournament"]["id"], "Pilot allocation belongs to another account scope")
-    risk = account_risk(account, exchange_ids)
+    risk_account = account
+    if managed_position_id is not None:
+        p = checkpoint.get("autonomous_positions", {}).get(managed_position_id)
+        require(p is not None and p["status"] == "OPEN" and set(exchange_ids).issubset(p["exchange_ids"])
+                and p["quantity"] < config.MAX_MATCHED_PAIRS_PER_RACE and not any(p["settled_legs"])
+                and p["exit_execution"] is None, "Add-on race is not eligible or its quantity cap is reached")
+        # Validate the real report before creating the temporary overlap view.
+        # Its summary must then describe only that view's remaining rows.
+        account_reader.validate_positions({"positions": account["positions"], "summary": account["summary"]})
+        risk_account = copy.deepcopy(account)
+        risk_account["positions"] = [r for r in account["positions"] if scanner.numeric_id(r["exchangeId"]) not in exchange_ids]
+        risk_account["summary"] = {total: sum(r[field] for r in risk_account["positions"])
+            for total, field in (("totalMarketValue", "marketValue"), ("totalCostBasis", "costBasis"),
+                                 ("totalUnrealizedPnl", "unrealizedPnl"))}
+    risk = account_risk(risk_account, exchange_ids)
+    # The overlap exemption above is only for a proven managed NO position.
+    # Restore its full basis to every capital bound; never hide it from risk.
+    removed = sum((amount(r["costBasis"]) for r in account["positions"]
+                   if r not in risk_account["positions"]), Decimal(0))
+    risk["existing_holdings_cost_basis"] = float(amount(risk["existing_holdings_cost_basis"]) + removed)
+    risk["race_exposure_upper_bound"] = float(amount(risk["race_exposure_upper_bound"]) + removed)
     cash = amount(risk["reported_cash"])
     require(cash == amount(checkpoint["last_reconciled_account_cash"]),
             "Account cash changed since reconciliation; manual review required")
@@ -521,35 +563,52 @@ def pilot_risk(account, exchange_ids, proposed_capital, quantity, checkpoint):
     require(cash >= reserve_floor, "Account cash is below the untouchable reserve; manual review required")
     positions = {scanner.numeric_id(row["exchangeId"]): row for row in account["positions"]}
     stored_holdings = Decimal(0)
+    expected = {}
+    from autonomous_pilot import execution_position_id, position_execution_ids
     for key, exposure in checkpoint["live_exposures"].items():
-        position = checkpoint.get("autonomous_positions", {}).get(key)
+        parent = execution_position_id(checkpoint, key)
+        position = checkpoint.get("autonomous_positions", {}).get(parent)
+        if position and key not in position_execution_ids(parent, position):
+            position = None
         if position is None:
             stored_holdings += max(Decimal(0), amount(exposure.get("capital_charge", 0))
                                    - sum(map(amount, exposure["confirmed_costs"])))
-        for market_id, exchange_id, held_quantity, held_cost in zip(exposure["market_ids"], exposure["exchange_ids"],
-                    position["remaining_quantities"] if position else exposure["confirmed_quantities"], exposure["confirmed_costs"]):
-            q, c = amount(held_quantity), amount(held_cost)
-            stored_holdings += q * c if position else c
+        for i, (market_id, exchange_id) in enumerate(zip(exposure["market_ids"], exposure["exchange_ids"])):
+            q, c = amount(exposure["confirmed_quantities"][i]), amount(exposure["confirmed_costs"][i])
+            if position:
+                # Each immutable execution is one lot. Spread remaining average
+                # basis across its lots after a quantity-aware sale/settlement.
+                fraction = amount(position["remaining_quantities"][i]) / position["quantity"]
+                q, c = q * fraction, c * fraction
+            stored_holdings += c
             if q:
-                row = positions.get(exchange_id)
-                expected_basis = c
+                item = expected.setdefault(exchange_id, {"market_id": market_id, "quantity": Decimal(0), "cost": Decimal(0),
+                                                          "basis": None})
+                require(item["market_id"] == market_id, "Managed market/exchange mapping disagrees")
+                item["quantity"] += q
+                item["cost"] += c
                 recovered = checkpoint.get("autonomous_execution", {}).get("attempts", {}).get(key, {}).get("filled_leg1_recovery")
-                if recovered and exchange_id == exposure["exchange_ids"][0]:
+                if recovered and exchange_id == exposure["exchange_ids"][0] and q == 1:
                     # This exact recovery proved the API's rounded .08 basis
                     # against the .075 fill. Keep comparing to that saved API
                     # basis exactly; do not introduce a generic cost tolerance.
                     saved_row = next(r for r in recovered["snapshot"]["account"]["positions"]
                                      if scanner.numeric_id(r["exchangeId"]) == exchange_id)
-                    expected_basis = amount(saved_row["costBasis"])
-                basis_matches = row is not None and abs(amount(row["costBasis"]) - expected_basis) <= Decimal(".00000001")
-                if not recovered and q == 1 and row is not None and not basis_matches:
-                    # A newly reconciled single fill can have a cent-displayed
-                    # basis. Require its exact average cost and half-cent bound.
-                    basis_matches = account_reader.one_no_buy_cost_matches(row, c)
-                require(row is not None and scanner.numeric_id(row["marketId"]) == market_id
-                        and abs(Decimal(str(row["quantity"])) + q) <= Decimal(".000000001")
-                        and basis_matches
-                        and row["settled"] is False, "Actual holdings disagree with persisted pilot exposure; manual review required")
+                    item["basis"] = amount(saved_row["costBasis"])
+    for exchange_id, item in expected.items():
+        row = positions.get(exchange_id)
+        q, c = item["quantity"], item["cost"]
+        basis_matches = row is not None and account_reader.no_holding_cost_matches(row, q, c)
+        if q == 1 and row is not None:
+            # Preserve the legacy exact-basis single-unit risk check. Actual
+            # autonomous fill reconciliation independently checks avgCost.
+            basis_matches = basis_matches or abs(amount(row["costBasis"]) - c) <= Decimal(".00000001")
+        if q == 1 and item["basis"] is not None and row is not None:
+            basis_matches = abs(amount(row["costBasis"]) - item["basis"]) <= Decimal(".00000001")
+        require(row is not None and scanner.numeric_id(row["marketId"]) == item["market_id"]
+                and abs(Decimal(str(row["quantity"])) + q) <= Decimal(".000000001")
+                and basis_matches and row["settled"] is False,
+                "Actual holdings disagree with persisted pilot exposure; manual review required")
     holdings = max(amount(risk["existing_holdings_cost_basis"]), stored_holdings)
     # Include external orders as well as saved possible pilot fills. They can
     # coexist. A known order may be reserved twice conservatively, never omitted.

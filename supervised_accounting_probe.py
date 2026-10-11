@@ -137,7 +137,7 @@ def ordinary_cash_receipt(economics, notional):
         return False
 
 
-def review_observation(before, after, receipt, activity, market_id, exchange_id):
+def review_observation(before, after, receipt, activity, market_id, exchange_id, existing_no=None):
     """Compare ONE completed leg using supplied full snapshots/actual receipt.
 
     Return all supplied evidence, including invalid/partial evidence, for a
@@ -201,8 +201,22 @@ def review_observation(before, after, receipt, activity, market_id, exchange_id)
         require(tid == a["tournament"]["id"] and b["tournament"]["slug"] == a["tournament"]["slug"],
                 "Tournament scope changed")
         require(not b["orders"] and not a["orders"], "Open orders prevent isolated accounting attribution")
-        require(not any(scanner.numeric_id(r["exchangeId"]) == eid and r["quantity"] for r in b["positions"]),
-                "Existing selected holdings allow netting")
+        prior_quantity, prior_cost = Decimal(0), Decimal(0)
+        if existing_no is None:
+            # Supervised probes and initial entries retain the zero-holding gate.
+            require(not any(scanner.numeric_id(r["exchangeId"]) == eid and r["quantity"] for r in b["positions"]),
+                    "Existing selected holdings allow netting")
+        else:
+            # Only the autonomous add-on coordinator supplies this exact known
+            # baseline. Confirm incremental inventory, never allow YES netting.
+            # Durable Decimal amounts are stored as strings; API money() is
+            # deliberately stricter and accepts only numeric response fields.
+            prior_quantity, prior_cost = map(pilot.amount, (existing_no["quantity"], existing_no["cost"]))
+            prior = next((r for r in b["positions"] if scanner.numeric_id(r["exchangeId"]) == eid), None)
+            require(prior is not None and scanner.numeric_id(prior["marketId"]) == mid
+                    and prior["settled"] is False and
+                    account_reader.no_holding_cost_matches(prior, prior_quantity, prior_cost),
+                    "Existing managed NO baseline does not match saved fills")
         require(inventory(b, eid) == inventory(a, eid), "Unrelated inventory changed during probe")
         order, fills = activity["order"], activity["fills"]
         require(type(receipt["orderId"]) is int and receipt["orderId"] > 0 and order["id"] == receipt["orderId"] and
@@ -232,12 +246,14 @@ def review_observation(before, after, receipt, activity, market_id, exchange_id)
                 "Receipt notional and full fills disagree")
         position = next((r for r in a["positions"] if scanner.numeric_id(r["exchangeId"]) == eid), None)
         require(position is not None and scanner.numeric_id(position["marketId"]) == mid and position["settled"] is False
-                and Decimal(str(position["quantity"])) == -quantity, "Position does not match completed NO fill")
+                and Decimal(str(position["quantity"])) == -(prior_quantity + quantity),
+                "Position does not match completed incremental NO fill")
         cost = money(position["costBasis"])
-        require(abs(money(position["avgCost"]) - notional) <= account_reader.POSITION_PRICE_PRECISION,
+        require(abs(money(position["avgCost"]) - (prior_cost + notional) / (prior_quantity + quantity))
+                <= account_reader.POSITION_PRICE_PRECISION,
                 "POSITION_AVERAGE_COST_MISMATCH")
         observations["execution_and_inventory_verified"] = True
-        if not account_reader.one_no_buy_cost_matches(position, notional):
+        if not account_reader.no_holding_cost_matches(position, prior_quantity + quantity, prior_cost + notional):
             result["issues"].append("POSITION_COST_ROUNDING_MISMATCH")
         delta = money(b["tournament"]["myBalance"]) - money(a["tournament"]["myBalance"])
         # The docs specify two decimals, but not the rounding mode. Conservatively

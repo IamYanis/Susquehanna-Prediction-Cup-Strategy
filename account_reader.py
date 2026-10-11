@@ -46,14 +46,23 @@ def one_no_buy_cost_matches(position, fill_notional):
     A different quantity, missing data or a non-cent rounded basis fails.
     Instrument identity, fills, ledger and cash remain the caller's checks.
     """
+    return no_holding_cost_matches(position, Decimal(1), fill_notional)
+
+
+def no_holding_cost_matches(position, quantity, total_cost):
+    """Match known NO inventory and weighted average against immutable fills.
+
+    A multi-unit position still has only one cent-displayed total cost basis.
+    Do not multiply the half-cent display allowance by its quantity.
+    """
     try:
-        if require_number(position["quantity"]) != -1:
+        if quantity <= 0 or Decimal(str(require_number(position["quantity"]))) != -quantity:
             return False
         average = Decimal(str(require_number(position["avgCost"], nonnegative=True)))
         basis = Decimal(str(require_number(position["costBasis"], nonnegative=True)))
-        if abs(average - fill_notional) > POSITION_PRICE_PRECISION:
+        if abs(average - total_cost / quantity) > POSITION_PRICE_PRECISION:
             return False
-        difference = abs(basis - fill_notional)
+        difference = abs(basis - total_cost)
         return difference <= POSITION_PRICE_PRECISION or (
             basis % Decimal("0.01") == 0 and difference <= POSITION_COST_ROUNDING_TOLERANCE)
     except API_ERRORS:

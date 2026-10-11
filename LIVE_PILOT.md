@@ -1,4 +1,4 @@
-# Autonomous v0.1 — enabled, start manually
+# Autonomous v0.2 — one-unit add-ons, start manually
 
 Following the user's approval and a fresh GET-only preflight on 9 October 2026,
 `AUTONOMOUS_LIVE_PILOT_ENABLED` is **True**. All three exact authorized pairs
@@ -6,6 +6,77 @@ passed the existing settlement, account, quote/depth, risk and persistent-state
 checks. The bot was not started and no order was submitted during enablement.
 Starting the command below runs live autonomous trading; every entry still
 repeats all existing checks. The legacy/probe submission switch remains False.
+
+## v0.2 sizing policy
+
+The existing enable switch is unchanged. This implementation does not start the
+bot, submit orders, migrate runtime state, or change settlement approvals.
+The v0.2 rules below supersede the older single-unit position descriptions.
+
+```python
+MAX_LIVE_QUANTITY_PER_LEG = 1       # Each BUY execution, not cumulative holdings.
+MAX_MATCHED_PAIRS_PER_RACE = 5
+MIN_ADDON_EDGE = Decimal("0.010")
+MIN_ADDON_COMPLETION_EDGE = Decimal("0.005")
+```
+
+Initial entry still requires 0.005 edge. Allocation stays 5,000 SUSQies, with
+50 per execution, 100 per race, and 500 total exposure. Unknown orders and the
+market-387 quarantine remain reserved. Account cash above the allocation does
+not enlarge it. All existing settlement, account, freshness and halt gates apply.
+
+An intact OPEN pair may compete with new entries using its **next unit's**
+tick-rounded executable NO asks. It needs depth for one share on both legs,
+marginal cost at most 0.990, and cost no higher than the position's weighted
+average pair cost. UI marks, currentPrice, P&L and midpoint prices never size an
+add-on. The exact managed holding is permitted through the duplicate gate only
+after its quantities and weighted costs match saved fills; its exposure still
+counts in every risk bound. Unexpected holdings/orders remain blocked.
+
+Rank eligible initial entries and add-ons by marginal edge, then executable
+depth. Execute at most one new pair per cycle, with no overlapping orders.
+An add-on uses the existing entry states and two new one-contract intents/keys,
+bound to its parent position and prior quantity/cost/history. Reconcile leg one
+before fetching a fresh leg-two quote. Add-on completion requires:
+
+```text
+completion edge >= max(0.005, initial marginal edge - 0.005)
+leg-two limit <= original leg-two limit + 0.005
+```
+
+The original initial-entry completion rule is unchanged. Any ambiguous POST,
+unexpected partial fill, inconsistent accounting or unacceptable completion
+preserves the existing pair plus any new one-sided exposure and halts. Restart
+never resubmits or automatically completes an unfinished add-on.
+
+Saved quote evidence contains raw GET responses, parsed book versions/times,
+tick-rounded prices, cost, edge, depth and a consumed-snapshot fingerprint.
+The fingerprint binds exact pair IDs and both executable bid/depth/sequence
+values. Merely refreshing a receipt time or asOf clock cannot reuse a consumed
+snapshot; a subsequent authoritative version or executable price/depth change
+can qualify in a later cycle, subject to all gates and the five-pair cap.
+
+Only fully reconciled add-ons merge into the OPEN record. `execution_ids` link
+every immutable intent, receipt and fill. The original entry timestamp,
+`actual_entry_prices` and `entry_edge` remain historical facts. Aggregate fields
+record matched quantity, per-leg quantities/costs, total entry cost, weighted
+average prices/pair cost, settlement floor, embedded edge and remaining holdings.
+Existing quantity-one records load without any migration or rewrite.
+
+For example, 0.975 plus 0.960 produces quantity 2, total cost 1.935, average pair
+cost 0.9675, ordinary settlement floor 2.000 and embedded edge 0.065.
+
+HOLD remains the default. Early exit sells the **full** matched quantity Q only
+when both fresh books have depth Q and combined proceeds reach Q × 1.010.
+Sales remain sequential and fully backed; one profitable leg is never enough.
+Settlement requires official cash-credit events and matching holdings. Multiple
+per-lot events must cover the exact remaining quantity. P&L uses total actual
+entry cost and actual sale/payout proceeds. Exposure is released only as holdings
+are reconciled; profits and extra account cash do not replenish bot principal.
+
+Regression coverage is in `test_autonomous_addons.py` and the existing lifecycle,
+account, risk, state, execution and recovery suites. All execution tests use fake
+HTTP and temporary state.
 
 ## Stable manual autonomous policy evidence — 10 October 2026
 
@@ -1958,3 +2029,66 @@ records, original entry history, allocation charges and quarantine reserve
 remain unchanged. Recovery does not start the bot or submit/cancel any order.
 Ordinary writes cannot append/erase the audit or clear the halt. A changed
 checkpoint or account fails closed. Dry-run writes nothing.
+
+### Read-only position-management interruptions
+
+Ctrl+C / SystemExit during GET-only HOLD/account/quote evaluation exits without
+writing an execution halt. Both the in-memory state and the last durable write
+must have no active attempt or pending sale. EXITING is persisted before a sale
+key can be allocated, so an interruption after this boundary still halts for
+manual review and never retries a SELL. Unexpected faults also remain fail-closed.
+New interruption reasons record current/saved stage, sale-intent presence,
+possible POST, pending receipt and exception class; exception text is omitted.
+
+The separately reviewed revision-290 interruption halt has a dedicated command:
+
+```bash
+.venv/bin/python recover_position_interruption.py --dry-run
+```
+
+It reuses the freshness recovery's GET-only proofs, exclusive lock and atomic
+writer, with a different exact checkpoint/reason/revision binding. It requires
+no active attempt, sale intent/key or open order; all six saved orders/fills,
+three OPEN positions, cash, complete economic history and current settlement
+authorizations must match. Changed allocation/quarantine accounting blocks it.
+
+Only a separately requested `--apply` archives `position_interruption_recoveries`
+and clears this exact halt to READY, preserving positions, entry history, all
+allocation charges and quarantine reserve. It does not start the bot. The old
+revision-221 freshness command cannot clear this halt, and neither recovery is
+a general permission to clear later execution uncertainty.
+
+### Completed add-on finalization freshness
+
+Entry and SELL pre-submit freshness requirements remain 15 seconds. After both
+BUY legs have fully filled and individually reconciled, the last leg-one GET
+verification can age the post-leg-two account snapshot. Finalization now refreshes
+that snapshot once if expired. The fresh bracketed cash, holdings, costs/lots,
+open orders, fills and economic transaction history must match the reconciled
+snapshot; mutable valuation marks alone may change. Any financial difference,
+incomplete read or still-stale replacement halts. This never creates another
+intent or POST and does not retry either order.
+
+The dedicated revision-407 Alaska recovery is GET-only by default:
+
+```bash
+.venv/bin/python recover_completed_addon.py --dry-run \
+  --attempt ec41968a3ed423632f1ade9f33c6a6be05340ab59ff786ffc612db065666b873
+```
+
+It verifies the exact two terminal orders/fills/transactions, unchanged 2/2
+Alaska NO holdings, the still-unmerged quantity-one parent, unchanged other
+positions and financial history, cash, quarantine, persistent state and fresh
+official settlement authorization. Terminal receipts are read before starting
+the final account freshness clock. Added/duplicate/missing activity fails closed.
+
+Only a separately authorized `--apply` repeats the proofs under the exclusive
+lock and performs one atomic audited local write. It uses the normal add-on
+merge helper: Alaska quantity 2, per-leg costs 0.590/1.380, total cost 1.970,
+weighted prices 0.295/0.690 and average pair cost 0.985. Original and add-on
+requests, keys, receipts, fills, transactions, leg reviews and snapshots remain
+unchanged; the previous halt reason/revision/hash and recovery GETs are archived
+in `completed_addon_recovery`. Existing debit charges stay unchanged. Only the
+0.040 add-on buffer is released; quarantine stays 0.125. The active attempt is
+cleared and state becomes READY without submitting/cancelling or starting the
+bot. Ordinary saves cannot clear this halt or change the recovery audit.

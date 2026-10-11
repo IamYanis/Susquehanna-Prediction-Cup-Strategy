@@ -39,9 +39,11 @@ class AutonomousLifecycleTests(unittest.TestCase):
         else:
             p = next(p for p in cp["autonomous_positions"].values() if p["status"] == "EXITING")
             leg = next(l for l in p["exit_execution"]["legs"] if l["request"] == body)
-            self.assertEqual(auto.held_quantity(self.fixture.fixture.current, body["exchangeId"]), 1)
+            self.assertEqual(auto.held_quantity(self.fixture.fixture.current, body["exchangeId"]), body["quantity"])
         self.assertTrue(leg["post_attempted"])
-        self.assertEqual(body["quantity"], 1)
+        self.assertTrue(1 <= body["quantity"] <= config.MAX_MATCHED_PAIRS_PER_RACE)
+        if body["action"] == "buy":
+            self.assertEqual(body["quantity"], 1)
         self.assertEqual(len({b["idempotencyKey"] for b in self.posts}), len(self.posts))
         self.posts.append(copy.deepcopy(body))
         script = self.scripts.get(len(self.posts), {})
@@ -49,7 +51,7 @@ class AutonomousLifecycleTests(unittest.TestCase):
             raise requests.Timeout("Synthetic ambiguous POST")
         oid, fid = 1000 + len(self.posts), 2000 + len(self.posts)
         eid, mid = body["exchangeId"], str(int(body["exchangeId"]) - 10)
-        q = Decimal(str(script.get("quantity", 1)))
+        q = Decimal(str(script.get("quantity", body["quantity"])))
         price = Decimal(str(body["price"]))
         notional = q * price
         stamp = datetime.now(timezone.utc).isoformat()
@@ -60,11 +62,13 @@ class AutonomousLifecycleTests(unittest.TestCase):
         account["tournament"]["myBalance"] = float(cash)
         old = next((r for r in account["positions"] if r["exchangeId"] == eid), None)
         rows = [r for r in account["positions"] if r["exchangeId"] != eid]
-        remaining = auto.held_quantity(account, eid) - q if body["action"] == "sell" else q
+        prior_q = auto.held_quantity(account, eid)
+        remaining = prior_q - q if body["action"] == "sell" else prior_q + q
         if remaining:
             row = position(eid, mid, float(-remaining))
-            basis = Decimal(str(old["costBasis"])) * remaining if old else notional
-            row.update(avgCost=old["avgCost"] if old else float(price), costBasis=float(basis),
+            old_cost = Decimal(str(old["avgCost"])) * prior_q if old else Decimal(0)
+            basis = old_cost / prior_q * remaining if body["action"] == "sell" else old_cost + notional
+            row.update(avgCost=float(basis / remaining), costBasis=float(basis),
                        marketValue=float(basis), currentPrice=float(price), unrealizedPnl=0)
             rows.append(row)
         account.update(holdings(rows))
@@ -76,7 +80,7 @@ class AutonomousLifecycleTests(unittest.TestCase):
             "quantity": float(-q), "price": float(price), "amount": None, "transactionType": None,
             "orderType": body["action"].upper()})
         order = {"id": oid, "exchangeId": eid, "tournamentId": body["tournamentId"], "side": "no",
-                 "action": body["action"], "quantity": 1, "quantityFilled": float(q), "priceLimit": body["price"],
+                 "action": body["action"], "quantity": body["quantity"], "quantityFilled": float(q), "priceLimit": body["price"],
                  "expirationDate": body["expirationDate"], "createdAt": stamp, "open": False}
         fills = account_fixtures.history([{k: v for k, v in fill.items() if k not in {"orderId", "marketId", "exchangeId"}}])
         fills.update(orderId=oid, exchangeId=eid, tournamentId=body["tournamentId"],
@@ -87,7 +91,7 @@ class AutonomousLifecycleTests(unittest.TestCase):
         if script.get("timeout_after"):
             raise requests.Timeout("Synthetic lost receipt after fill")
         return self.fixture.base.response({"orderId": oid, "exchangeId": eid, "side": "no", "action": body["action"],
-            "price": body["price"], "quantity": 1, "quantityTraded": float(q), "totalCost": float(notional),
+            "price": body["price"], "quantity": body["quantity"], "quantityTraded": float(q), "totalCost": float(notional),
             "open": False, "remainingQuantity": 0, "fillPrice": float(price), "all": None})
 
     def cycle(self):
@@ -105,13 +109,14 @@ class AutonomousLifecycleTests(unittest.TestCase):
     def settle(self, mid, amount, with_event=True):
         account = self.fixture.fixture.current
         eid = str(int(mid) + 10)
+        quantity = auto.held_quantity(account, eid)
         self.fixture.markets[mid].update(status="settled", settledWith="NO" if amount else "YES")
         account.update(holdings([r for r in account["positions"] if r["exchangeId"] != eid]))
         account["tournament"]["myBalance"] = float(Decimal(str(account["tournament"]["myBalance"])) + Decimal(str(amount)))
         if with_event:
             self.fixture.fixture.transactions.insert(0, {"event_id": "settle-" + mid, "event_type": "settlement",
                 "createdAt": datetime.now(timezone.utc).isoformat(), "tournamentId": self.fixture.approval["tournament_id"],
-                "exchangeId": eid, "marketId": mid, "quantity": -1, "price": amount, "amount": amount,
+                "exchangeId": eid, "marketId": mid, "quantity": float(-quantity), "price": amount / float(quantity), "amount": amount,
                 "transactionType": "SETTLEMENT", "orderType": None})
 
     def test_complete_entry_hold_early_exit_repeat_and_settlement(self):
@@ -211,6 +216,110 @@ class AutonomousLifecycleTests(unittest.TestCase):
         self.assertEqual(cp["review_reason"], "")
         self.assertIsNone(next(iter(cp["autonomous_positions"].values()))["exit_execution"])
         self.assertEqual(len(self.posts), 2)  # Only the earlier mocked entry.
+
+    def test_ctrl_c_during_read_only_account_capture_does_not_write_halt(self):
+        self.cycle()
+        before = self.fixture.path.read_bytes()
+        with patch.object(auto.pilot_account, "read_snapshot", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            self.manage()
+        self.assertEqual(self.fixture.path.read_bytes(), before)
+        self.assertEqual(len(self.posts), 2)
+
+    def test_ctrl_c_during_hold_quote_does_not_change_state_or_positions(self):
+        self.cycle()
+        captured = []
+        def interrupt(*args, **kwargs):
+            captured.append(self.fixture.path.read_bytes())
+            raise KeyboardInterrupt
+        with patch.object(auto, "exit_quote", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+            self.manage()
+        self.assertEqual(self.fixture.path.read_bytes(), captured[0])
+        self.assertFalse(self.fixture.checkpoint()["manual_review_required"])
+        self.assertEqual(len(self.posts), 2)
+
+    def test_ctrl_c_before_sale_intent_exits_cleanly(self):
+        self.cycle()
+        self.quote_exit(.495)
+        original, captured = auto.exit_quote, []
+        calls = []
+        def interrupt(*args, **kwargs):
+            calls.append(True)
+            if len(calls) == 2:  # execute_exit_locked's quote BEFORE EXITING.
+                captured.append(self.fixture.path.read_bytes())
+                raise KeyboardInterrupt
+            return original(*args, **kwargs)
+        with patch.object(auto, "exit_quote", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+            self.manage()
+        self.assertEqual(self.fixture.path.read_bytes(), captured[0])
+        self.assertIsNone(next(iter(self.fixture.checkpoint()["autonomous_positions"].values()))["exit_execution"])
+        self.assertEqual(len(self.posts), 2)
+
+    def interrupt_after_sale_intent(self, error):
+        self.cycle()
+        self.quote_exit(.495)
+        original, raised = auto.persist, []
+        def interrupt(state):
+            original(state)
+            if state["checkpoint"]["state"] == pilot.EXECUTING and not raised:
+                raised.append(True)
+                raise error
+        with patch.object(auto, "persist", side_effect=interrupt), self.assertRaises(type(error)):
+            self.manage()
+        cp = self.fixture.checkpoint()
+        self.assertEqual(cp["state"], pilot.HALTED)
+        self.assertTrue(cp["manual_review_required"])
+        self.assertIn("stage=EXECUTING", cp["review_reason"])
+        self.assertIn("sale_intent=True", cp["review_reason"])
+        self.assertIn("post_attempted=False", cp["review_reason"])
+        self.assertIn("exception=" + type(error).__name__, cp["review_reason"])
+        self.assertEqual(len(self.posts), 2)
+
+    def test_ctrl_c_after_sale_intent_halts(self):
+        self.interrupt_after_sale_intent(KeyboardInterrupt())
+
+    def test_runtime_fault_after_sale_intent_halts_with_safe_diagnostics(self):
+        self.interrupt_after_sale_intent(RuntimeError("Sensitive text must not be persisted"))
+        self.assertNotIn("Sensitive text", self.fixture.checkpoint()["review_reason"])
+
+    def test_ctrl_c_after_sell_post_attempt_halts_and_never_retries(self):
+        self.cycle()
+        self.quote_exit(.495)
+        self.session.post.side_effect = KeyboardInterrupt
+        calls = self.session.post.call_count
+        with self.assertRaises(KeyboardInterrupt):
+            self.manage()
+        cp = self.fixture.checkpoint()
+        self.assertEqual(cp["state"], pilot.HALTED)
+        self.assertIn("post_attempted=True", cp["review_reason"])
+        p = next(iter(cp["autonomous_positions"].values()))
+        self.assertIsNotNone(p["exit_execution"]["legs"][0]["request"]["idempotencyKey"])
+        self.assertEqual(self.session.post.call_count, calls + 1)
+        self.manage()
+        self.assertEqual(self.session.post.call_count, calls + 1)
+
+    def test_ctrl_c_after_receipt_before_reconciliation_halts(self):
+        self.cycle()
+        self.quote_exit(.495)
+        with patch.object(auto, "wait_for_account_cache", side_effect=KeyboardInterrupt), self.assertRaises(KeyboardInterrupt):
+            self.manage()
+        cp = self.fixture.checkpoint()
+        self.assertEqual(cp["state"], pilot.HALTED)
+        self.assertIn("receipt_pending=True", cp["review_reason"])
+        self.assertEqual(len(self.posts), 3)
+
+    def test_system_exit_during_read_only_hold_propagates_without_halt(self):
+        self.cycle()
+        before = self.fixture.path.read_bytes()
+        with patch.object(auto.pilot_account, "read_snapshot", side_effect=SystemExit(7)), \
+                self.assertRaises(SystemExit) as error:
+            self.manage()
+        self.assertEqual(error.exception.code, 7)
+        self.assertEqual(self.fixture.path.read_bytes(), before)
+        self.assertEqual(len(self.posts), 2)
+
+    def test_system_exit_after_sale_intent_is_not_swallowed_and_halts(self):
+        self.interrupt_after_sale_intent(SystemExit(7))
 
     def test_stale_hold_snapshot_capture_skips_with_zero_state_writes(self):
         self.cycle()
