@@ -1,0 +1,270 @@
+{
+  "version": 1,
+  "allowed_use": "READ_ONLY_RESEARCH",
+  "mappings": [
+    {
+      "mapping_version": 1,
+      "mapping_status": "APPROVED_RESEARCH_ONLY",
+      "allowed_use": "READ_ONLY_RESEARCH",
+      "reviewed_at": "2026-10-11T11:42:21+00:00",
+      "race": "Colorado Senate",
+      "election_stage": "General",
+      "election_date": "2026-11-03",
+      "normalized_outcome": "Democratic Party wins",
+      "tournament_id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "tournament_slug": "midterm-elections",
+      "sig_market_id": "256",
+      "sig_exchange_id": "945",
+      "sig_proposition": "Will the Democratic Party win the Colorado Senate?",
+      "sig_race_id": "62956",
+      "sig_stage_id": "98086",
+      "sig_expected_resolution_date": "2026-11-04T17:00:00.000Z",
+      "sig_root_sha256": "5f4bf5a853aa466fa41b7fff4b40e55cb4c487a659f4f6e5f9dc5f34d9a835a0",
+      "polymarket_market_id": "630666",
+      "polymarket_condition_id": "0x3f8d20cfcf2136d0c001663603c2d7f7be0fb920534d09a193f3165a40fe9469",
+      "polymarket_tokens": {
+        "Yes": "68194463917260305435439145066031544476540679280823247532132832363696000101185",
+        "No": "106192530786960539135535008575818346767459617102414049409342524139150698862791"
+      },
+      "polymarket_yes_represents": "SIG_YES",
+      "polymarket_question": "Will the Democrats win the Colorado Senate race in 2026?",
+      "polymarket_slug": "will-the-democrats-win-the-colorado-senate-race-in-2026",
+      "polymarket_rules_sha256": "52bbcfbc4587a24f9cb78e022e4590f72114c435a8ea1d071413617ba38db382",
+      "polymarket_expected_resolution_date": "2026-11-04T04:59:00Z",
+      "settlement_mismatch": false,
+      "source_urls": [
+        "https://sig.thesuper.market/api/v1/markets/256/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://polymarket.com/event/colorado-senate-election-winner",
+        "https://gamma-api.polymarket.com/markets/630666"
+      ],
+      "approval_note": "Exact research mapping reviewed from scoped SIG Party Winner resolution root and Polymarket party-nominee rules; independent YES/NO contract, not inferred from the opposing party.",
+      "settlement_notes": [
+        "Both ordinary outcomes mean the Democratic Party nominee wins this exact 2026 general Senate election. Polymarket explicitly follows replacement nominees and excludes independents from party options.",
+        "Cross-venue equivalence is conditional on ordinary settlement only, not an executable arbitrage or LIVE authorization.",
+        "Polymarket includes run-offs and resolves on AP/Fox/NBC agreement or official certification. SIG exposes Party Winner plus election/stage IDs but does not promise the same source hierarchy or runoff/nominee-replacement handling.",
+        "Scheduled end/settlement timestamps differ and are not guarantees of final resolution. Cancellation/N/A/refund and administrator/oracle dispute/override behavior may differ; unresolved exceptional outcomes require re-review."
+      ]
+    },
+    {
+      "mapping_version": 1,
+      "mapping_status": "APPROVED_RESEARCH_ONLY",
+      "allowed_use": "READ_ONLY_RESEARCH",
+      "reviewed_at": "2026-10-11T11:42:21+00:00",
+      "race": "Colorado Senate",
+      "election_stage": "General",
+      "election_date": "2026-11-03",
+      "normalized_outcome": "Republican Party wins",
+      "tournament_id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "tournament_slug": "midterm-elections",
+      "sig_market_id": "257",
+      "sig_exchange_id": "946",
+      "sig_proposition": "Will the Republican Party win the Colorado Senate?",
+      "sig_race_id": "62956",
+      "sig_stage_id": "98086",
+      "sig_expected_resolution_date": "2026-11-04T17:00:00.000Z",
+      "sig_root_sha256": "b10041af4d5bd076a3d4cdf3e4c97199ec1a0e505226da7003f9762f2d4b4ff9",
+      "polymarket_market_id": "630667",
+      "polymarket_condition_id": "0xf67cdc929ad7442696e3c61a88445a5cf06d99e1a6e7eb41f17e48d20da35ee9",
+      "polymarket_tokens": {
+        "Yes": "94387913280398317052582281843978069916338462525042652614881277797162415545237",
+        "No": "2474994172812821906731940905046937405647772936830086080400122272424376650343"
+      },
+      "polymarket_yes_represents": "SIG_YES",
+      "polymarket_question": "Will the Republicans win the Colorado Senate race in 2026?",
+      "polymarket_slug": "will-the-republicans-win-the-colorado-senate-race-in-2026",
+      "polymarket_rules_sha256": "52bbcfbc4587a24f9cb78e022e4590f72114c435a8ea1d071413617ba38db382",
+      "polymarket_expected_resolution_date": "2026-11-04T04:59:00Z",
+      "settlement_mismatch": false,
+      "source_urls": [
+        "https://sig.thesuper.market/api/v1/markets/257/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://polymarket.com/event/colorado-senate-election-winner",
+        "https://gamma-api.polymarket.com/markets/630667"
+      ],
+      "approval_note": "Exact research mapping reviewed from scoped SIG Party Winner resolution root and Polymarket party-nominee rules; independent YES/NO contract, not inferred from the opposing party.",
+      "settlement_notes": [
+        "Both ordinary outcomes mean the Republican Party nominee wins this exact 2026 general Senate election. Polymarket explicitly follows replacement nominees and excludes independents from party options.",
+        "Cross-venue equivalence is conditional on ordinary settlement only, not an executable arbitrage or LIVE authorization.",
+        "Polymarket includes run-offs and resolves on AP/Fox/NBC agreement or official certification. SIG exposes Party Winner plus election/stage IDs but does not promise the same source hierarchy or runoff/nominee-replacement handling.",
+        "Scheduled end/settlement timestamps differ and are not guarantees of final resolution. Cancellation/N/A/refund and administrator/oracle dispute/override behavior may differ; unresolved exceptional outcomes require re-review."
+      ]
+    },
+    {
+      "mapping_version": 1,
+      "mapping_status": "NO_EQUIVALENT_EXTERNAL_MARKET",
+      "allowed_use": "READ_ONLY_RESEARCH",
+      "reviewed_at": "2026-10-11T11:42:21+00:00",
+      "race": "Alaska Senate",
+      "election_stage": "General",
+      "election_date": "2026-11-03",
+      "normalized_outcome": "Democratic Party wins",
+      "tournament_id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "tournament_slug": "midterm-elections",
+      "sig_market_id": "377",
+      "sig_exchange_id": "1066",
+      "sig_proposition": "Will the Democratic Party win the Alaska Senate?",
+      "sig_race_id": "62954",
+      "sig_stage_id": "98084",
+      "sig_expected_resolution_date": "2026-11-04T17:00:00.000Z",
+      "sig_root_sha256": "95926f3f34cf6a3e28e3813321f2533f4353e56c449721c30aca2035c526f9ee",
+      "polymarket_market_id": null,
+      "polymarket_condition_id": null,
+      "polymarket_tokens": null,
+      "polymarket_yes_represents": null,
+      "polymarket_question": null,
+      "polymarket_slug": null,
+      "polymarket_rules_sha256": null,
+      "polymarket_expected_resolution_date": null,
+      "settlement_mismatch": true,
+      "source_urls": [
+        "https://sig.thesuper.market/api/v1/markets/377/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://polymarket.com/event/alaska-senate-election-winner"
+      ],
+      "approval_note": "No exact party-winner contract found in the official Alaska event/public search or the exact Democratic/Republican party slugs. No candidate token substituted.",
+      "reviewed_non_equivalent_market_ids": [
+        "634974",
+        "634975",
+        "634976",
+        "634977",
+        "634978",
+        "634979",
+        "634980"
+      ],
+      "settlement_notes": [
+        "SIG resolves Party Winner; Polymarket resolves named candidates, not a party nominee contract. Candidate replacement, multiple same-party candidates and Alaska ranked-choice results prevent assuming equivalence.",
+        "Polymarket adds a July 31, 2027 deadline resolving to Other if unconfirmed, with no equivalent rule in the SIG root. NO_EQUIVALENT_EXTERNAL_MARKET; no external edge or signal calculated."
+      ]
+    },
+    {
+      "mapping_version": 1,
+      "mapping_status": "NO_EQUIVALENT_EXTERNAL_MARKET",
+      "allowed_use": "READ_ONLY_RESEARCH",
+      "reviewed_at": "2026-10-11T11:42:21+00:00",
+      "race": "Alaska Senate",
+      "election_stage": "General",
+      "election_date": "2026-11-03",
+      "normalized_outcome": "Republican Party wins",
+      "tournament_id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "tournament_slug": "midterm-elections",
+      "sig_market_id": "378",
+      "sig_exchange_id": "1067",
+      "sig_proposition": "Will the Republican Party win the Alaska Senate?",
+      "sig_race_id": "62954",
+      "sig_stage_id": "98084",
+      "sig_expected_resolution_date": "2026-11-04T17:00:00.000Z",
+      "sig_root_sha256": "8fe67c16b16544d7f71c3c955e40adaaa0baaa6b19e7ac29d6aafe931ae84c8a",
+      "polymarket_market_id": null,
+      "polymarket_condition_id": null,
+      "polymarket_tokens": null,
+      "polymarket_yes_represents": null,
+      "polymarket_question": null,
+      "polymarket_slug": null,
+      "polymarket_rules_sha256": null,
+      "polymarket_expected_resolution_date": null,
+      "settlement_mismatch": true,
+      "source_urls": [
+        "https://sig.thesuper.market/api/v1/markets/378/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://polymarket.com/event/alaska-senate-election-winner"
+      ],
+      "approval_note": "No exact party-winner contract found in the official Alaska event/public search or the exact Democratic/Republican party slugs. No candidate token substituted.",
+      "reviewed_non_equivalent_market_ids": [
+        "634974",
+        "634975",
+        "634976",
+        "634977",
+        "634978",
+        "634979",
+        "634980"
+      ],
+      "settlement_notes": [
+        "SIG resolves Party Winner; Polymarket resolves named candidates, not a party nominee contract. Candidate replacement, multiple same-party candidates and Alaska ranked-choice results prevent assuming equivalence.",
+        "Polymarket adds a July 31, 2027 deadline resolving to Other if unconfirmed, with no equivalent rule in the SIG root. NO_EQUIVALENT_EXTERNAL_MARKET; no external edge or signal calculated."
+      ]
+    },
+    {
+      "mapping_version": 1,
+      "mapping_status": "APPROVED_RESEARCH_ONLY",
+      "allowed_use": "READ_ONLY_RESEARCH",
+      "reviewed_at": "2026-10-11T11:42:21+00:00",
+      "race": "New Hampshire Senate",
+      "election_stage": "General",
+      "election_date": "2026-11-03",
+      "normalized_outcome": "Democratic Party wins",
+      "tournament_id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "tournament_slug": "midterm-elections",
+      "sig_market_id": "381",
+      "sig_exchange_id": "1070",
+      "sig_proposition": "Will the Democratic Party win the New Hampshire Senate?",
+      "sig_race_id": "62972",
+      "sig_stage_id": "98102",
+      "sig_expected_resolution_date": "2026-11-04T17:00:00.000Z",
+      "sig_root_sha256": "a053e8c5c102efb72b6760b3ca43b622368233860e9b53ddf7ac3cee67aed353",
+      "polymarket_market_id": "630844",
+      "polymarket_condition_id": "0xfc5c740e4617eb9908ceada7c91bfbe1cd41f172d703ef811d544e60a7a70bb5",
+      "polymarket_tokens": {
+        "Yes": "82410058691149830741200014405570918770267839390767234397030380747995715352939",
+        "No": "28709552853916742051233428360468180906283732902940871675642481670799666825242"
+      },
+      "polymarket_yes_represents": "SIG_YES",
+      "polymarket_question": "Will the Democrats win the New Hampshire Senate race in 2026?",
+      "polymarket_slug": "will-the-democrats-win-the-new-hampshire-senate-race-in-2026",
+      "polymarket_rules_sha256": "e8ab335d7837ee67142f21fee4bd57ed165f237b552ff33b9b444695dc6ad7c5",
+      "polymarket_expected_resolution_date": "2026-11-04T04:59:00Z",
+      "settlement_mismatch": false,
+      "source_urls": [
+        "https://sig.thesuper.market/api/v1/markets/381/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://polymarket.com/event/new-hampshire-senate-election-winner",
+        "https://gamma-api.polymarket.com/markets/630844"
+      ],
+      "approval_note": "Exact research mapping reviewed from scoped SIG Party Winner resolution root and Polymarket party-nominee rules; independent YES/NO contract, not inferred from the opposing party.",
+      "settlement_notes": [
+        "Both ordinary outcomes mean the Democratic Party nominee wins this exact 2026 general Senate election. Polymarket explicitly follows replacement nominees and excludes independents from party options.",
+        "Cross-venue equivalence is conditional on ordinary settlement only, not an executable arbitrage or LIVE authorization.",
+        "Polymarket includes run-offs and resolves on AP/Fox/NBC agreement or official certification. SIG exposes Party Winner plus election/stage IDs but does not promise the same source hierarchy or runoff/nominee-replacement handling.",
+        "Scheduled end/settlement timestamps differ and are not guarantees of final resolution. Cancellation/N/A/refund and administrator/oracle dispute/override behavior may differ; unresolved exceptional outcomes require re-review."
+      ]
+    },
+    {
+      "mapping_version": 1,
+      "mapping_status": "APPROVED_RESEARCH_ONLY",
+      "allowed_use": "READ_ONLY_RESEARCH",
+      "reviewed_at": "2026-10-11T11:42:21+00:00",
+      "race": "New Hampshire Senate",
+      "election_stage": "General",
+      "election_date": "2026-11-03",
+      "normalized_outcome": "Republican Party wins",
+      "tournament_id": "bda92870-621e-47b0-bc3c-3602c5c26f55",
+      "tournament_slug": "midterm-elections",
+      "sig_market_id": "382",
+      "sig_exchange_id": "1071",
+      "sig_proposition": "Will the Republican Party win the New Hampshire Senate?",
+      "sig_race_id": "62972",
+      "sig_stage_id": "98102",
+      "sig_expected_resolution_date": "2026-11-04T17:00:00.000Z",
+      "sig_root_sha256": "6516a7d2092334ecc9baf501971eb93c247dde9a6da5ca19362703fb727b6b4b",
+      "polymarket_market_id": "630845",
+      "polymarket_condition_id": "0x57599a84bf50c94b958adb020aa2a25bf02e26453e500d3b739d86e6b783774c",
+      "polymarket_tokens": {
+        "Yes": "62227089537100115269143206481757249285124282589590263790284791475153705872216",
+        "No": "58757590052289479996371632351141005979216013605386057994994985198930000872621"
+      },
+      "polymarket_yes_represents": "SIG_YES",
+      "polymarket_question": "Will the Republicans win the New Hampshire Senate race in 2026?",
+      "polymarket_slug": "will-the-republicans-win-the-new-hampshire-senate-race-in-2026",
+      "polymarket_rules_sha256": "e8ab335d7837ee67142f21fee4bd57ed165f237b552ff33b9b444695dc6ad7c5",
+      "polymarket_expected_resolution_date": "2026-11-04T04:59:00Z",
+      "settlement_mismatch": false,
+      "source_urls": [
+        "https://sig.thesuper.market/api/v1/markets/382/nodes?tournamentId=bda92870-621e-47b0-bc3c-3602c5c26f55",
+        "https://polymarket.com/event/new-hampshire-senate-election-winner",
+        "https://gamma-api.polymarket.com/markets/630845"
+      ],
+      "approval_note": "Exact research mapping reviewed from scoped SIG Party Winner resolution root and Polymarket party-nominee rules; independent YES/NO contract, not inferred from the opposing party.",
+      "settlement_notes": [
+        "Both ordinary outcomes mean the Republican Party nominee wins this exact 2026 general Senate election. Polymarket explicitly follows replacement nominees and excludes independents from party options.",
+        "Cross-venue equivalence is conditional on ordinary settlement only, not an executable arbitrage or LIVE authorization.",
+        "Polymarket includes run-offs and resolves on AP/Fox/NBC agreement or official certification. SIG exposes Party Winner plus election/stage IDs but does not promise the same source hierarchy or runoff/nominee-replacement handling.",
+        "Scheduled end/settlement timestamps differ and are not guarantees of final resolution. Cancellation/N/A/refund and administrator/oracle dispute/override behavior may differ; unresolved exceptional outcomes require re-review."
+      ]
+    }
+  ]
+}

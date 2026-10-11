@@ -26,3 +26,4 @@ live_pilot_allocation.json
 .live_pilot_allocation.json.*.tmp
 accounting_probe.json
 .accounting_probe.json.*.tmp
+external_research/
